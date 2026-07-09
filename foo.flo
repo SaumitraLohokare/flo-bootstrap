@@ -1,0 +1,305 @@
+# Algorithm:
+
+-- Generate call graph
+-- Bottom up pass:
+    - Create a schema for function (with known types)
+    - Collect all constraints from function body
+    - Add constraints from function schema
+    - Pull in constraints from calls with only one possible overload
+    - Solve constraints as much as possible
+    - If a call gets pruned to have only one possible overload, pull in constraints
+        and continue solving
+    - If a call has all args and ret type known: specialize it with known types as new constraints
+    - Update schema with known types
+    - Return schema
+
+-- Specialize pass
+    - Add additional constraints to remaining function constraints
+    - If new constraints were added: Solve constraints as much as possible
+    - If a call gets pruned to have only one possible overload, pull in constraints
+        and continue solving
+    - If a call has all args and ret type known: specialize it with known types as new constraints
+    - Default types
+    - Solve constraints as much as possible
+    - If a call gets pruned to have only one possible overload, pull in constraints
+        and continue solving
+    - If a call has all args and ret type known: specialize it with known types as new constraints
+    - Create a new schema and add it to specialized_schemas
+
+
+-----------------------------------------------------------------
+
+fn main() = 0;
+
+-- call_graph = ["main"]
+
+-- Bottom-up pass
+-- main_schema = () -> t_ret
+-- main_constraints = IsKind(t0, numeric), IsEqual(t_ret, t0)
+-- main_constraints = IsKind(t_ret, Numeric)
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- Nothing to solve since no new constraints added
+-- Default types: t_ret -> i32
+-- main_schema = () -> i32
+
+-----------------------------------------------------------------
+
+fn main() = id(0);
+
+fn id(x) = x;
+
+-- call_graph = ["id", "main"]
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t1), IsEqual(t1, t_ret)
+-- main_schema = () -> t_ret
+-- id_constraints = IsEqual(tx, t0), IsEqual(t0, t_ret)
+-- id_schema = (tx) -> t_ret
+
+-- Bottom-up pass
+-- id_constraints = nil
+-- id_schema = (tx) -> tx
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t_ret), IsEqual(t0, t_ret) -- pulled in constraint from id
+-- main_constraints = IsKind(t_ret, Numeric), Call("id", [t_ret], t_ret)
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- Nothing to solve
+-- Default types: t_ret -> i32
+-- main_constraints = Call("id", [i32], i32)
+-- Solve again => Specializes Call now because everything is known
+
+-----------------------------------------------------------------
+
+fn main() = foo(0);
+fn foo(x) = id(x);
+fn id(y) = y;
+
+-- call_graph = ["id", "foo", "main"]
+-- id_constraints = IsEqual(t0, t_ret), IsEqual(ty, t0)
+-- id_schema = (ty) -> t_ret
+-- foo_constraints = Call("id", [t0], t1), IsEqual(t1, t_ret), IsEqual(tx, t0)
+-- foo_schema = (tx) -> t_ret
+-- main_constraints = IsKind(t0, Numeric), Call("foo", [t0], t1), IsEqual(t1, t_ret)
+-- main_schema = () -> t_ret
+
+-- Bottom-up pass
+
+-- id_constraints = nil
+-- id_schema = (ty) -> ty
+
+-- (pulled in new id schema constraints): foo_constraints = Call("id", [tx], t_ret) + IsEqual(tx, t_ret)
+-- foo_constraints = Call("id", [tx], tx)
+-- foo_schema = (tx) -> tx
+
+-- main_constraints = IsKind(t0, Numeric), Call("foo", [t0], t_ret) + IsEqual(t0, t_ret)
+-- main_constraints = IsKind(t_ret, Numeric), Call("foo", [t_ret], t_ret)
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- No solving required cause no new constraints
+-- Default Types: t_ret -> i32
+-- main_constraints = Call("foo", [i32], i32)
+-- main_schema = () -> i32
+-- Solve again: "foo" call is known completely => specialize it
+-- main_schema = () -> i32
+
+-- Specialize "foo" [IsEqual(tx, i32), IsEqual(tx, i32)]
+-- new constraints = IsEqual(tx, i32), IsEqual(tx, i32), Call(id, [tx], tx)
+-- new constraints = Call(id, [i32], i32)
+-- Solve constraints: Call to id is known => specialize it
+-- Nothing to Default
+-- nothing to solve since no default
+-- new_schema = (i32) -> i32
+
+-- Specialize "id" [IsEqual(ty, i32), IsEqual(ty, i32)]
+-- new constraints = IsEqual(tx, i32), IsEqual(tx, i32)
+-- new_schema = (i32) -> i32
+
+-----------------------------------------------------------------
+
+fn main() = id(0);
+
+fn id(x) -> u8 = x;
+
+-- call_graph = ["id", "main"]
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t1), IsEqual(t1, t_ret)
+-- main_schema = () -> t_ret
+-- id_constraints = IsEqual(tx, t0), IsEqual(t0, u8)
+-- id_schema = (tx) -> u8
+
+-- Bottom-up pass
+-- id_constraints = nil
+-- id_schema = (u8) -> u8
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t_ret), IsEqual(t0, u8), IsEqual(t_ret, u8) -- pulled in constraint from id
+-- main_constraints = Call("id", [u8], u8) => All known so specialize it
+-- main_schema = () -> u8
+
+-- Specialize "id" [IsEqual(tx, u8)]
+-- new constraints = IsEqual(tx, u8) => nil
+-- Solved.
+-- specialized schema = (u8) -> u8
+
+-----------------------------------------------------------------
+
+fn main() = 1 + 1;
+
+-- existing op: @1:(+, [i32, i32], i32), @2:(+, [u8, u8], u8)
+
+-- call_graph = ["main"]
+-- main_constraints = IsKind(t0, Numeric), IsEqual(t1, Numeric), Op(+, [t0, t1], t2, [@1, @2]), IsEqual(t2, t_ret)
+-- main_schema = () -> t_ret
+
+-- Bottom-up pass
+-- main_constraints = IsKind(t0, Numeric), IsEqual(t1, Numeric), Op(+, [t0, t1], t_ret, [@1, @2])
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- Nothing to solve since no additional constraints
+-- default types: t0 -> i32, t1 -> i32
+-- main_constraints = Op(+, [i32, i32], t_ret, [@1]) => @2 got removed because the schema didn't match
+-- main_schema = () -> t_ret
+
+-- Now since we have reduced to only one overload we can pull in it's schema and constraints
+-- main_constraints = Op(+, [i32, i32], t_ret, [@1]) + IsEqual(t_ret, i32)
+-- main_constraints = Op(+, [i32, i32], i32, [@1])
+-- main_schema = () -> i32
+
+-----------------------------------------------------------------
+
+fn main() = id(0);
+
+fn id(x: i32) = x;
+fn id(x: bool) = x;
+
+-- call_graph = ["id", "main"]
+-- id@1_constraints = IsEqual(t0, i32), IsEqual(t_ret, t0)
+-- id@1_schema = (i32) -> t_ret
+-- id@1_constraints = IsEqual(t0, bool), IsEqual(t_ret, t0)
+-- id@1_schema = (bool) -> t_ret
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t1, [@1, @2]), IsEqual(t1, t_ret)
+-- main_schema = () -> t_ret
+
+-- Bottom-up pass
+-- id@1_constraints = nil
+-- id@1_schema = (i32) -> i32
+-- id@2_constraints = nil
+-- id@2_schema = (bool) -> bool
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t_ret, [@1, @2])
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- Nothing to solve since no new constraints
+-- Default types: t0 -> i32
+-- main_constraints = Call("id", [i32], t_ret, [@1]) => @2 got removed because schema didn't match
+-- main_constraints = Call("id", [i32], t_ret, [@1]) + IsEqual(t_ret, i32) -- pulled from id@1
+-- main_constraints = Call("id", [i32], i32, [@1])
+-- main_schema = () -> i32
+
+-----------------------------------------------------------------
+
+fn main() = id(0);
+
+fn id(x) = x;
+fn id(x: i32) = x;
+
+-- call_graph = ["id", "main"]
+-- id@1_constraints = IsEqual(t0, tx), IsEqual(t_ret, t0)
+-- id@1_schema = (tx) -> t_ret
+-- id@2_constraints = IsEqual(t0, i32), IsEqual(t_ret, t0)
+-- id@2_schema = (i32) -> t_ret
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t1, [@1, @2]), IsEqual(t1, t_ret)
+-- main_schema = () -> t_ret
+
+-- Bottom-up pass
+-- id@1_constraints = nil
+-- id@1_schema = (tx) -> tx
+-- id@2_constraints = nil
+-- id@2_schema = (i32) -> i32
+-- main_constraints = IsKind(t0, Numeric), Call("id", [t0], t_ret, [@1, @2])
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- Nothing to solve since no new constraints
+-- Default types: t0 -> i32
+-- main_constraints = Call("id", [i32], t_ret, [@1, @2]) => Cannot shrink overload set
+
+-- Error: Ambiguous call to id
+
+-----------------------------------------------------------------
+
+fn main() = {
+    id(true);
+    id(0)
+};
+
+fn id(x: i32) = x;
+fn id(x: bool) = x;
+
+-- call_graph = ["id", "main"]
+-- id@1_constraints = IsEqual(tx, i32), IsEqual(t0, tx), IsEqual(t0, t_ret)
+-- id@1_schema = (i32) -> t_ret
+-- id@2_constraints = IsEqual(tx, bool), IsEqual(t0, tx), IsEqual(t0, t_ret)
+-- id@2_schema = (bool) -> t_ret
+-- main_constraints = IsEqual(t0, bool), Call("id", [t0], t1, [@1, @2]), IsKind(t2, Numeric), Call("id", [t2], t3, [@1, @2]), IsEqual(t3, t_ret)
+-- main_schema = () -> t_ret
+
+-- Bottom-up pass
+-- id@1_constraints = nil
+-- id@1_schema = (i32) -> i32
+-- id@2_constraints = nil
+-- id@2_schema = (bool) -> bool
+-- main_constraints = Call("id", [bool], t1, [@2]), IsKind(t2, Numeric), Call("id", [t2], t_ret, [@1, @2])
+-- main_constraints = Call("id", [bool], t1, [@2]), IsKind(t2, Numeric), Call("id", [t2], t_ret, [@1, @2]) + IsEqual(t1, bool) -- from id@2
+-- main_constraints = Call("id", [bool], bool, [@2]), IsKind(t2, Numeric), Call("id", [t2], t_ret, [@1, @2]) => Specialize ("id", [bool], bool)
+-- main_schema = () -> t_ret
+
+-- Specialize "main" (no additional constraints)
+-- Nothing to solve since no new constraints
+-- Default types: t2 -> i32
+-- main_constraints = Call("id", [i32], t_ret, [@1]) + IsEqual(t_ret, i32) -- from id@1
+-- main_constraints = Call("id", [i32], i32, [@1]) => Specialize ("id", [i32], i32)
+-- main_schema = () -> i32
+
+-----------------------------------------------------------------
+
+fn fact(n) = if n == 0 { 1 } else { n * fact(n - 1) };
+fn main() = fact(5);
+
+-- call_graph = [["fact"], "main"]
+
+-- fact:
+-- schema = (tn) -> t_ret
+-- constraints = [
+    IsKind(t0, Numeric),
+    Op(==, [tn, t0], t1, @n),
+    IsEqual(t1, bool),
+    IsKind(t2, Numeric),
+    IsKind(t3, Numeric),
+    Op(-, [tn, t3], t4, @n),
+    Call("fact", [t4], t5, @1)
+    Op(*, [tn, t5], t6, @n),
+    IsEqual(t2, t7),
+    IsEqual(t6, t7),
+    IsEqual(t7, t_ret),
+]
+-- constraints = [
+    IsKind(t0, Numeric),
+    Op(==, [tn, t0], bool, @n),
+    IsKind(t_ret, Numeric),
+    IsKind(t3, Numeric),
+    Op(-, [tn, t3], t4, @n),
+    Call("fact", [t4], t5, @1)
+    Op(*, [tn, t5], t_ret, @n),
+]
+- new schema = (tn) -> t_ret
+
+-- main:
+-- schema = () -> t_ret
+-- constraints = [IsKind(t0, Numeric), Call("fact", [t0], t1), IsEqual(t1, t_ret)]
+-- solved constraints = [IsKind(t0, Numeric), Call("fact", [t0], t_ret)]
+-- new schema = () -> t_ret
+
+-- TODO: Specialize
+
+-- In an SCC if a schema changes, we iterate over it again until no schema changes
