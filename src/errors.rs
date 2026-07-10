@@ -1,5 +1,6 @@
 use crate::{
-    tokenizer::{Loc, Token, TokenKind}, types::{Type, TypeKind},
+    tokenizer::{Loc, Token, TokenKind},
+    types::{Type, TypeKind},
 };
 
 pub type FloResult<T> = Result<T, FloErr>;
@@ -30,7 +31,20 @@ pub enum FloErr {
         token: Token,
     },
 
-    UndefinedIdentifier { name: String, loc: Loc },
+    UndefinedIdentifier {
+        name: String,
+        loc: Loc,
+    },
+    UndefinedFunction {
+        name: String,
+        loc: Loc,
+    },
+
+    CallArityMismatch {
+        expected: usize,
+        got: usize,
+        loc: Loc,
+    },
 
     UnsatisfiedTypeKind {
         ty: Type,
@@ -50,7 +64,7 @@ pub enum FloErr {
 }
 
 impl FloErr {
-    pub fn pretty_print(self, src: String) {
+    pub fn pretty_print(self, src: &String) {
         eprint!("Error: ");
 
         match self {
@@ -79,7 +93,12 @@ impl FloErr {
                 eprintln!("`{}` is not a type", token.kind.pretty_name(),);
                 print_src(src, &[token.loc]);
             }
-            FloErr::UnsatisfiedTypeKind { ty, ty_loc, kind, loc } => {
+            FloErr::UnsatisfiedTypeKind {
+                ty,
+                ty_loc,
+                kind,
+                loc,
+            } => {
                 eprintln!("Type `{kind:?}` does not match `{ty:?}`");
                 print_src(src, &[ty_loc, loc]);
             }
@@ -95,8 +114,15 @@ impl FloErr {
                 eprintln!("Main function not found.");
             }
             FloErr::UndefinedIdentifier { name, loc } => {
-
                 eprintln!("Undefined identifier `{name}`");
+                print_src(src, &[loc]);
+            }
+            FloErr::UndefinedFunction { name, loc } => {
+                eprintln!("Undefined function `{name}`");
+                print_src(src, &[loc]);
+            }
+            FloErr::CallArityMismatch { expected, got, loc } => {
+                eprintln!("Function call expected {expected} arguments, but got {got} instead");
                 print_src(src, &[loc]);
             }
         }
@@ -106,7 +132,7 @@ impl FloErr {
 use std::collections::BTreeMap;
 
 // DISCLAIMER: This function is written by Claude
-fn print_src(src: String, locs: &[Loc]) {
+fn print_src(src: &String, locs: &[Loc]) {
     if locs.is_empty() {
         return;
     }

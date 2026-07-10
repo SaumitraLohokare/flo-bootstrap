@@ -10,14 +10,17 @@ mod type_checker;
 mod types;
 mod util;
 
-// TODO: Add arguments
+// TODO: Errors are printed randomly, because we check functions by iterating HashMap
+// TODO: Pipe, Scope + Variables, Operators
 
 fn main() {
     let src = r#"
         -- This is a comment
-        fn main() -> i32 = 0;
+        fn main() -> i32 = foo(0);
 
-        fn foo(a: i32) -> void = a;
+        fn foo(a: i32) -> void = id(a);
+
+        fn id(a: i32) -> void = a;
     "#
     .to_string();
 
@@ -25,15 +28,18 @@ fn main() {
     let mut module = match Parser::new(tokens).parse() {
         Ok(module) => module,
         Err(err) => {
-            err.pretty_print(src);
+            err.pretty_print(&src);
             exit(1);
         }
     };
 
     println!("{module:?}");
 
-    if let Err(err) = TypeChecker::new().check(&mut module) {
-        err.pretty_print(src);
+    let errs = TypeChecker::new().check(&mut module);
+    if !errs.is_empty() {
+        for err in errs {
+            err.pretty_print(&src);
+        }
         exit(1);
     }
 

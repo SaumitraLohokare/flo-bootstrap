@@ -195,23 +195,50 @@ impl Parser {
             }
 
             Ident => {
-                let TokenValue::String(name) = &token.value else {
+                let TokenValue::String(name) = token.value.clone() else {
                     unreachable!()
                 };
-                let var_id = scope.get_var(name).ok_or(FloErr::UndefinedIdentifier {
-                    name: name.clone(),
-                    loc: token.loc,
-                })?;
-                let loc = token.loc;
+                let name_loc = token.loc;
 
                 self.skip();
 
-                let kind = ExprKind::Var(var_id);
-                Ok(Expr {
-                    kind,
-                    ty: scope.get_var_type(var_id),
-                    loc,
-                })
+                if let Ok(LParen) = self.peek_kind() {
+                    self.skip();
+
+                    let mut args = Vec::new();
+                    while let Ok(next_kind) = self.peek_kind()
+                        && next_kind != RParen
+                    {
+                        args.push(self.parse_expr(-1, scope)?);
+                        if self.expect(Comma).is_err() {
+                            break;
+                        }
+                    }
+
+                    let r_paren = self.expect_get(RParen)?;
+
+                    let kind = ExprKind::Call(name, args);
+                    Ok(Expr {
+                        kind,
+                        ty: self.fresh_type(),
+                        loc: Loc {
+                            start: name_loc.start,
+                            end: r_paren.loc.end,
+                        },
+                    })
+                } else {
+                    let var_id = scope.get_var(&name).ok_or(FloErr::UndefinedIdentifier {
+                        name: name.clone(),
+                        loc: name_loc,
+                    })?;
+
+                    let kind = ExprKind::Var(var_id);
+                    Ok(Expr {
+                        kind,
+                        ty: scope.get_var_type(var_id),
+                        loc: name_loc,
+                    })
+                }
             }
 
             _ => Err(FloErr::UnexpectedToken {
@@ -248,6 +275,13 @@ impl Parser {
 
     fn peek(&self) -> FloResult<&Token> {
         self.tokens.get(self.idx).ok_or(FloErr::UnexpectedEOF)
+    }
+
+    fn peek_kind(&self) -> FloResult<TokenKind> {
+        self.tokens
+            .get(self.idx)
+            .map(|t| t.kind)
+            .ok_or(FloErr::UnexpectedEOF)
     }
 
     fn skip(&mut self) {

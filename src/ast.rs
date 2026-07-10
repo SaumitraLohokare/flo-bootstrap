@@ -32,6 +32,7 @@ pub struct Expr {
 pub enum ExprKind {
     Num(u64),
     Var(usize),
+    Call(String, Vec<Expr>),
 }
 
 // -------------------------------------------
@@ -52,9 +53,13 @@ impl Debug for Module {
 impl Expr {
     fn pretty_print(&self, indent: usize) -> String {
         let indent = " ".repeat(indent);
-        match self.kind {
+        match &self.kind {
             ExprKind::Num(num) => format!("{indent}{num}:{:?}", self.ty),
             ExprKind::Var(id) => format!("{indent}var_{id}:{:?}", self.ty),
+            ExprKind::Call(name, exprs) => {
+                let arg_list = exprs.iter().map(|arg| arg.pretty_print(0)).collect::<Vec<_>>().join(", ");
+                format!("{name}({arg_list}):{:?}", self.ty)
+            }
         }
     }
 }
