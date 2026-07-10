@@ -1,6 +1,12 @@
 use std::{collections::HashMap, fmt::Debug};
 
-use crate::{errors::{FloErr, FloResult}, tokenizer::Loc, types::Type};
+use crate::{tokenizer::Loc, types::Type};
+
+#[derive(Debug, Clone, Copy)]
+pub struct FuncLocs {
+    pub definition: Loc,
+    pub ret_type: Loc,
+}
 
 #[derive(Clone)]
 pub struct Module {
@@ -11,7 +17,7 @@ pub struct Module {
 pub struct Func {
     pub body: Expr,
     pub ty: Type,
-    pub loc: Loc,
+    pub loc: FuncLocs,
 }
 
 #[derive(Debug, Clone)]
@@ -21,42 +27,9 @@ pub struct Expr {
     pub loc: Loc,
 }
 
-impl Expr {
-    fn replace_types(&mut self, replace_map: &HashMap<Type, Type>) {
-        self.ty.replace_types(replace_map);
-
-        match self.kind {
-            ExprKind::Num(_) => {}
-        }
-    }
-
-    fn ensure_resolved(&self) -> FloResult<()> {
-        if !self.ty.is_known() {
-            return Err(FloErr::UnresolvedType { loc: self.loc });
-        }
-        
-        match self.kind {
-            ExprKind::Num(_) => {}
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Num(u64),
-}
-
-impl Func {
-    pub fn replace_types(&mut self, replace_map: &HashMap<Type, Type>) {
-        self.ty.replace_types(replace_map);
-        self.body.replace_types(replace_map);
-    }
-
-    pub fn ensure_resolved(&self) -> FloResult<()> {
-        self.body.ensure_resolved()
-    }
 }
 
 // -------------------------------------------

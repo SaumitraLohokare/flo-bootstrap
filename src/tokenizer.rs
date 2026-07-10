@@ -8,6 +8,8 @@ pub enum TokenKind {
     LParen,
     RParen,
 
+    Colon,
+    Comma,
     Arrow,
 
     Equal,
@@ -22,7 +24,7 @@ pub enum TokenValue {
     Num(u64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Loc {
     pub start: usize,
     pub end: usize,
@@ -68,6 +70,9 @@ impl Tokenizer {
 
                 '(' => tokens.push(self.tokenize_symbol("(", TokenKind::LParen)),
                 ')' => tokens.push(self.tokenize_symbol(")", TokenKind::RParen)),
+
+                ':' => tokens.push(self.tokenize_symbol(":", TokenKind::Colon)),
+                ',' => tokens.push(self.tokenize_symbol(",", TokenKind::Comma)),
 
                 '=' => tokens.push(self.tokenize_symbol("=", TokenKind::Equal)),
 

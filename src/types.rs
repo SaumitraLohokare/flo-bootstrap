@@ -1,4 +1,26 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::fmt::Debug;
+
+#[derive(Debug, Clone, Copy)]
+pub enum TypeKind {
+    Integral,
+}
+
+impl TypeKind {
+    pub fn satisfies_type(&self, ty: &Type) -> bool {
+        use Type::*;
+        use TypeKind::*;
+
+        match self {
+            Integral => matches!(ty, I32),
+        }
+    }
+
+    pub fn default_type(&self) -> Type {
+        match self {
+            TypeKind::Integral => Type::I32,
+        }
+    }
+}
 
 #[allow(unused)]
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -30,23 +52,6 @@ impl Type {
             }
 
             Type::Void | Type::I32 => true,
-        }
-    }
-
-    pub fn replace_types(&mut self, replace_map: &HashMap<Type, Type>) {
-        match self {
-            Type::T(_) => {
-                if let Some(replacement) = replace_map.get(self) {
-                    *self = replacement.clone();
-                }
-            }
-            Type::Fn(args, ret) => {
-                for arg in args {
-                    arg.replace_types(replace_map);
-                }
-                ret.replace_types(replace_map);
-            }
-            _ => {}
         }
     }
 }

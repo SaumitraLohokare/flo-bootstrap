@@ -1,7 +1,5 @@
 use crate::{
-    tokenizer::{Loc, Token, TokenKind, TokenValue},
-    type_checker::TypeKind,
-    types::Type,
+    tokenizer::{Loc, Token, TokenKind}, types::{Type, TypeKind},
 };
 
 pub type FloResult<T> = Result<T, FloErr>;
@@ -17,7 +15,8 @@ pub enum FloErr {
     },
 
     RedifinitionOfFunction {
-        token: Token,
+        name: String,
+        loc: Loc,
     },
 
     MainFunctionNotFound,
@@ -28,6 +27,7 @@ pub enum FloErr {
 
     UnsatisfiedTypeKind {
         ty: Type,
+        ty_loc: Loc,
         kind: TypeKind,
         loc: Loc,
     },
@@ -60,20 +60,17 @@ impl FloErr {
                 );
                 print_src(src, &[found.loc]);
             }
-            FloErr::RedifinitionOfFunction { token } => {
-                let TokenValue::String(func_name) = token.value else {
-                    unreachable!()
-                };
-                eprintln!("Redifinition of function `{func_name}`");
-                print_src(src, &[token.loc]);
+            FloErr::RedifinitionOfFunction { name, loc } => {
+                eprintln!("Redifinition of function `{name}`");
+                print_src(src, &[loc]);
             }
             FloErr::NotAType { token } => {
                 eprintln!("`{}` is not a type", token.kind.pretty_name(),);
                 print_src(src, &[token.loc]);
             }
-            FloErr::UnsatisfiedTypeKind { ty, kind, loc } => {
-                eprintln!("Could not assign type `{ty:?}` to expression of kind `{kind:?}`");
-                print_src(src, &[loc]);
+            FloErr::UnsatisfiedTypeKind { ty, ty_loc, kind, loc } => {
+                eprintln!("Type `{kind:?}` does not match `{ty:?}`");
+                print_src(src, &[ty_loc, loc]);
             }
             FloErr::TypeMismatch { t1, loc1, t2, loc2 } => {
                 eprintln!("Type `{t1:?}` does not match `{t2:?}`");
@@ -92,6 +89,7 @@ impl FloErr {
 
 use std::collections::BTreeMap;
 
+// DISCLAIMER: This function is written by Claude
 fn print_src(src: String, locs: &[Loc]) {
     if locs.is_empty() {
         return;
@@ -99,27 +97,32 @@ fn print_src(src: String, locs: &[Loc]) {
 
     let mut lines_info: BTreeMap<usize, (&str, usize, Vec<(usize, usize)>)> = BTreeMap::new();
 
+    // Locs are char indices (the tokenizer counts chars, not bytes), so all
+    // offsets here are measured in chars to stay consistent.
+    let src_len = src.chars().count();
+
     let mut all_lines = Vec::new();
     let mut offset = 0;
     for (i, line) in src.split('\n').enumerate() {
-        let line_end = offset + line.len();
-        all_lines.push((i, offset, line_end, line));
+        let line_len = line.chars().count();
+        let line_end = offset + line_len;
+        all_lines.push((i, offset, line_end, line, line_len));
         offset = line_end + 1;
     }
 
     for loc in locs {
-        let start = loc.start.min(src.len());
-        let end = loc.end.min(src.len());
+        let start = loc.start.min(src_len);
+        let end = loc.end.min(src_len);
 
-        for &(line_num, line_start, line_end, line_text) in &all_lines {
+        for &(line_num, line_start, line_end, line_text, line_len) in &all_lines {
             if line_end < start || line_start > end {
                 continue;
             }
 
             let seg_start = start.max(line_start) - line_start;
             let seg_end = end.min(line_end) - line_start;
-            let seg_start = seg_start.min(line_text.len());
-            let seg_end = seg_end.max(seg_start).min(line_text.len());
+            let seg_start = seg_start.min(line_len);
+            let seg_end = seg_end.max(seg_start).min(line_len);
 
             let entry = lines_info
                 .entry(line_num)
@@ -154,7 +157,7 @@ fn print_src(src: String, locs: &[Loc]) {
                 continue;
             }
             underline.push_str(&" ".repeat(seg_start - cursor));
-            let len = (seg_end - seg_start).max(1);
+            let len = seg_end - seg_start + 1;
             underline.push_str(&"^".repeat(len));
             cursor = seg_start + len;
         }
@@ -176,6 +179,8 @@ impl TokenKind {
             TokenKind::Arrow => "->",
             TokenKind::Equal => "=",
             TokenKind::Semicolon => ";",
+            TokenKind::Colon => ":",
+            TokenKind::Comma => ",",
         }
     }
 }

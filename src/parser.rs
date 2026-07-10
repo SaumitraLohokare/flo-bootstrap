@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, Func, Module},
+    ast::{Expr, ExprKind, Func, FuncLocs, Module},
     errors::{FloErr, FloResult},
-    tokenizer::{Token, TokenKind, TokenValue},
+    tokenizer::{Loc, Token, TokenKind, TokenValue},
     types::Type,
     util::Iota,
 };
@@ -51,20 +51,53 @@ impl Parser {
         use TokenKind::*;
         self.expect(Fn)?;
         let name_token = self.expect_get(Ident)?;
+        let name_loc = name_token.loc;
         let TokenValue::String(name) = name_token.value.clone() else {
             unreachable!()
         };
 
         self.expect(LParen)?;
-        self.expect(RParen)?;
 
-        let ret_type = if self.expect(Arrow).is_ok() {
+        let mut arg_types = Vec::new();
+        while self.peek()?.kind == Ident {
+            let _arg_name = self.expect_get(Ident)?;
+            self.expect(Colon)?;
+            let (arg_type, _arg_type_loc) = self.parse_type()?;
+            arg_types.push(arg_type);
+            // TODO: Add a `Scope` and add args to the scope
+            // TODO: Use `Scope` in parse_expr for identifiers
+
+            if self.expect(Comma).is_err() {
+                break
+            }
+        }
+
+        let r_paren_token = self.expect_get(RParen)?;
+        let r_paren_loc = r_paren_token.loc;
+
+        let (ret_type, ret_type_loc) = if self.expect(Arrow).is_ok() {
             self.parse_type()?
         } else {
-            Type::Void
+            (
+                Type::Void,
+                Loc {
+                    start: name_loc.start,
+                    end: r_paren_loc.end,
+                },
+            )
         };
 
-        let ty = self.func_type(ret_type);
+        let func_definition_loc = Loc {
+            start: name_loc.start,
+            end: ret_type_loc.end,
+        };
+
+        let loc = FuncLocs {
+            definition: func_definition_loc,
+            ret_type: ret_type_loc,
+        };
+
+        let ty = self.func_type(arg_types, ret_type);
 
         self.expect(Equal)?;
 
@@ -73,16 +106,12 @@ impl Parser {
         self.expect(Semicolon)?;
 
         if self.funcs.contains_key(&name) {
-            return Err(FloErr::RedifinitionOfFunction { token: name_token });
-        } else {
-            self.funcs.insert(
+            return Err(FloErr::RedifinitionOfFunction {
                 name,
-                Func {
-                    body,
-                    ty,
-                    loc: name_token.loc,
-                },
-            );
+                loc: loc.definition,
+            });
+        } else {
+            self.funcs.insert(name, Func { body, ty, loc });
         }
 
         Ok(())
@@ -122,9 +151,10 @@ impl Parser {
         }
     }
 
-    fn parse_type(&mut self) -> FloResult<Type> {
+    fn parse_type(&mut self) -> FloResult<(Type, Loc)> {
         use TokenKind::*;
         let token = self.peek()?;
+        let loc = token.loc;
 
         match token.kind {
             Ident => {
@@ -134,8 +164,8 @@ impl Parser {
                 };
 
                 match value.as_str() {
-                    "i32" => Ok(Type::I32),
-                    "void" => Ok(Type::Void),
+                    "i32" => Ok((Type::I32, loc)),
+                    "void" => Ok((Type::Void, loc)),
 
                     _ => Err(FloErr::NotAType { token }),
                 }
@@ -186,7 +216,7 @@ impl Parser {
         Type::T(self.type_iota.next())
     }
 
-    fn func_type(&self, ret_type: Type) -> Type {
-        Type::Fn(Vec::new(), Box::new(ret_type))
+    fn func_type(&self, arg_types: Vec<Type>, ret_type: Type) -> Type {
+        Type::Fn(arg_types, Box::new(ret_type))
     }
 }

@@ -1,58 +1,125 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, Func, Module},
-    errors::{FloErr, FloResult},
-    tokenizer::Loc,
-    types::Type,
+    ast::{Expr, ExprKind, Func, Module}, errors::{FloErr, FloResult}, tokenizer::Loc, types::{Type, TypeKind},
 };
 
+type TypeLoc = (Type, Loc);
+
+#[derive(Debug)]
+struct ReplaceSet {
+    ty_to_id: HashMap<TypeLoc, usize>,
+    id_to_ty: Vec<TypeLoc>,
+
+    parents: Vec<usize>,
+}
+
+impl ReplaceSet {
+    fn new() -> Self {
+        Self {
+            ty_to_id: HashMap::new(),
+            id_to_ty: Vec::new(),
+
+            parents: Vec::new(),
+        }
+    }
+
+    // We should add all known types first
+    fn add(&mut self, ty: Type, loc: Loc) -> usize {
+        let type_loc = (ty, loc);
+        if let Some(&id) = self.ty_to_id.get(&type_loc) {
+            return id;
+        }
+        let id = self.id_to_ty.len();
+        self.id_to_ty.push(type_loc.clone());
+        self.ty_to_id.insert(type_loc, id);
+        self.parents.push(id);
+        id
+    }
+
+    fn find(&mut self, type_id: usize) -> usize {
+        // All types should already be added
+        debug_assert!(self.id_to_ty.len() > type_id);
+
+        let mut root = type_id;
+        while self.parents[root] != root {
+            root = self.parents[root];
+        }
+
+        // Path Compression
+        let mut cur = type_id;
+        while cur != root {
+            let next = self.parents[cur];
+            self.parents[cur] = root;
+            cur = next;
+        }
+
+        root
+    }
+
+    fn union(&mut self, a: usize, b: usize) -> FloResult<()> {
+        let ra = self.find(a);
+        let rb = self.find(b);
+
+        let (ra_type, ra_loc) = &self.id_to_ty[ra];
+        let (rb_type, rb_loc) = &self.id_to_ty[rb];
+
+        match (ra_type.is_known(), rb_type.is_known()) {
+            (true, true) => {
+                if ra_type != rb_type {
+                    Err(FloErr::TypeMismatch {
+                        t1: ra_type.clone(),
+                        loc1: *ra_loc,
+                        t2: rb_type.clone(),
+                        loc2: *rb_loc,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            (false, _) => {
+                self.parents[ra] = rb;
+                Ok(())
+            }
+            (_, false) => {
+                self.parents[rb] = ra;
+                Ok(())
+            }
+        }
+    }
+
+    fn resolve(&mut self, ty: Type, loc: Loc) -> FloResult<Type> {
+        let type_loc = (ty, loc);
+
+        let Some(&id) = self.ty_to_id.get(&type_loc) else {
+            unreachable!()
+        };
+        let root = self.find(id);
+        let (root_type, _) = self.id_to_ty[root].clone();
+
+        if root_type.is_known() {
+            Ok(root_type.clone())
+        } else {
+            Err(FloErr::UnresolvedType { loc })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-pub enum TypeKind {
-    Numeric,
-}
-
-impl TypeKind {
-    fn satisfies_type(&self, ty: &Type) -> bool {
-        use Type::*;
-        use TypeKind::*;
-
-        match self {
-            Numeric => matches!(ty, I32),
-        }
-    }
-
-    fn default_type(&self) -> Type {
-        match self {
-            TypeKind::Numeric => Type::I32,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 enum Constraint {
-    IsEqual(Type, Loc, Type, Loc),
-    IsKind(Type, Loc, TypeKind),
+    IsEqual(usize, usize),
+    IsKind(usize, TypeKind, Loc),
 }
 
-pub struct TypeChecker {
-    func_types: HashMap<String, Type>,
-}
+pub struct TypeChecker;
 
 impl TypeChecker {
     pub fn new() -> Self {
-        Self {
-            func_types: HashMap::new(),
-        }
+        Self
     }
 
-    pub fn check(&mut self, module: &mut Module) -> FloResult<()> {
-        for (name, func) in module.funcs.iter() {
-            // NOTE: Redefinition is already checked in parsing
-            self.func_types.insert(name.clone(), func.ty.clone());
-        }
-
-        for (_name, func) in module.funcs.iter_mut() {
+    pub fn check(self, module: &mut Module) -> FloResult<()> {
+        for (_, func) in &mut module.funcs {
             self.check_func(func)?;
         }
 
@@ -60,163 +127,122 @@ impl TypeChecker {
     }
 
     fn check_func(&self, func: &mut Func) -> FloResult<()> {
-        // Using Union-Find solve the constraints
-        // If unsolved constraints: Default types
-        // Solve again
-        // Resolve types for all expressions
-        // Unsolved => Error
+        // 1. Generate Constraints
 
-        // 1. Generate Constraints & Initialize UnionFind
-
-        let Type::Fn(_, ret_ty) = &func.ty else {
-            unreachable!()
-        };
-
+        let mut set = ReplaceSet::new();
         let mut constraints = Vec::new();
+        self.generate_func_constraints(func, &mut set, &mut constraints);
+        self.generate_expr_constraints(&func.body, &mut set, &mut constraints);
 
-        // NOTE: This will have to change once we add `return`
-        constraints.push(Constraint::IsEqual(
-            *ret_ty.clone(),
-            func.loc,
-            func.body.ty.clone(),
-            func.body.loc,
-        ));
+        // 2. Solve Constraints
 
-        self.generate_expr_constraints(&func.body, &mut constraints);
-
-        // 2. Solve constraints
-
-        let mut replace_map = HashMap::new();
-        constraints = self.solve_constraints(constraints, &mut replace_map)?;
+        constraints = self.solve_constraints(&mut set, &mut constraints)?;
 
         // 3. Default Types
 
-        if !constraints.is_empty() {
-            for constraint in &constraints {
-                match constraint {
-                    Constraint::IsKind(ty, _, kind) => {
-                        assert!(!ty.is_known());
-
-                        replace_map.insert(ty.clone(), kind.default_type());
-                    }
-                    _ => {}
+        for constraint in &constraints {
+            use Constraint::*;
+            if let IsKind(id, kind, loc) = constraint {
+                let root = set.find(*id);
+                if !set.id_to_ty[root].0.is_known() {
+                    let default_id = set.add(kind.default_type(), *loc);
+                    set.union(root, default_id)?;
                 }
             }
         }
 
-        // 4. Solve again
+        // 4. Solve Constraints
 
-        _ = self.solve_constraints(constraints, &mut replace_map)?;
+        constraints = self.solve_constraints(&mut set, &mut constraints)?;
+        debug_assert!(constraints.is_empty());
 
-        // 5. Replace types in func
+        // 5. Replace Types in Func
 
-        func.replace_types(&replace_map);
-        func.ensure_resolved()
+        self.resolve_func(func, &mut set)
     }
 
-    fn generate_expr_constraints(&self, expr: &Expr, constraints: &mut Vec<Constraint>) {
+    fn generate_func_constraints(
+        &self,
+        func: &Func,
+        set: &mut ReplaceSet,
+        constraints: &mut Vec<Constraint>,
+    ) {
+        use Constraint::*;
+
+        let Type::Fn(_, ret_ty) = &func.ty else {
+            unreachable!()
+        };
+        let a = set.add(*ret_ty.clone(), func.loc.ret_type);
+        let b = set.add(func.body.ty.clone(), func.body.loc);
+        constraints.push(IsEqual(a, b));
+    }
+
+    fn generate_expr_constraints(
+        &self,
+        expr: &Expr,
+        set: &mut ReplaceSet,
+        constraints: &mut Vec<Constraint>,
+    ) {
         use Constraint::*;
         use ExprKind::*;
         use TypeKind::*;
 
-        let ty = expr.ty.clone();
-
         match expr.kind {
-            Num(_) => constraints.push(IsKind(ty, expr.loc, Numeric)),
+            Num(_) => {
+                let id = set.add(expr.ty.clone(), expr.loc);
+                constraints.push(IsKind(id, Integral, expr.loc));
+            }
         }
     }
 
     fn solve_constraints(
         &self,
-        mut constraints: Vec<Constraint>,
-        replace_map: &mut HashMap<Type, Type>,
+        set: &mut ReplaceSet,
+        constraints: &mut Vec<Constraint>,
     ) -> FloResult<Vec<Constraint>> {
-        loop {
-            let mut keep_solving = false;
-            let mut new_constraints = Vec::new();
-            for constraint in constraints {
-                match constraint {
-                    Constraint::IsEqual(ref t1, loc1, ref t2, loc2) => {
-                        match (t1.is_known(), t2.is_known()) {
-                            (true, true) => {
-                                if t1 != t2 {
-                                    return Err(FloErr::TypeMismatch {
-                                        t1: t1.clone(),
-                                        loc1,
-                                        t2: t2.clone(),
-                                        loc2,
-                                    });
-                                }
-                            }
-                            (false, true) => {
-                                let ty = replace_map.entry(t1.clone()).or_insert(t2.clone());
-                                if ty != t2 {
-                                    return Err(FloErr::TypeMismatch {
-                                        t1: t1.clone(),
-                                        loc1,
-                                        t2: t2.clone(),
-                                        loc2,
-                                    });
-                                }
-                            }
-                            (true, false) => {
-                                let ty = replace_map.entry(t2.clone()).or_insert(t1.clone());
-                                if ty != t1 {
-                                    return Err(FloErr::TypeMismatch {
-                                        t1: t1.clone(),
-                                        loc1,
-                                        t2: t2.clone(),
-                                        loc2,
-                                    });
-                                }
-                            }
-                            (false, false) => new_constraints.push(constraint),
+        let mut pending = Vec::new();
+
+        for constraint in constraints {
+            match constraint {
+                Constraint::IsEqual(a, b) => set.union(*a, *b)?,
+                Constraint::IsKind(id, kind, loc) => {
+                    let root = set.find(*id);
+                    let (ty, ty_loc) = set.id_to_ty[root].clone();
+                    if ty.is_known() {
+                        if !kind.satisfies_type(&ty) {
+                            return Err(FloErr::UnsatisfiedTypeKind {
+                                ty,
+                                ty_loc,
+                                kind: *kind,
+                                loc: *loc,
+                            });
                         }
-                    }
-                    Constraint::IsKind(ref ty, loc, kind) => {
-                        if ty.is_known() {
-                            if !kind.satisfies_type(ty) {
-                                return Err(FloErr::UnsatisfiedTypeKind {
-                                    ty: ty.clone(),
-                                    kind,
-                                    loc,
-                                });
-                            }
-                        } else {
-                            new_constraints.push(constraint);
-                        }
+                    } else {
+                        pending.push(*constraint);
                     }
                 }
-            }
-
-            // Replace all types
-            for constraint in new_constraints.iter_mut() {
-                match constraint {
-                    Constraint::IsEqual(t1, _, t2, _) => {
-                        if let Some(replace_type) = replace_map.get(t1) {
-                            *t1 = replace_type.clone();
-                            keep_solving = true;
-                        }
-                        if let Some(replace_type) = replace_map.get(t2) {
-                            *t2 = replace_type.clone();
-                            keep_solving = true;
-                        }
-                    }
-                    Constraint::IsKind(ty, _, _) => {
-                        if let Some(replace_type) = replace_map.get(ty) {
-                            *ty = replace_type.clone();
-                            keep_solving = true;
-                        }
-                    }
-                }
-            }
-
-            constraints = new_constraints;
-            if !keep_solving {
-                break;
             }
         }
 
-        Ok(constraints)
+        Ok(pending)
+    }
+
+    fn resolve_func(&self, func: &mut Func, set: &mut ReplaceSet) -> FloResult<()> {
+        let Type::Fn(_, ret_type) = &mut func.ty else { unreachable!() };
+
+        // TODO: Resolve arg types
+        *ret_type = Box::new(set.resolve(*ret_type.clone(), func.loc.ret_type)?);
+
+        self.resolve_expr(&mut func.body, set)
+    }
+
+    fn resolve_expr(&self, expr: &mut Expr, set: &mut ReplaceSet) -> FloResult<()> {
+        expr.ty = set.resolve(expr.ty.clone(), expr.loc)?;
+
+        match expr.kind {
+            ExprKind::Num(_) => {}
+        }
+
+        Ok(())
     }
 }
