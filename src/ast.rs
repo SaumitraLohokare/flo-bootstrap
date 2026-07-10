@@ -2,9 +2,10 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::{tokenizer::Loc, types::Type};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FuncLocs {
     pub definition: Loc,
+    pub arg_types: Vec<Loc>, 
     pub ret_type: Loc,
 }
 
@@ -30,6 +31,7 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Num(u64),
+    Var(usize),
 }
 
 // -------------------------------------------
@@ -52,6 +54,7 @@ impl Expr {
         let indent = " ".repeat(indent);
         match self.kind {
             ExprKind::Num(num) => format!("{indent}{num}:{:?}", self.ty),
+            ExprKind::Var(id) => format!("{indent}var_{id}:{:?}", self.ty),
         }
     }
 }

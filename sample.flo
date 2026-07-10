@@ -312,3 +312,15 @@ fn Vec<T>() -> _ = Vec<T> {
     len: 0,
     cap: 0,
 };
+
+---
+
+fn foo(a: i32) = a;
+-- a -> v0
+-- a_type -> i32
+-- a_type_origin -> loc(i32)??
+
+fn foo() -> bool = {
+    let a: u8 = 0;
+    let b: i32 = a;
+}

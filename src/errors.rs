@@ -19,11 +19,18 @@ pub enum FloErr {
         loc: Loc,
     },
 
+    RedifinitionOfArgument {
+        name: String,
+        loc: Loc,
+    },
+
     MainFunctionNotFound,
 
     NotAType {
         token: Token,
     },
+
+    UndefinedIdentifier { name: String, loc: Loc },
 
     UnsatisfiedTypeKind {
         ty: Type,
@@ -64,6 +71,10 @@ impl FloErr {
                 eprintln!("Redifinition of function `{name}`");
                 print_src(src, &[loc]);
             }
+            FloErr::RedifinitionOfArgument { name, loc } => {
+                eprintln!("Redifinition of argument `{name}`");
+                print_src(src, &[loc]);
+            }
             FloErr::NotAType { token } => {
                 eprintln!("`{}` is not a type", token.kind.pretty_name(),);
                 print_src(src, &[token.loc]);
@@ -82,6 +93,11 @@ impl FloErr {
             }
             FloErr::MainFunctionNotFound => {
                 eprintln!("Main function not found.");
+            }
+            FloErr::UndefinedIdentifier { name, loc } => {
+
+                eprintln!("Undefined identifier `{name}`");
+                print_src(src, &[loc]);
             }
         }
     }

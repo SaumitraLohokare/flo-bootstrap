@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, Func, Module}, errors::{FloErr, FloResult}, tokenizer::Loc, types::{Type, TypeKind},
+    ast::{Expr, ExprKind, Func, Module},
+    errors::{FloErr, FloResult},
+    tokenizer::Loc,
+    types::{Type, TypeKind},
 };
 
 type TypeLoc = (Type, Loc);
@@ -169,12 +172,17 @@ impl TypeChecker {
     ) {
         use Constraint::*;
 
-        let Type::Fn(_, ret_ty) = &func.ty else {
+        let Type::Fn(arg_tys, ret_ty) = &func.ty else {
             unreachable!()
         };
+
+        for (arg_ty, &arg_loc) in arg_tys.iter().zip(&func.loc.arg_types) {
+            set.add(arg_ty.clone(), arg_loc);
+        }
+
         let a = set.add(*ret_ty.clone(), func.loc.ret_type);
         let b = set.add(func.body.ty.clone(), func.body.loc);
-        constraints.push(IsEqual(a, b));
+        constraints.push(IsEqual(b, a));
     }
 
     fn generate_expr_constraints(
@@ -192,6 +200,7 @@ impl TypeChecker {
                 let id = set.add(expr.ty.clone(), expr.loc);
                 constraints.push(IsKind(id, Integral, expr.loc));
             }
+            Var(_) => {}
         }
     }
 
@@ -228,9 +237,13 @@ impl TypeChecker {
     }
 
     fn resolve_func(&self, func: &mut Func, set: &mut ReplaceSet) -> FloResult<()> {
-        let Type::Fn(_, ret_type) = &mut func.ty else { unreachable!() };
+        let Type::Fn(arg_types, ret_type) = &mut func.ty else {
+            unreachable!()
+        };
 
-        // TODO: Resolve arg types
+        for (arg_ty, arg_loc) in arg_types.iter_mut().zip(&func.loc.arg_types) {
+            *arg_ty = set.resolve(arg_ty.clone(), *arg_loc)?;
+        }
         *ret_type = Box::new(set.resolve(*ret_type.clone(), func.loc.ret_type)?);
 
         self.resolve_expr(&mut func.body, set)
@@ -241,6 +254,7 @@ impl TypeChecker {
 
         match expr.kind {
             ExprKind::Num(_) => {}
+            ExprKind::Var(_) => {}
         }
 
         Ok(())

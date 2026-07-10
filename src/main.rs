@@ -15,7 +15,9 @@ mod util;
 fn main() {
     let src = r#"
         -- This is a comment
-        fn main() -> void = 0;
+        fn main() -> i32 = 0;
+
+        fn foo(a: i32) -> void = a;
     "#
     .to_string();
 

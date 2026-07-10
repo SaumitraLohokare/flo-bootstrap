@@ -8,6 +8,41 @@ use crate::{
     util::Iota,
 };
 
+struct Scope {
+    var_iota: Iota,
+    vars: HashMap<String, usize>,
+    var_types: HashMap<usize, Type>,
+}
+
+impl Scope {
+    fn new() -> Self {
+        Self {
+            var_iota: Iota::new(),
+            vars: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
+    fn add_arg(&mut self, name: String, ty: Type) -> bool {
+        if self.vars.contains_key(&name) {
+            return false;
+        }
+
+        let var_id = self.var_iota.next();
+        self.vars.insert(name, var_id);
+        self.var_types.insert(var_id, ty);
+        true
+    }
+
+    fn get_var(&self, name: &String) -> Option<usize> {
+        self.vars.get(name).copied()
+    }
+
+    fn get_var_type(&self, id: usize) -> Type {
+        self.var_types[&id].clone()
+    }
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     idx: usize,
@@ -56,19 +91,32 @@ impl Parser {
             unreachable!()
         };
 
+        let mut scope = Scope::new();
+
         self.expect(LParen)?;
 
         let mut arg_types = Vec::new();
+        let mut arg_locs = Vec::new();
         while self.peek()?.kind == Ident {
-            let _arg_name = self.expect_get(Ident)?;
+            let arg = self.expect_get(Ident)?;
+            let TokenValue::String(arg_name) = arg.value else {
+                unreachable!()
+            };
             self.expect(Colon)?;
-            let (arg_type, _arg_type_loc) = self.parse_type()?;
-            arg_types.push(arg_type);
-            // TODO: Add a `Scope` and add args to the scope
-            // TODO: Use `Scope` in parse_expr for identifiers
+            let (arg_type, arg_type_loc) = self.parse_type()?;
+            arg_types.push(arg_type.clone());
+            arg_locs.push(arg_type_loc);
+
+            // EW: clone might be unneccessary
+            if !scope.add_arg(arg_name.clone(), arg_type) {
+                return Err(FloErr::RedifinitionOfArgument {
+                    name: arg_name,
+                    loc: arg.loc,
+                });
+            }
 
             if self.expect(Comma).is_err() {
-                break
+                break;
             }
         }
 
@@ -94,6 +142,7 @@ impl Parser {
 
         let loc = FuncLocs {
             definition: func_definition_loc,
+            arg_types: arg_locs,
             ret_type: ret_type_loc,
         };
 
@@ -101,7 +150,7 @@ impl Parser {
 
         self.expect(Equal)?;
 
-        let body = self.parse_expr(-1)?;
+        let body = self.parse_expr(-1, &scope)?;
 
         self.expect(Semicolon)?;
 
@@ -117,15 +166,15 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_expr(&mut self, _precedence: i32) -> FloResult<Expr> {
-        let lhs = self.parse_atom()?;
+    fn parse_expr(&mut self, _precedence: i32, scope: &Scope) -> FloResult<Expr> {
+        let lhs = self.parse_atom(scope)?;
 
         // TODO
 
         Ok(lhs)
     }
 
-    fn parse_atom(&mut self) -> FloResult<Expr> {
+    fn parse_atom(&mut self, scope: &Scope) -> FloResult<Expr> {
         use TokenKind::*;
 
         let token = self.peek()?;
@@ -141,6 +190,26 @@ impl Parser {
                 Ok(Expr {
                     kind,
                     ty: self.fresh_type(),
+                    loc,
+                })
+            }
+
+            Ident => {
+                let TokenValue::String(name) = &token.value else {
+                    unreachable!()
+                };
+                let var_id = scope.get_var(name).ok_or(FloErr::UndefinedIdentifier {
+                    name: name.clone(),
+                    loc: token.loc,
+                })?;
+                let loc = token.loc;
+
+                self.skip();
+
+                let kind = ExprKind::Var(var_id);
+                Ok(Expr {
+                    kind,
+                    ty: scope.get_var_type(var_id),
                     loc,
                 })
             }
