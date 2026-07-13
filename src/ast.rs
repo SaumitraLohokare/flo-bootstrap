@@ -11,6 +11,18 @@ pub struct FuncLocs {
 
 #[derive(Clone)]
 pub struct Module {
+    /// Every function definition, grouped by source name. A name maps to a list
+    /// of overloads (keyed conceptually by their `(params, return)` signature);
+    /// the parser never rejects duplicates — an unresolvable overload set instead
+    /// surfaces as an ambiguity error during type checking.
+    pub funcs: HashMap<String, Vec<Func>>,
+}
+
+/// The output of the type checker: every overload has been resolved and every
+/// reachable function monomorphized, so names are now mangled and unique and each
+/// maps to exactly one concrete `Func`.
+#[derive(Clone)]
+pub struct ResolvedModule {
     pub funcs: HashMap<String, Func>,
 }
 
@@ -38,6 +50,21 @@ pub enum ExprKind {
 // -------------------------------------------
 
 impl Debug for Module {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Module:")?;
+
+        for (name, overloads) in &self.funcs {
+            for func in overloads {
+                let expr_string = func.body.pretty_print(0);
+                writeln!(f, "fn {name}{:?} = {expr_string};", func.ty)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Debug for ResolvedModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Module:")?;
 

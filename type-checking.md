@@ -14,9 +14,12 @@ Three design questions were settled while writing this:
 1. **Overload specificity** — if a call matches both a generic overload and a
    concrete one, that is an **error** (ambiguous). We do *not* prefer the more
    specific overload.
-2. **Numeric defaulting** — an unresolved numeric literal always defaults to
-   `i32`. If that default then kills every candidate overload, it's an **error**;
-   we don't try to pick a default that keeps an overload alive.
+2. **Numeric defaulting** — a numeric literal defaults to `i32`, but **only after
+   overload resolution has run**. A literal that real constraints haven't pinned to
+   a concrete type does *not* help choose an overload, so a call like `f(0)` against
+   `f(i32)`/`f(u8)` is **ambiguous** (an error), not silently steered to the `i32`
+   overload. Defaulting never drives overload choice, and we don't pick a default
+   just to keep an overload alive.
 3. **No unit type** — there is no `()`/void value. `if`-without-`else`, `while`,
    and `;`-terminated blocks are legal *only in statement position*. Using one
    where a value is expected is a kind/position error, not a type-unit.
@@ -348,27 +351,32 @@ function's polymorphic shape so callers can use it.
 ### 8.2.1 How the bottom-up pass is actually implemented
 
 The prose above describes the algorithm abstractly; here's how it maps onto the
-code in [src/new_type_checker.rs](src/new_type_checker.rs), including a few
+code in [src/type_checker/](src/type_checker/) — chiefly [mod.rs](src/type_checker/mod.rs)
+(the pass driver), [infer.rs](src/type_checker/infer.rs) (constraint generation +
+the solver), [subst.rs](src/type_checker/subst.rs) (freshening/canonicalization),
+and [unify.rs](src/type_checker/unify.rs) (the union-find) — including a few
 decisions that aren't forced by the algorithm but keep the implementation simple.
 
 **Where the schema lives — there is no `Schema` struct.** A schema is "signature +
-residual constraints" (§2), but the signature half already exists: it's the
-function's `func.ty` (a `Type::Fn(params, ret)`) sitting in the `Module`. The
-bottom-up pass **mutates `func.ty` and `func.body` in place**, so once a function
-is processed the module *is* the source of truth for its signature. The only thing
-`Type::Fn` can't represent is a leftover **kind bound on a still-free variable**
-(e.g. `fn bar() -> 'a = 0` has signature `() -> t0` but `t0` must be `Numeric`).
-Those go in one side-map on the checker:
+residual constraints" (§2), but the signature half already exists: it's an
+overload's `func.ty` (a `Type::Fn(params, ret)`) sitting in the `Module`. Because a
+name can be **overloaded**, `module.funcs` maps each name to a **`Vec<Func>`** — one
+entry per overload — and the bottom-up pass **mutates each overload's `func.ty` and
+`func.body` in place**, so once processed the module *is* the source of truth for
+that overload's signature. The only thing `Type::Fn` can't represent is a leftover
+**kind bound on a still-free variable** (e.g. `fn bar() -> 'a = 0` has signature
+`() -> t0` but `t0` must be `Numeric`). Those go in one side-map on the checker,
+keyed the same way — a parallel `Vec` per name, one residual list per overload:
 
 ```
-residuals: HashMap<String, Vec<(usize, TypeKind, Loc)>>   // fn name -> [(var id, kind, where)]
+residuals: HashMap<String, Vec<Vec<(usize, TypeKind, Loc)>>>  // name -> per-overload [(var id, kind, where)]
 ```
 
-So a function's full schema is `module.funcs[name].ty` **plus** `residuals[name]`.
-When a caller resolves a call it reads *both* straight out of the module/side-map —
-processing callees before callers (reverse-topo) guarantees they're already final.
-Freshening (§5.1) is applied to the signature **and** its residual entries at each
-call site.
+So overload `i`'s full schema is `module.funcs[name][i].ty` **plus**
+`residuals[name][i]`. When a caller resolves a call it reads *both* straight out of
+the module/side-map — processing callees before callers (reverse-topo) guarantees
+they're already final. Freshening (§5.1) is applied to the chosen overload's
+signature **and** its residual entries at each call site.
 
 **One id space, two conventions.** Type-variable ids come from three places and
 must never collide:
@@ -393,13 +401,42 @@ the signature changed — a function like `fn foo() -> i32 = 0` has a fixed sign
 yet its body literal still needs resolving from `t2` to `i32`. Gating the body
 write on signature-change would leave those internal types unresolved.
 
-**No worklist in this pass.** §5 describes a worklist run to a fixed point because
-resolving one `Call`/`Op` can prune another's overload set. This pass has no
-overloading yet — every call has exactly one candidate — so there is nothing to
-prune and unification is order-independent. A single pass suffices: unify all the
-equality constraints, then apply all the kind bounds (each either checks against a
-now-concrete type or is recorded as a residual bound). When overloads arrive, this
-is the step that grows back into a real worklist.
+**The overload worklist (§5).** Constraint generation (`gen_expr`) no longer pulls
+callees in directly; instead every call becomes an **`Obligation`** (name, argument
+types, result type, loc) alongside the equality/kind constraints. `solve` then
+unifies all equalities and applies all kind bounds, and runs the overload worklist
+to a fixed point. Each round, for every unresolved obligation it resolves the
+argument/result types to their union-find heads and computes the **live candidates**
+(`candidates`): overloads whose arity matches and whose concrete parameter/return
+types — and residual kind bounds — don't contradict the *already-concrete*
+argument/result types (`compat`). Then:
+
+- **exactly one candidate** → `commit` it: freshen that overload's signature +
+  residuals and unify `arg_i ~ param_i`, `result ~ ret`, adding its kind bounds.
+  This can make more variables concrete and unlock other obligations, so the loop
+  runs again.
+- **zero candidates** → error. Pruning is monotonic (unification only ever makes
+  types *more* concrete, which only removes candidates), so zero now means zero
+  forever — reported as `NoMatchingOverload`, or the sharper `CallArityMismatch` /
+  `UndefinedFunction` when that's the cause.
+- **two or more** → depends on the mode (below).
+
+**Two modes: `strict`.** The bottom-up pass solves **non-strict**: a call still
+sitting on ≥2 candidates when the loop stalls is *left unresolved*, not errored —
+the function stays polymorphic there, and the specialize pass retries it once
+concrete argument types arrive. The specialize pass solves **strict**: a stalled
+≥2-candidate call is a genuine `AmbiguousCall` error, because by then every argument
+type is concrete and no further information can arrive.
+
+**Resolve before default; free vars are wildcards when pruning.** Overload
+resolution runs entirely *before* `default_free` (§7). Crucially, an argument whose
+type is still a free variable — an un-pinned numeric literal like `0` — is treated
+*permissively* by `candidates`: it neither prunes a candidate nor commits one. So
+`f(0)` against `f(i32)`/`f(u8)` is ambiguous (both survive) rather than being
+silently steered to `i32`. Only concrete types prune; defaulting never chooses an
+overload. A single non-overloaded call still reports its true kind/type error
+(rather than "no matching overload"), because a lone candidate is committed and the
+real unification surfaces the mismatch.
 
 **Errors don't wedge the loop.** If solving a function errors (type mismatch, kind
 violation, arity/undefined-call), the error is recorded and that function is marked
@@ -448,17 +485,27 @@ don't emit code for them).
 ### 8.3.1 How the specialize pass is actually implemented
 
 This maps §8.3 onto the `Specializer` in
-[src/new_type_checker.rs](src/new_type_checker.rs). It runs only after a clean
-bottom-up pass (if that pass errored, the schemas can't be trusted, so specialize
-is skipped).
+[src/type_checker/specialize.rs](src/type_checker/specialize.rs). It runs only after
+a clean bottom-up pass (if that pass errored, the schemas can't be trusted, so
+specialize is skipped).
+
+**Picking the overload (`select_overload`).** `specialize(name, args, expected_ret,
+loc)` first chooses *which* overload it is specializing. By the time a call is
+reached, `args` — and, at every real call site, `expected_ret` — are concrete, so
+`candidates` must return exactly one overload: the same one the strict solve already
+committed to. Zero or several here is an error (`NoMatchingOverload` /
+`AmbiguousCall`). The root `main` passes `expected_ret = None` (permissive) and,
+being unoverloadable (the parser rejects a second `main`), always has a single
+candidate.
 
 **The memo table replaces `specialized_schemas`.** Instances live in
 `instances: HashMap<InstanceKey, Option<Func>>` where the key is `(function name,
-concrete arg types, concrete return type)` — no overload-id yet, but the return
-type *is* part of the key (see the return-polymorphism note below). The value is
-`None` while the instance is being built (the in-progress marker) and `Some(func)`
-once the concrete body is done; the return type isn't stored again in the value
-since it's already the third element of the key.
+concrete arg types, concrete return type)`. No separate overload-id is needed — the
+resolved `(args, ret)` already pin down which overload this is — and the return type
+*is* part of the key (see the return-polymorphism note below). The value is `None`
+while the instance is being built (the in-progress marker) and `Some(func)` once the
+concrete body is done; the return type isn't stored again in the value since it's
+already the third element of the key.
 
 **The caller's expected return type is threaded in — this is the subtle part.**
 §8.3 keys instances by argument types alone, which quietly assumes a function's
@@ -476,9 +523,12 @@ caller's union-find, so it passes that as `Some(ret)`; only the root `main` pass
 return is unified in as `IsEqual(fret, expected_ret)` *before* `default_free` runs,
 so real information wins and `zero` becomes `() -> u8` here. Two call sites at
 different types therefore yield two genuinely distinct instances — which is exactly
-why the return type is in the key, and in the mangled name (`mangle` appends it only
-when `schema_return_polymorphic` holds, so ordinary functions stay `foo$u8` /
-`bar$i32` and only return-polymorphic ones get the extra tag, `zero$u8`).
+why the return type is in the key and in the **mangled name**. `mangle` appends
+every argument type tag *and* the return tag to the name (only `main` is exempt and
+stays `main`), so instances that differ in either arguments or return can't collide:
+`bar$i32$i32`, `foo$u8$u8`, and the nullary `zero$u8`. With overloading this return
+tag is essential — two overloads that differ *only* in return type (`make() -> i32`
+vs `make() -> u8`) resolve to `make$i32` and `make$u8`.
 
 **Return type is registered before the body — that's what terminates recursion.**
 The mandatory in-progress marker (§8.3 step 1) works because the concrete return
@@ -491,17 +541,19 @@ the full key is known before any solving.
 
 **One solve, then a resolve-and-rewrite walk.** Unlike the abstract description's
 "solve / default / solve again / feed callee returns back", the implementation does
-a *single* solve because there are no overloads to prune: instantiate the schema
-(freshen signature, body, and residuals through one shared map so linked variables
-stay linked), pin `param_i = A_i` and `fret = expected_ret`, regenerate the body's
-constraints with the same `gen_expr` the bottom-up pass uses, unify, then
-`default_free`. Because `gen_expr` re-links every call's argument/return to the
-callee's schema, each call's result type is already concrete after this solve — no
-need to explicitly feed callee return types back in. A second pass
-(`resolve_and_specialize`) then walks the concrete body: it resolves every type
-and, at each call, recurses into `specialize` for the callee (passing the call's
-concrete result as the expected return) and rewrites the call target to the callee
-instance's mangled name.
+a *single* `solve` (the strict overload worklist of §8.2.1) followed by
+`default_free`: instantiate the chosen overload's schema (freshen signature, body,
+and residuals through one shared map so linked variables stay linked), pin
+`param_i = A_i` and `fret = expected_ret`, regenerate the body's constraints with
+the same `gen_expr` the bottom-up pass uses, then hand the obligations to `solve`
+with `strict = true`. The worklist resolves every body call against the now-concrete
+argument types; because `commit` re-links each call's argument/return to the callee's
+schema, each call's result type is already concrete afterwards — no need to
+explicitly feed callee return types back in. A second pass
+(`resolve_and_specialize`) then walks the concrete body: it resolves every type and,
+at each call, recurses into `specialize` for the callee (passing the call's concrete
+result as the expected return) and rewrites the call target to the callee instance's
+mangled name.
 
 **Defaulting is genuinely last (§7).** `default_free` runs *after* unification —
 including the caller's demanded return type — and only binds variables that are
@@ -509,12 +561,16 @@ still free *and* carry a kind bound, to that kind's default (`Numeric → i32`).
 Anything real information pinned down is untouched. A variable still free with *no*
 bound after defaulting is a real `UnresolvedType` error, not a panic.
 
-**The output is a fresh monomorphic module.** `into_module` collapses the memo
-table into a `HashMap<String, Func>` keyed by mangled name (`main` stays `main`;
-other names get their arg types, plus the return type for return-polymorphic
-functions). `check` then *replaces* `module.funcs` with this set. Unreachable
-functions never entered the memo, so they simply vanish from the module — exactly
-the "don't emit code for them" behavior the guide calls for.
+**The output is a `ResolvedModule`.** `into_module` collapses the memo table into a
+`HashMap<String, Func>` keyed by mangled name (`main` stays `main`; every other name
+carries its argument tags and return tag). `check` wraps it in a **`ResolvedModule`**
+— a type distinct from `Module`, whose `funcs` is `HashMap<String, Func>` (one
+concrete function per mangled name) rather than `Module`'s `HashMap<String,
+Vec<Func>>` (overload sets). `check`'s signature is therefore
+`Result<ResolvedModule, Vec<FloErr>>`, and it `assert!`s the invariant that every
+instance is fully monomorphic — no unresolved type variable survives anywhere in a
+resolved signature. Unreachable functions never entered the memo, so they simply
+vanish — exactly the "don't emit code for them" behavior the guide calls for.
 
 ---
 
@@ -528,18 +584,26 @@ Pulling the overload rules together, since they're the subtle part:
   with any argument, so known arguments never prune it.
 - **0 live candidates** → error (no overload accepts these arguments).
 - **1 live candidate** → resolve and pull it in (§5 step 2).
-- **≥2 live candidates after solving *and* defaulting** → **ambiguity error**. This
-  is the decided behavior (question 1): when both `fn id(x)` and `fn id(x: i32)` are
-  in scope and you call `id(0)`, defaulting makes the argument `i32`; that prunes
-  nothing (both the generic and the `i32` overload accept `i32`), two candidates
-  remain, and it's an error. We do **not** implement "most specific wins."
+- **≥2 live candidates once the worklist stalls** → **ambiguity error** in the
+  strict (specialize) pass; left unresolved in the non-strict (bottom-up) pass. This
+  is the decided behavior (question 1): we do **not** implement "most specific wins."
+  When both `fn id(x)` and `fn id(x: i32)` are in scope and `id` is called with an
+  `i32`-typed value, the generic overload accepts anything and the `i32` overload
+  accepts `i32`, so two candidates remain — an error.
 
-Contrast the two foo.flo examples that look similar:
+**Ordering (as implemented).** Resolution runs *before* defaulting, and an argument
+still on a free type variable is treated permissively — it never prunes. So
+ambiguity is decided on *real* concrete types only; a bare literal `0` is **not**
+defaulted to `i32` first to break a tie. Concretely, with the implemented type set
+(`i32`/`u8`, both `Numeric`):
 
-- `fn id(x: i32)` + `fn id(x: bool)`, call `id(0)`: defaulting → `i32` prunes the
-  `bool` overload; one candidate left; fine.
-- `fn id(x)` + `fn id(x: i32)`, call `id(0)`: defaulting → `i32` prunes nothing;
-  two candidates; **ambiguous error**.
+- `fn id(x: i32)` + `fn id(x: u8)`, call `id(0)`: `0` stays a free numeric variable,
+  neither concrete overload prunes, two candidates → **ambiguous error** (you must
+  annotate). It is *not* silently resolved to `i32` by defaulting.
+- The same call resolves cleanly when context pins the type — e.g. the result flows
+  into a parameter of known type, making the argument concrete before the worklist
+  looks at it (see the `add(id(1), id(1))` example, where `add`'s `i32`/`u8`
+  parameters select the two `id` overloads).
 
 ---
 
@@ -565,10 +629,14 @@ Two independent mechanisms handle recursion; don't conflate them:
   (`i32` vs `bool`).
 - **Kind violation** — a `Numeric`-bound variable forced to a non-numeric type
   (`true + 1`).
-- **No matching overload** — a `Call`/`Op` pruned to 0 candidates.
-- **Ambiguous call** — a `Call`/`Op` with ≥2 candidates after solving + defaulting.
-- **Ambiguous numeric type** — defaulting to `i32` empties an overload set; user
-  must annotate.
+- **No matching overload** — a `Call`/`Op` pruned to 0 candidates (`NoMatchingOverload`;
+  the sharper `CallArityMismatch` / `UndefinedFunction` when that's the cause).
+- **Ambiguous call** — a `Call`/`Op` still on ≥2 candidates when the strict worklist
+  stalls (`AmbiguousCall`). Because resolution precedes defaulting, an un-pinned
+  numeric literal that matches several numeric overloads triggers this — the fix is
+  an annotation.
+- **Multiple `main` definitions** — `main` is the single specialize root and can't
+  be overloaded (`MultipleMainDefinitions`).
 - **Position error** — a non-value-producing form (`while`, `if`-without-`else`,
   `;`-terminated block, assignment) used in value position. (Structural; can be
   caught before inference.)

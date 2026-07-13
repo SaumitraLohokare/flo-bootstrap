@@ -7,6 +7,10 @@ impl Iota {
         Self { counter: 0 }
     }
 
+    pub fn reset(&mut self) {
+        self.counter = 0;
+    }
+
     pub fn next(&mut self) -> usize {
         let n = self.counter;
         self.counter += 1;

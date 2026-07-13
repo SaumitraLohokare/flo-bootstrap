@@ -16,9 +16,13 @@ fn main() {
     let src = r#"
         -- This is a comment
 
-        fn zero() = 0;
-        fn foo(x: u8) = x;
-        fn main() = foo(zero());
+        -- fn nop() -> void = {};
+
+        -- fn main() = nop();
+
+        fn main() = add(id(1), id(1));
+        fn id(a, b) = a;
+        fn add(a: i32, b: u8) = b;
     "#
     .to_string();
 
@@ -33,13 +37,15 @@ fn main() {
 
     println!("{module:?}");
 
-    let errs = TypeChecker::new(&mut module).check();
-    if !errs.is_empty() {
-        for err in errs {
-            err.pretty_print(&src);
+    let resolved = match TypeChecker::new(&mut module).check() {
+        Ok(resolved) => resolved,
+        Err(errs) => {
+            for err in errs {
+                err.pretty_print(&src);
+            }
+            exit(1);
         }
-        exit(1);
-    }
+    };
 
-    println!("{module:?}");
+    println!("{resolved:?}");
 }

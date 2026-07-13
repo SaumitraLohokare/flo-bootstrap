@@ -8,8 +8,8 @@ use crate::{
     util::Iota,
 };
 
+#[derive(Debug, Clone)]
 struct Scope {
-    var_iota: Iota,
     vars: HashMap<String, usize>,
     var_types: HashMap<usize, Type>,
 
@@ -19,22 +19,15 @@ struct Scope {
 impl Scope {
     fn new() -> Self {
         Self {
-            var_iota: Iota::new(),
             vars: HashMap::new(),
             var_types: HashMap::new(),
             type_vars: HashMap::new(),
         }
     }
 
-    fn add_arg(&mut self, name: String, ty: Type) -> bool {
-        if self.vars.contains_key(&name) {
-            return false;
-        }
-
-        let var_id = self.var_iota.next();
-        self.vars.insert(name, var_id);
-        self.var_types.insert(var_id, ty);
-        true
+    fn add_var(&mut self, name: String, id: usize, ty: Type) {
+        self.vars.insert(name, id);
+        self.var_types.insert(id, ty);
     }
 
     fn get_var(&self, name: &String) -> Option<usize> {
@@ -58,9 +51,10 @@ pub struct Parser {
     tokens: Vec<Token>,
     idx: usize,
 
+    var_iota: Iota,
     type_iota: Iota,
 
-    funcs: HashMap<String, Func>,
+    funcs: HashMap<String, Vec<Func>>,
 }
 
 impl Parser {
@@ -68,6 +62,7 @@ impl Parser {
         Self {
             tokens,
             idx: 0,
+            var_iota: Iota::new(),
             type_iota: Iota::new(),
             funcs: HashMap::new(),
         }
@@ -86,15 +81,21 @@ impl Parser {
             }
         }
 
-        if !self.funcs.contains_key("main") {
-            Err(FloErr::MainFunctionNotFound)
-        } else {
-            Ok(Module { funcs: self.funcs })
+        match self.funcs.get("main") {
+            None => Err(FloErr::MainFunctionNotFound),
+            // `main` is the single specialize root and stays unmangled, so it can
+            // never be overloaded.
+            Some(mains) if mains.len() > 1 => Err(FloErr::MultipleMainDefinitions {
+                locs: mains.iter().map(|f| f.loc.definition).collect(),
+            }),
+            Some(_) => Ok(Module { funcs: self.funcs }),
         }
     }
 
     fn parse_func(&mut self) -> FloResult<()> {
         use TokenKind::*;
+        self.var_iota.reset();
+
         self.expect(Fn)?;
         let name_token = self.expect_get(Ident)?;
         let name_loc = name_token.loc;
@@ -109,22 +110,25 @@ impl Parser {
         let mut arg_types = Vec::new();
         let mut arg_locs = Vec::new();
         while self.peek()?.kind == Ident {
+            // Parse arg name
             let arg = self.expect_get(Ident)?;
             let TokenValue::String(arg_name) = arg.value else {
                 unreachable!()
             };
-            self.expect(Colon)?;
-            let (arg_type, arg_type_loc) = self.parse_type(&mut scope)?;
+
+            // Parse arg type
+            let (arg_type, arg_type_loc) = if self.expect(Colon).is_ok() {
+                self.parse_type(&mut scope)?
+            } else {
+                (self.fresh_type(), arg.loc)
+            };
+
+            // Store arg types and loc (Do we need these?)
             arg_types.push(arg_type.clone());
             arg_locs.push(arg_type_loc);
 
-            // EW: clone might be unneccessary
-            if !scope.add_arg(arg_name.clone(), arg_type) {
-                return Err(FloErr::RedifinitionOfArgument {
-                    name: arg_name,
-                    loc: arg.loc,
-                });
-            }
+            // Register arg in scope
+            self.fresh_arg(arg_name, arg_type, arg.loc, &mut scope)?;
 
             if self.expect(Comma).is_err() {
                 break;
@@ -165,14 +169,13 @@ impl Parser {
 
         self.expect(Semicolon)?;
 
-        if self.funcs.contains_key(&name) {
-            return Err(FloErr::RedifinitionOfFunction {
-                name,
-                loc: loc.definition,
-            });
-        } else {
-            self.funcs.insert(name, Func { body, ty, loc });
-        }
+        // Overloads are permitted: every definition is kept. An overload set that
+        // can't be narrowed to a single candidate at a call site becomes an
+        // ambiguity error during type checking, not a redefinition error here.
+        self.funcs
+            .entry(name)
+            .or_default()
+            .push(Func { body, ty, loc });
 
         Ok(())
     }
@@ -306,6 +309,27 @@ impl Parser {
         }
     }
 
+    fn fresh_arg(&mut self, name: String, ty: Type, loc: Loc, scope: &mut Scope) -> FloResult<()> {
+        if let Some(_) = scope.get_var(&name) {
+            Err(FloErr::RedifinitionOfArgument {
+                name: name,
+                loc: loc,
+            })
+        } else {
+            let id = self.var_iota.next();
+            scope.add_var(name, id, ty);
+            Ok(())
+        }
+    }
+
+    fn fresh_type(&mut self) -> Type {
+        Type::T(self.type_iota.next())
+    }
+
+    fn func_type(&self, arg_types: Vec<Type>, ret_type: Type) -> Type {
+        Type::Fn(arg_types, Box::new(ret_type))
+    }
+
     fn peek(&self) -> FloResult<&Token> {
         self.tokens.get(self.idx).ok_or(FloErr::UnexpectedEOF)
     }
@@ -346,13 +370,5 @@ impl Parser {
             self.skip();
             Ok(token)
         }
-    }
-
-    fn fresh_type(&mut self) -> Type {
-        Type::T(self.type_iota.next())
-    }
-
-    fn func_type(&self, arg_types: Vec<Type>, ret_type: Type) -> Type {
-        Type::Fn(arg_types, Box::new(ret_type))
     }
 }

@@ -15,17 +15,30 @@ pub enum FloErr {
         found: Token,
     },
 
-    RedifinitionOfFunction {
-        name: String,
-        loc: Loc,
-    },
-
     RedifinitionOfArgument {
         name: String,
         loc: Loc,
     },
 
     MainFunctionNotFound,
+    /// `main` is the single specialize root and stays unmangled, so it can never
+    /// be overloaded. Carries every `main` definition's loc so all are shown.
+    MultipleMainDefinitions {
+        locs: Vec<Loc>,
+    },
+
+    /// A call whose overload set could not be narrowed to a single candidate:
+    /// two or more overloads remained possible after pruning.
+    AmbiguousCall {
+        name: String,
+        loc: Loc,
+        candidates: usize,
+    },
+    /// A call for which no overload matched (wrong argument types / kinds).
+    NoMatchingOverload {
+        name: String,
+        loc: Loc,
+    },
 
     NotAType {
         token: Token,
@@ -81,10 +94,6 @@ impl FloErr {
                 );
                 print_src(src, &[found.loc]);
             }
-            FloErr::RedifinitionOfFunction { name, loc } => {
-                eprintln!("Redifinition of function `{name}`");
-                print_src(src, &[loc]);
-            }
             FloErr::RedifinitionOfArgument { name, loc } => {
                 eprintln!("Redifinition of argument `{name}`");
                 print_src(src, &[loc]);
@@ -112,6 +121,22 @@ impl FloErr {
             }
             FloErr::MainFunctionNotFound => {
                 eprintln!("Main function not found.");
+            }
+            FloErr::MultipleMainDefinitions { locs } => {
+                eprintln!("`main` is defined more than once and cannot be overloaded");
+                print_src(src, &locs);
+            }
+            FloErr::AmbiguousCall {
+                name,
+                loc,
+                candidates,
+            } => {
+                eprintln!("Call to `{name}` is ambiguous: {candidates} overloads match");
+                print_src(src, &[loc]);
+            }
+            FloErr::NoMatchingOverload { name, loc } => {
+                eprintln!("No overload of `{name}` matches this call");
+                print_src(src, &[loc]);
             }
             FloErr::UndefinedIdentifier { name, loc } => {
                 eprintln!("Undefined identifier `{name}`");
