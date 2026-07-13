@@ -12,6 +12,8 @@ struct Scope {
     var_iota: Iota,
     vars: HashMap<String, usize>,
     var_types: HashMap<usize, Type>,
+
+    type_vars: HashMap<String, Type>,
 }
 
 impl Scope {
@@ -20,6 +22,7 @@ impl Scope {
             var_iota: Iota::new(),
             vars: HashMap::new(),
             var_types: HashMap::new(),
+            type_vars: HashMap::new(),
         }
     }
 
@@ -40,6 +43,14 @@ impl Scope {
 
     fn get_var_type(&self, id: usize) -> Type {
         self.var_types[&id].clone()
+    }
+
+    fn add_type_var(&mut self, name: String, ty: Type) {
+        self.type_vars.insert(name, ty);
+    }
+
+    fn get_type_var(&self, name: &String) -> Option<Type> {
+        self.type_vars.get(name).cloned()
     }
 }
 
@@ -103,7 +114,7 @@ impl Parser {
                 unreachable!()
             };
             self.expect(Colon)?;
-            let (arg_type, arg_type_loc) = self.parse_type()?;
+            let (arg_type, arg_type_loc) = self.parse_type(&mut scope)?;
             arg_types.push(arg_type.clone());
             arg_locs.push(arg_type_loc);
 
@@ -124,10 +135,10 @@ impl Parser {
         let r_paren_loc = r_paren_token.loc;
 
         let (ret_type, ret_type_loc) = if self.expect(Arrow).is_ok() {
-            self.parse_type()?
+            self.parse_type(&mut scope)?
         } else {
             (
-                Type::Void,
+                self.fresh_type(),
                 Loc {
                     start: name_loc.start,
                     end: r_paren_loc.end,
@@ -150,7 +161,7 @@ impl Parser {
 
         self.expect(Equal)?;
 
-        let body = self.parse_expr(-1, &scope)?;
+        let body = self.parse_expr(-1, &mut scope)?;
 
         self.expect(Semicolon)?;
 
@@ -166,7 +177,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_expr(&mut self, _precedence: i32, scope: &Scope) -> FloResult<Expr> {
+    fn parse_expr(&mut self, _precedence: i32, scope: &mut Scope) -> FloResult<Expr> {
         let lhs = self.parse_atom(scope)?;
 
         // TODO
@@ -174,7 +185,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_atom(&mut self, scope: &Scope) -> FloResult<Expr> {
+    fn parse_atom(&mut self, scope: &mut Scope) -> FloResult<Expr> {
         use TokenKind::*;
 
         let token = self.peek()?;
@@ -247,7 +258,7 @@ impl Parser {
         }
     }
 
-    fn parse_type(&mut self) -> FloResult<(Type, Loc)> {
+    fn parse_type(&mut self, scope: &mut Scope) -> FloResult<(Type, Loc)> {
         use TokenKind::*;
         let token = self.peek()?;
         let loc = token.loc;
@@ -261,10 +272,32 @@ impl Parser {
 
                 match value.as_str() {
                     "i32" => Ok((Type::I32, loc)),
+                    "u8" => Ok((Type::U8, loc)),
                     "void" => Ok((Type::Void, loc)),
 
                     _ => Err(FloErr::NotAType { token }),
                 }
+            }
+
+            SingleQuote => {
+                let mut loc = token.loc;
+                self.skip();
+                let ident = self.expect_get(Ident)?;
+                let TokenValue::String(type_name) = ident.value else {
+                    unreachable!()
+                };
+                loc.end = ident.loc.end;
+
+                let ty = match scope.get_type_var(&type_name) {
+                    Some(ty) => ty,
+                    None => {
+                        let ty = self.fresh_type();
+                        scope.add_type_var(type_name, ty.clone());
+                        ty
+                    }
+                };
+
+                Ok((ty, loc))
             }
 
             _ => Err(FloErr::NotAType {

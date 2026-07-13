@@ -12,6 +12,8 @@ pub enum TokenKind {
     Comma,
     Arrow,
 
+    SingleQuote,
+
     Equal,
 
     Semicolon,
@@ -70,6 +72,8 @@ impl Tokenizer {
 
                 '(' => tokens.push(self.tokenize_symbol("(", TokenKind::LParen)),
                 ')' => tokens.push(self.tokenize_symbol(")", TokenKind::RParen)),
+
+                '\'' => tokens.push(self.tokenize_symbol("'", TokenKind::SingleQuote)),
 
                 ':' => tokens.push(self.tokenize_symbol(":", TokenKind::Colon)),
                 ',' => tokens.push(self.tokenize_symbol(",", TokenKind::Comma)),

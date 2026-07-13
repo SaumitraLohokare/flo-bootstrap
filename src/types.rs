@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeKind {
     Integral,
 }
@@ -11,7 +11,7 @@ impl TypeKind {
         use TypeKind::*;
 
         match self {
-            Integral => matches!(ty, I32),
+            Integral => matches!(ty, I32 | U8),
         }
     }
 
@@ -36,24 +36,9 @@ pub enum Type {
 
     /// i32
     I32,
-}
 
-impl Type {
-    pub fn is_known(&self) -> bool {
-        match self {
-            Type::T(_) => false,
-
-            Type::Fn(args, ret) => {
-                let mut known = true;
-                for arg in args {
-                    known &= arg.is_known();
-                }
-                known && ret.is_known()
-            }
-
-            Type::Void | Type::I32 => true,
-        }
-    }
+    /// u8
+    U8,
 }
 
 impl Debug for Type {
@@ -70,6 +55,7 @@ impl Debug for Type {
             }
             Self::Void => write!(f, "void"),
             Self::I32 => write!(f, "i32"),
+            Self::U8 => write!(f, "u8"),
         }
     }
 }

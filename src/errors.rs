@@ -223,6 +223,7 @@ impl TokenKind {
             TokenKind::Semicolon => ";",
             TokenKind::Colon => ":",
             TokenKind::Comma => ",",
+            TokenKind::SingleQuote => "'",
         }
     }
 }
