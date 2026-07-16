@@ -16,13 +16,14 @@ fn main() {
     let src = r#"
         -- This is a comment
 
-        -- fn nop() -> void = {};
+        -- Arithmetic operators desugar to calls against built-in overloads and
+        -- are type-checked like any other function. Bare literals default to i32
+        -- (resolve -> default -> resolve), so no annotations are needed here.
 
-        -- fn main() = nop();
+        fn main() = double(1 + 2 * 3) - -4;
+        fn double(x) = x + is_even(x);
 
-        fn main() = add(id(1), id(1));
-        fn id(a, b) = a;
-        fn add(a: i32, b: u8) = b;
+        fn is_even(n) = n % 2;
     "#
     .to_string();
 

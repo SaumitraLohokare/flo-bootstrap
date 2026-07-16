@@ -181,7 +181,7 @@ impl<'m> Specializer<'m> {
         let this_ret = expr.ty.clone();
 
         match &mut expr.kind {
-            ExprKind::Num(_) | ExprKind::Var(_) => {}
+            ExprKind::Num(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
             ExprKind::Call(name, args) => {
                 let old_args = std::mem::take(args);
                 let mut new_args = Vec::with_capacity(old_args.len());

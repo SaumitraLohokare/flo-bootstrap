@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ast::{Module, ResolvedModule},
+    ast::{Expr, ExprKind, Func, FuncLocs, Module, ResolvedModule},
     errors::FloErr,
     tokenizer::Loc,
     types::{Type, TypeKind},
@@ -49,6 +49,12 @@ impl<'a> TypeChecker<'a> {
     }
 
     pub fn check(mut self) -> Result<ResolvedModule, Vec<FloErr>> {
+        // Inject the built-in operator overloads (`+`, `-`, …) so operator calls
+        // desugared by the parser resolve against real overloads. They have
+        // concrete signatures and body-less (`Intrinsic`) bodies, so both passes
+        // handle them like any other function.
+        register_builtins(self.module);
+
         // SCCs in reverse-topological order (callees before callers). Collect
         // owned names so we no longer borrow the module and can mutate it below.
         let sccs: Vec<Vec<String>> = CallGraph::build(self.module)
@@ -152,6 +158,53 @@ impl<'a> TypeChecker<'a> {
         );
 
         Ok(resolved)
+    }
+}
+
+/// Register the built-in operator overloads. Arithmetic operators desugar to
+/// `Call`s named by their symbol; each gets one overload per numeric type. Unary
+/// `-` shares the `-` name with binary `-` — overload resolution tells them apart
+/// by arity. Symbol names can never collide with user identifiers (which are
+/// alphanumeric/underscore), so injecting them here is always safe. Bodies are
+/// left as `Intrinsic` sentinels until there's an interpreter to fill them in.
+fn register_builtins(module: &mut Module) {
+    // The numeric types operators are defined over (mirrors `TypeKind::Integral`).
+    const NUMERIC: [Type; 2] = [Type::I32, Type::U8];
+    const BINOPS: [&str; 5] = ["+", "-", "*", "/", "%"];
+
+    for op in BINOPS {
+        for ty in &NUMERIC {
+            let func = builtin_func(vec![ty.clone(), ty.clone()], ty.clone());
+            module.funcs.entry(op.to_string()).or_default().push(func);
+        }
+    }
+
+    // Unary minus: `-(t) -> t`, added under the same `-` name as binary minus.
+    for ty in &NUMERIC {
+        let func = builtin_func(vec![ty.clone()], ty.clone());
+        module.funcs.entry("-".to_string()).or_default().push(func);
+    }
+}
+
+/// Build a body-less built-in `Func` with the given (already concrete) parameter
+/// and return types. The `Intrinsic` body carries the return type so the
+/// body-equals-return constraint the passes emit is trivially satisfied; its loc
+/// is a dummy since built-ins have no source position.
+fn builtin_func(params: Vec<Type>, ret: Type) -> Func {
+    let dummy = Loc { start: 0, end: 0 };
+    let arity = params.len();
+    Func {
+        body: Expr {
+            kind: ExprKind::Intrinsic,
+            ty: ret.clone(),
+            loc: dummy,
+        },
+        ty: Type::Fn(params, Box::new(ret)),
+        loc: FuncLocs {
+            definition: dummy,
+            arg_types: vec![dummy; arity],
+            ret_type: dummy,
+        },
     }
 }
 

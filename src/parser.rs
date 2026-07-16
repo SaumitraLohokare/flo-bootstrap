@@ -180,12 +180,74 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_expr(&mut self, _precedence: i32, scope: &mut Scope) -> FloResult<Expr> {
-        let lhs = self.parse_atom(scope)?;
+    /// Precedence-climbing parser. `min_prec` is the lowest binary-operator
+    /// precedence this call is allowed to consume; callers starting a fresh
+    /// expression (function body, call argument) pass `-1` so every operator is in
+    /// range. Operators desugar straight into `Call` nodes named by their symbol
+    /// (`+`, `-`, …) — names no user identifier can collide with — so the type
+    /// checker resolves them exactly like any other overloaded call.
+    fn parse_expr(&mut self, min_prec: i32, scope: &mut Scope) -> FloResult<Expr> {
+        let mut lhs = self.parse_unary(scope)?;
 
-        // TODO
+        while let Some((op, prec)) = self.peek_binop() {
+            if prec < min_prec {
+                break;
+            }
+            self.skip(); // consume the operator token
+
+            // Left-associative: the right operand only binds operators strictly
+            // tighter than this one, so `a - b - c` parses as `(a - b) - c`.
+            let rhs = self.parse_expr(prec + 1, scope)?;
+
+            let loc = Loc {
+                start: lhs.loc.start,
+                end: rhs.loc.end,
+            };
+            lhs = Expr {
+                kind: ExprKind::Call(op.to_string(), vec![lhs, rhs]),
+                ty: self.fresh_type(),
+                loc,
+            };
+        }
 
         Ok(lhs)
+    }
+
+    /// Parse a unary-prefix expression. Unary `-` binds tighter than any binary
+    /// operator and desugars to a one-argument `Call` on `-` (told apart from
+    /// binary `-` by arity during overload resolution).
+    fn parse_unary(&mut self, scope: &mut Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        if self.peek()?.kind == Minus {
+            let minus = self.expect_get(Minus)?;
+            let operand = self.parse_unary(scope)?;
+            let loc = Loc {
+                start: minus.loc.start,
+                end: operand.loc.end,
+            };
+            return Ok(Expr {
+                kind: ExprKind::Call("-".to_string(), vec![operand]),
+                ty: self.fresh_type(),
+                loc,
+            });
+        }
+
+        self.parse_atom(scope)
+    }
+
+    /// If the next token is a binary operator, its symbol name and precedence.
+    /// `* / %` bind tighter than `+ -`.
+    fn peek_binop(&self) -> Option<(&'static str, i32)> {
+        use TokenKind::*;
+        match self.peek_kind().ok()? {
+            Plus => Some(("+", 1)),
+            Minus => Some(("-", 1)),
+            Star => Some(("*", 2)),
+            Slash => Some(("/", 2)),
+            Percent => Some(("%", 2)),
+            _ => None,
+        }
     }
 
     fn parse_atom(&mut self, scope: &mut Scope) -> FloResult<Expr> {

@@ -87,8 +87,9 @@ pub(super) fn gen_expr(
     match &expr.kind {
         ExprKind::Num(_) => kinds.push((expr.ty.clone(), TypeKind::Integral, expr.loc)),
         // A variable reference already shares its parameter's type variable, so
-        // there's nothing to relate here.
-        ExprKind::Var(_) => {}
+        // there's nothing to relate here. A built-in's body is a sentinel with no
+        // constraints of its own.
+        ExprKind::Var(_) | ExprKind::Intrinsic => {}
         ExprKind::Call(name, args) => {
             for arg in args {
                 gen_expr(arg, eqs, kinds, calls);
@@ -146,10 +147,23 @@ pub(super) fn solve(
             }
         }
 
-        // No singleton resolved this round: every remaining call is genuinely
-        // ambiguous with the information available.
+        // No singleton resolved this round: every remaining call is stuck on the
+        // information available so far.
         if !changed {
             if strict {
+                // Resolve → default → resolve (§7/§8.3). Real information has
+                // already been propagated, so as a last resort default the still-
+                // free numeric variables to `i32` and retry: pinning a bare
+                // `1 + 2`'s operands to `i32` prunes the operator's overload set to
+                // one. `default_free` reports whether it bound anything new, so we
+                // only loop while defaulting makes progress (it can't spin, since
+                // each pass binds at least one previously-free variable) and error
+                // only once nothing free remains yet calls are still ambiguous.
+                if uf.default_free() {
+                    pending = next;
+                    continue;
+                }
+
                 let call = next[0];
                 let candidates = call_candidates(&mut uf, module, residuals, call).len();
                 return Err(FloErr::AmbiguousCall {

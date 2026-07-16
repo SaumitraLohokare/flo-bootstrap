@@ -131,11 +131,21 @@ impl FloErr {
                 loc,
                 candidates,
             } => {
-                eprintln!("Call to `{name}` is ambiguous: {candidates} overloads match");
+                if is_operator(&name) {
+                    eprintln!(
+                        "Operator `{name}` is ambiguous here: {candidates} overloads match"
+                    );
+                } else {
+                    eprintln!("Call to `{name}` is ambiguous: {candidates} overloads match");
+                }
                 print_src(src, &[loc]);
             }
             FloErr::NoMatchingOverload { name, loc } => {
-                eprintln!("No overload of `{name}` matches this call");
+                if is_operator(&name) {
+                    eprintln!("No overload of operator `{name}` matches these operands");
+                } else {
+                    eprintln!("No overload of `{name}` matches this call");
+                }
                 print_src(src, &[loc]);
             }
             FloErr::UndefinedIdentifier { name, loc } => {
@@ -152,6 +162,14 @@ impl FloErr {
             }
         }
     }
+}
+
+/// Whether a resolved function name is actually a built-in operator. Operator
+/// overloads are keyed by their symbol (`+`, `-`, …); user identifiers are always
+/// alphanumeric/underscore, so a purely-symbolic name can only be an operator.
+/// Lets overload errors on desugared operator calls read as operator errors.
+fn is_operator(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
 use std::collections::BTreeMap;
@@ -243,6 +261,11 @@ impl TokenKind {
             TokenKind::Num => "number",
             TokenKind::LParen => "(",
             TokenKind::RParen => ")",
+            TokenKind::Plus => "+",
+            TokenKind::Minus => "-",
+            TokenKind::Star => "*",
+            TokenKind::Slash => "/",
+            TokenKind::Percent => "%",
             TokenKind::Arrow => "->",
             TokenKind::Equal => "=",
             TokenKind::Semicolon => ";",

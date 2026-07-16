@@ -8,6 +8,12 @@ pub enum TokenKind {
     LParen,
     RParen,
 
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+
     Colon,
     Comma,
     Arrow,
@@ -69,6 +75,12 @@ impl Tokenizer {
                 '-' if self.peek_n(1) == Some('>') => {
                     tokens.push(self.tokenize_symbol("->", TokenKind::Arrow))
                 }
+
+                '+' => tokens.push(self.tokenize_symbol("+", TokenKind::Plus)),
+                '-' => tokens.push(self.tokenize_symbol("-", TokenKind::Minus)),
+                '*' => tokens.push(self.tokenize_symbol("*", TokenKind::Star)),
+                '/' => tokens.push(self.tokenize_symbol("/", TokenKind::Slash)),
+                '%' => tokens.push(self.tokenize_symbol("%", TokenKind::Percent)),
 
                 '(' => tokens.push(self.tokenize_symbol("(", TokenKind::LParen)),
                 ')' => tokens.push(self.tokenize_symbol(")", TokenKind::RParen)),

@@ -14,12 +14,20 @@ Three design questions were settled while writing this:
 1. **Overload specificity** — if a call matches both a generic overload and a
    concrete one, that is an **error** (ambiguous). We do *not* prefer the more
    specific overload.
-2. **Numeric defaulting** — a numeric literal defaults to `i32`, but **only after
-   overload resolution has run**. A literal that real constraints haven't pinned to
-   a concrete type does *not* help choose an overload, so a call like `f(0)` against
-   `f(i32)`/`f(u8)` is **ambiguous** (an error), not silently steered to the `i32`
-   overload. Defaulting never drives overload choice, and we don't pick a default
-   just to keep an overload alive.
+2. **Numeric defaulting** — a numeric literal defaults to `i32`, applied as a
+   **last resort tiebreak**: overload resolution runs first on real (concrete)
+   type information, and only when it *stalls* on an ambiguity do the still-free
+   numeric variables default to `i32` and resolution **retry** (the
+   **resolve → default → resolve** loop). Real constraints therefore always win —
+   a `u8`-typed context pins the literal before defaulting can fire — but a call
+   with no other information, like `f(0)` against `f(i32)`/`f(u8)` (or a bare
+   `1 + 2`), defaults the literal to `i32` and selects the `i32` overload rather
+   than erroring. Defaulting still never *inspects* the overload set to pick a
+   convenient value; it unconditionally freezes free numerics to `i32`, and the
+   retry then prunes. A value with no numeric bound (e.g. a return-only-overloaded
+   `make()` whose result var carries no kind) is untouched by defaulting and stays
+   ambiguous. (An earlier revision left `f(0)`/`1 + 2` ambiguous; defaulting-as-
+   tiebreak was adopted so bare arithmetic type-checks without annotation.)
 3. **No unit type** — there is no `()`/void value. `if`-without-`else`, `while`,
    and `;`-terminated blocks are legal *only in statement position*. Using one
    where a value is expected is a kind/position error, not a type-unit.
@@ -424,19 +432,27 @@ argument/result types (`compat`). Then:
 **Two modes: `strict`.** The bottom-up pass solves **non-strict**: a call still
 sitting on ≥2 candidates when the loop stalls is *left unresolved*, not errored —
 the function stays polymorphic there, and the specialize pass retries it once
-concrete argument types arrive. The specialize pass solves **strict**: a stalled
-≥2-candidate call is a genuine `AmbiguousCall` error, because by then every argument
-type is concrete and no further information can arrive.
+concrete argument types arrive. The specialize pass solves **strict**: when the
+worklist stalls on a ≥2-candidate call it defaults the free numerics and retries
+(the resolve → default → resolve loop below); a call still stalled after defaulting
+can no longer make progress and is a genuine `AmbiguousCall` error.
 
-**Resolve before default; free vars are wildcards when pruning.** Overload
-resolution runs entirely *before* `default_free` (§7). Crucially, an argument whose
-type is still a free variable — an un-pinned numeric literal like `0` — is treated
-*permissively* by `candidates`: it neither prunes a candidate nor commits one. So
-`f(0)` against `f(i32)`/`f(u8)` is ambiguous (both survive) rather than being
-silently steered to `i32`. Only concrete types prune; defaulting never chooses an
-overload. A single non-overloaded call still reports its true kind/type error
-(rather than "no matching overload"), because a lone candidate is committed and the
-real unification surfaces the mismatch.
+**Resolve → default → resolve; free vars are wildcards when pruning.** Overload
+resolution runs on concrete types first: an argument whose type is still a free
+variable — an un-pinned numeric literal like `0` — is treated *permissively* by
+`candidates` (it neither prunes a candidate nor commits one), so only concrete
+types prune. When the strict worklist stalls with everything it can resolve from
+real information already resolved, `solve` calls `default_free` (§7) — freezing
+every still-free numeric variable to `i32` — and loops again; freezing `0` (or a
+`1 + 2`'s operands) to `i32` prunes the surviving overloads down to the `i32` one,
+which then commits. `default_free` reports whether it bound anything, so the loop
+runs only while defaulting makes progress and reports `AmbiguousCall` once nothing
+free remains yet candidates still tie (e.g. two overloads matching a value that has
+no numeric bound to default). Defaulting never *inspects* the overload set to pick a
+convenient value — it is unconditional, and the retry does the pruning. A single
+non-overloaded call still reports its true kind/type error (rather than "no matching
+overload"), because a lone candidate is committed and the real unification surfaces
+the mismatch.
 
 **Errors don't wedge the loop.** If solving a function errors (type mismatch, kind
 violation, arity/undefined-call), the error is recorded and that function is marked
@@ -539,17 +555,20 @@ hits the memo, reads `ret`, and returns — it never re-enters the body. When th
 caller pinned the return type there's also a fast-path memo check up front, since
 the full key is known before any solving.
 
-**One solve, then a resolve-and-rewrite walk.** Unlike the abstract description's
-"solve / default / solve again / feed callee returns back", the implementation does
-a *single* `solve` (the strict overload worklist of §8.2.1) followed by
-`default_free`: instantiate the chosen overload's schema (freshen signature, body,
-and residuals through one shared map so linked variables stay linked), pin
-`param_i = A_i` and `fret = expected_ret`, regenerate the body's constraints with
-the same `gen_expr` the bottom-up pass uses, then hand the obligations to `solve`
-with `strict = true`. The worklist resolves every body call against the now-concrete
-argument types; because `commit` re-links each call's argument/return to the callee's
-schema, each call's result type is already concrete afterwards — no need to
-explicitly feed callee return types back in. A second pass
+**One solve, then a resolve-and-rewrite walk.** The abstract description's
+"solve / default / solve again" loop lives *inside* `solve` when `strict = true`:
+the implementation instantiates the chosen overload's schema (freshen signature,
+body, and residuals through one shared map so linked variables stay linked), pins
+`param_i = A_i` and `fret = expected_ret`, regenerates the body's constraints with
+the same `gen_expr` the bottom-up pass uses, then hands the obligations to `solve`
+with `strict = true`. When that worklist stalls it defaults free numerics and
+retries internally (§8.2.1), so a single `solve` call already does resolve → default
+→ resolve; the trailing `default_free` in `specialize` only mops up leftover free
+numerics in bodies with no calls to stall on (e.g. `fn main() = 0;`). The worklist
+resolves every body call against the now-concrete argument types; because `commit`
+re-links each call's argument/return to the callee's schema, each call's result type
+is already concrete afterwards — no need to explicitly feed callee return types back
+in. A second pass
 (`resolve_and_specialize`) then walks the concrete body: it resolves every type and,
 at each call, recurses into `specialize` for the callee (passing the call's concrete
 result as the expected return) and rewrites the call target to the callee instance's
@@ -584,25 +603,28 @@ Pulling the overload rules together, since they're the subtle part:
   with any argument, so known arguments never prune it.
 - **0 live candidates** → error (no overload accepts these arguments).
 - **1 live candidate** → resolve and pull it in (§5 step 2).
-- **≥2 live candidates once the worklist stalls** → **ambiguity error** in the
-  strict (specialize) pass; left unresolved in the non-strict (bottom-up) pass. This
-  is the decided behavior (question 1): we do **not** implement "most specific wins."
-  When both `fn id(x)` and `fn id(x: i32)` are in scope and `id` is called with an
-  `i32`-typed value, the generic overload accepts anything and the `i32` overload
-  accepts `i32`, so two candidates remain — an error.
+- **≥2 live candidates once the worklist stalls** → default free numerics and
+  retry (strict pass); left unresolved in the non-strict (bottom-up) pass. Only a
+  stall that *defaulting can't break* is an **ambiguity error**. Question 1 still
+  holds — we do **not** implement "most specific wins." When both `fn id(x)` and
+  `fn id(x: i32)` are in scope and `id` is called with an `i32`-typed value, the
+  generic overload accepts anything and the `i32` overload accepts `i32`; both
+  survive on *concrete* information, defaulting has nothing free to bind, so two
+  candidates remain — an error.
 
-**Ordering (as implemented).** Resolution runs *before* defaulting, and an argument
-still on a free type variable is treated permissively — it never prunes. So
-ambiguity is decided on *real* concrete types only; a bare literal `0` is **not**
-defaulted to `i32` first to break a tie. Concretely, with the implemented type set
-(`i32`/`u8`, both `Numeric`):
+**Ordering (as implemented).** Resolution runs on concrete information first; an
+argument still on a free type variable is treated permissively (it never prunes),
+so real types decide first. Only when the strict worklist stalls does defaulting
+freeze the still-free numerics to `i32` and drive a retry (resolve → default →
+resolve). Concretely, with the implemented type set (`i32`/`u8`, both `Numeric`):
 
-- `fn id(x: i32)` + `fn id(x: u8)`, call `id(0)`: `0` stays a free numeric variable,
-  neither concrete overload prunes, two candidates → **ambiguous error** (you must
-  annotate). It is *not* silently resolved to `i32` by defaulting.
-- The same call resolves cleanly when context pins the type — e.g. the result flows
-  into a parameter of known type, making the argument concrete before the worklist
-  looks at it (see the `add(id(1), id(1))` example, where `add`'s `i32`/`u8`
+- `fn id(x: i32)` + `fn id(x: u8)`, call `id(0)`: no concrete info prunes, the
+  worklist stalls, so `0` defaults to `i32` and the retry selects the `i32`
+  overload. (The `i32`/generic case above is different: there defaulting has
+  nothing free to bind, so it stays ambiguous.)
+- Context still wins when it exists — if `id(0)`'s result flows into a parameter of
+  known type the argument is concrete *before* the worklist stalls, so no defaulting
+  is needed (see the `add(id(1), id(1))` example, where `add`'s `i32`/`u8`
   parameters select the two `id` overloads).
 
 ---
@@ -631,10 +653,13 @@ Two independent mechanisms handle recursion; don't conflate them:
   (`true + 1`).
 - **No matching overload** — a `Call`/`Op` pruned to 0 candidates (`NoMatchingOverload`;
   the sharper `CallArityMismatch` / `UndefinedFunction` when that's the cause).
-- **Ambiguous call** — a `Call`/`Op` still on ≥2 candidates when the strict worklist
-  stalls (`AmbiguousCall`). Because resolution precedes defaulting, an un-pinned
-  numeric literal that matches several numeric overloads triggers this — the fix is
-  an annotation.
+- **Ambiguous call** — a `Call`/`Op` still on ≥2 candidates after the strict
+  worklist has stalled *and* defaulting has run without breaking the tie
+  (`AmbiguousCall`). An un-pinned numeric literal no longer triggers this (it
+  defaults to `i32` and resolves); the remaining cases are ties defaulting can't
+  help — e.g. a value with no numeric bound matching two overloads, or a concrete
+  value matching both a generic and a concrete overload. The fix is an annotation
+  or a more specific type.
 - **Multiple `main` definitions** — `main` is the single specialize root and can't
   be overloaded (`MultipleMainDefinitions`).
 - **Position error** — a non-value-producing form (`while`, `if`-without-`else`,

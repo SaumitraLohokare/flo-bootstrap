@@ -155,15 +155,20 @@ impl UnionFind {
     /// Bind every still-free variable that carries a kind bound to that kind's
     /// default concrete type (`Numeric` → `i32`). Real information has already been
     /// unified in, so this only touches variables nothing else pinned down.
-    pub(super) fn default_free(&mut self) {
+    /// Returns whether any variable was newly bound — the strict solver uses this
+    /// to decide whether a stalled overload set is worth retrying.
+    pub(super) fn default_free(&mut self) -> bool {
         let bounds: Vec<usize> = self.kind.keys().copied().collect();
+        let mut bound_any = false;
         for var in bounds {
             let root = self.find(var);
             if !self.binding.contains_key(&root) {
                 if let Some(&(kind, _)) = self.kind.get(&root) {
                     self.binding.insert(root, kind.default_type());
+                    bound_any = true;
                 }
             }
         }
+        bound_any
     }
 }

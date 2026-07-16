@@ -45,6 +45,11 @@ pub enum ExprKind {
     Num(u64),
     Var(usize),
     Call(String, Vec<Expr>),
+    /// A body-less built-in. Operators desugar to `Call`s against built-in
+    /// overloads (`+`, `-`, …) whose bodies are this sentinel: they carry a
+    /// concrete signature but no source to walk, so every AST walk treats it as a
+    /// leaf. A real implementation is filled in later (e.g. by the interpreter).
+    Intrinsic,
 }
 
 // -------------------------------------------
@@ -87,6 +92,7 @@ impl Expr {
                 let arg_list = exprs.iter().map(|arg| arg.pretty_print(0)).collect::<Vec<_>>().join(", ");
                 format!("{name}({arg_list}):{:?}", self.ty)
             }
+            ExprKind::Intrinsic => format!("{indent}<intrinsic>:{:?}", self.ty),
         }
     }
 }
