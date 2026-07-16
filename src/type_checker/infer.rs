@@ -102,6 +102,22 @@ pub(super) fn gen_expr(
                 loc: expr.loc,
             });
         }
+        // A scope's type is its tail expression's type, or `void` when it has no
+        // tail (or ends in `;`). Without this constraint the scope's own variable
+        // floats free — nothing pins it and, having no kind bound, it can't even be
+        // defaulted, so an unannotated `fn f() = { ... expr }` fails to resolve.
+        ExprKind::Scope(exprs, tail) => {
+            for inner in exprs {
+                gen_expr(inner, eqs, kinds, calls);
+            }
+            match tail {
+                Some(tail) => {
+                    gen_expr(tail, eqs, kinds, calls);
+                    eqs.push((expr.ty.clone(), tail.ty.clone(), expr.loc));
+                }
+                None => eqs.push((expr.ty.clone(), Type::Void, expr.loc)),
+            }
+        }
     }
 }
 

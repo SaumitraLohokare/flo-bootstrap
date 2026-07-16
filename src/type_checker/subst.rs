@@ -41,6 +41,14 @@ pub(super) fn freshen_expr(expr: &mut Expr, map: &mut HashMap<usize, usize>, fre
                 freshen_expr(arg, map, fresh);
             }
         }
+        ExprKind::Scope(exprs, tail) => {
+            for expr in exprs {
+                freshen_expr(expr, map, fresh);
+            }
+            if let Some(expr) = tail {
+                freshen_expr(expr, map, fresh);
+            }
+        }
     }
 }
 
@@ -100,6 +108,14 @@ pub(super) fn resolve_expr_canon(
         ExprKind::Call(_, args) => {
             for arg in args {
                 resolve_expr_canon(arg, uf, map, next);
+            }
+        }
+        ExprKind::Scope(exprs, tail) => {
+            for expr in exprs {
+                resolve_expr_canon(expr, uf, map, next);
+            }
+            if let Some(expr) = tail {
+                resolve_expr_canon(expr, uf, map, next);
             }
         }
     }

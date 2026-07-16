@@ -195,6 +195,17 @@ impl<'m> Specializer<'m> {
                 *name = mangle(&callee, &arg_tys, &this_ret);
                 *args = new_args;
             }
+            ExprKind::Scope(exprs, tail) => {
+                let old_exprs = std::mem::take(exprs);
+                let mut new_exprs = Vec::with_capacity(old_exprs.len());
+                for e in old_exprs {
+                    new_exprs.push(self.resolve_and_specialize(e, uf)?);
+                }
+                *exprs = new_exprs;
+                if let Some(t) = tail.take() {
+                    *tail = Some(Box::new(self.resolve_and_specialize(*t, uf)?));
+                }
+            }
         }
 
         Ok(expr)

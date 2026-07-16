@@ -10,10 +10,10 @@ mod type_checker;
 mod types;
 mod util;
 
-// TODO: Add booleans
-// TODO: Add writing custom operator overloads
-// TODO: Add scope
+// DONE: Add booleans
+// DONE: Add scope
 // TODO: Add If Else + early returns
+// TODO: Add writing custom operator overloads
 // TODO: Add variables
 // TODO: Add While + Continue/Break
 // TODO: Add |>
@@ -26,7 +26,7 @@ mod util;
 // TODO: Add defining external functions/globals
 // TODO: Add structs
 // TODO: Add enums
-// TODO: Add match? or simplify using enums?
+// TODO: Add match
 // TODO: Work on interpreter
 // TODO: Add support for multiple files
 // TODO: Implement compiler in flo
@@ -39,14 +39,15 @@ fn main() {
         -- are type-checked like any other function. Bare literals default to i32
         -- (resolve -> default -> resolve), so no annotations are needed here.
 
-        fn main() = and(or(truth(), lie()), not(lie()));
+        fn main() = {
+            nop();
+            foo(); -- Discarded result
+            foo()
+        };
 
-        fn truth() = true;
-        fn lie() = false;
+        fn nop() -> void = {};
 
-        fn not(b) = !b;
-        fn and(a, b) = a && b;
-        fn or(a, b) = a || b;
+        fn foo() = 0;
     "#
     .to_string();
 

@@ -10,6 +10,8 @@ pub enum TokenKind {
 
     LParen,
     RParen,
+    LCurly,
+    RCurly,
 
     Plus,
     Minus,
@@ -99,6 +101,8 @@ impl Tokenizer {
 
                 '(' => tokens.push(self.tokenize_symbol("(", TokenKind::LParen)),
                 ')' => tokens.push(self.tokenize_symbol(")", TokenKind::RParen)),
+                '{' => tokens.push(self.tokenize_symbol("{", TokenKind::LCurly)),
+                '}' => tokens.push(self.tokenize_symbol("}", TokenKind::RCurly)),
 
                 '\'' => tokens.push(self.tokenize_symbol("'", TokenKind::SingleQuote)),
 

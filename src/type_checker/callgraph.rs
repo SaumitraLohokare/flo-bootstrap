@@ -34,6 +34,14 @@ impl CallGraph {
                     calls.extend(Self::collect_calls(&arg));
                 }
             }
+            Scope(exprs, tail) => {
+                for expr in exprs {
+                    calls.extend(Self::collect_calls(expr));
+                }
+                if let Some(expr) = tail {
+                    calls.extend(Self::collect_calls(expr));
+                }
+            }
         }
 
         calls

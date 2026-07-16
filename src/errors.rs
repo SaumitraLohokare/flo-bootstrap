@@ -277,6 +277,8 @@ impl TokenKind {
             TokenKind::Exclamation => "!",
             TokenKind::AmpAmp => "&&",
             TokenKind::PipePipe => "||",
+            TokenKind::LCurly => "{",
+            TokenKind::RCurly => "}",
         }
     }
 }

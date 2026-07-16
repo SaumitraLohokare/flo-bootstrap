@@ -46,6 +46,7 @@ pub enum ExprKind {
     Bool(bool),
     Var(usize),
     Call(String, Vec<Expr>),
+    Scope(Vec<Expr>, Option<Box<Expr>>),
     /// A body-less built-in. Operators desugar to `Call`s against built-in
     /// overloads (`+`, `-`, …) whose bodies are this sentinel: they carry a
     /// concrete signature but no source to walk, so every AST walk treats it as a
@@ -84,8 +85,8 @@ impl Debug for ResolvedModule {
 }
 
 impl Expr {
-    fn pretty_print(&self, indent: usize) -> String {
-        let indent = " ".repeat(indent);
+    fn pretty_print(&self, indent_amt: usize) -> String {
+        let indent = " ".repeat(indent_amt);
         match &self.kind {
             ExprKind::Num(num) => format!("{indent}{num}:{:?}", self.ty),
             ExprKind::Bool(value) => format!("{indent}{value}:{:?}", self.ty),
@@ -96,9 +97,23 @@ impl Expr {
                     .map(|arg| arg.pretty_print(0))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{name}({arg_list}):{:?}", self.ty)
+                format!("{indent}{name}({arg_list}):{:?}", self.ty)
             }
             ExprKind::Intrinsic => format!("{indent}<intrinsic>:{:?}", self.ty),
+            ExprKind::Scope(exprs, tail) => {
+                let exprs_str = exprs
+                    .iter()
+                    .map(|e| format!("{};", e.pretty_print(indent_amt + 2)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let tail_str = if let Some(e) = tail {
+                    format!("\n{}", e.pretty_print(indent_amt + 2))
+                } else {
+                    "".to_string()
+                };
+
+                format!("{indent}{{\n{exprs_str}{tail_str}\n}}")
+            }
         }
     }
 }

@@ -351,6 +351,35 @@ impl Parser {
                 }
             }
 
+            LCurly => {
+                let l_curly = self.expect_get(LCurly)?;
+
+                let mut exprs = Vec::new();
+                let mut tail = None;
+                while self.peek()?.kind != RCurly {
+                    if let Some(old_tail) = tail {
+                        exprs.push(old_tail);
+                    }
+                    tail = Some(self.parse_expr(-1, scope)?);
+                    if self.expect(Semicolon).is_err() {
+                        break;
+                    }
+                }
+
+                let r_curly = self.expect_get(RCurly)?;
+                let loc = Loc {
+                    start: l_curly.loc.start,
+                    end: r_curly.loc.end,
+                };
+
+                let kind = ExprKind::Scope(exprs, tail.map(|e| Box::new(e)));
+                Ok(Expr {
+                    kind,
+                    ty: self.fresh_type(),
+                    loc,
+                })
+            }
+
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
             }),
@@ -373,6 +402,7 @@ impl Parser {
                     "i32" => Ok((Type::I32, loc)),
                     "u8" => Ok((Type::U8, loc)),
                     "void" => Ok((Type::Void, loc)),
+                    "bool" => Ok((Type::Bool, loc)),
 
                     _ => Err(FloErr::NotAType { token }),
                 }

@@ -31,6 +31,43 @@ fn assert_funcs(src: &str, expected: &[&str]) {
     assert_eq!(got, want);
 }
 
+/// Like `compile`, but keeps each function's full (possibly multi-line) body
+/// intact — a scope body prints across several lines, so the `starts_with("fn ")`
+/// filter in `compile` would drop everything but the first line. Splits the dump
+/// into per-function blocks (a block starts at a `fn ` line and runs until the
+/// next one) and sorts them, again so the result is HashMap-order independent.
+fn compile_blocks(src: &str) -> Result<Vec<String>, Vec<FloErr>> {
+    let src = src.to_string();
+    let tokens = Tokenizer::new(&src).tokenize();
+    let mut module = Parser::new(tokens).parse().map_err(|e| vec![e])?;
+
+    let resolved = TypeChecker::new(&mut module).check()?;
+
+    let dump = format!("{resolved:?}");
+    let mut blocks: Vec<String> = Vec::new();
+    for line in dump.lines() {
+        if line.starts_with("fn ") {
+            blocks.push(line.to_string());
+        } else if let Some(last) = blocks.last_mut() {
+            // Body / closing-brace continuation of the current function.
+            last.push('\n');
+            last.push_str(line);
+        }
+        // The leading "Module:" header (before any `fn`) is ignored.
+    }
+    blocks.sort();
+    Ok(blocks)
+}
+
+/// Like `assert_funcs`, but block-aware (see `compile_blocks`) so `expected`
+/// entries may be multi-line scope bodies.
+fn assert_blocks(src: &str, expected: &[&str]) {
+    let got = compile_blocks(src).expect("expected a successful type check");
+    let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want);
+}
+
 #[test]
 fn numeric_literal_defaults_to_i32() {
     // Nothing constrains the literal, so defaulting (the last resort) picks i32.
@@ -323,4 +360,141 @@ fn kind_violation_is_an_error() {
     )
     .expect_err("integral literal used where void required");
     assert!(matches!(errs[0], FloErr::UnsatisfiedTypeKind { .. }));
+}
+
+// -------------------------------------------------------------------------
+// Booleans
+// -------------------------------------------------------------------------
+
+#[test]
+fn bool_literal_is_bool() {
+    // A `bool` literal is concretely typed — no defaulting is involved (unlike a
+    // numeric literal, whose type is only a kind bound until defaulting runs).
+    assert_funcs("fn main() = true;", &["fn main() -> bool = true:bool;"]);
+}
+
+#[test]
+fn logical_and_desugars_to_builtin_call() {
+    // `&&` desugars to a call against the built-in bool overload, monomorphized and
+    // mangled like any other function; its body is the intrinsic sentinel.
+    assert_funcs(
+        "fn main() = true && false;",
+        &[
+            "fn main() -> bool = &&$bool$bool$bool(true:bool, false:bool):bool;",
+            "fn &&$bool$bool$bool(bool, bool) -> bool = <intrinsic>:bool;",
+        ],
+    );
+}
+
+#[test]
+fn logical_or_desugars_to_builtin_call() {
+    assert_funcs(
+        "fn main() = true || false;",
+        &[
+            "fn main() -> bool = ||$bool$bool$bool(true:bool, false:bool):bool;",
+            "fn ||$bool$bool$bool(bool, bool) -> bool = <intrinsic>:bool;",
+        ],
+    );
+}
+
+#[test]
+fn logical_not_desugars_to_arity_one_call() {
+    assert_funcs(
+        "fn main() = !true;",
+        &[
+            "fn main() -> bool = !$bool$bool(true:bool):bool;",
+            "fn !$bool$bool(bool) -> bool = <intrinsic>:bool;",
+        ],
+    );
+}
+
+#[test]
+fn bool_flows_through_a_parameter() {
+    // A `bool` argument selects the (only) instance and pins the passthrough's
+    // parameter and return, mangling with the `bool` tag.
+    assert_funcs(
+        "fn id(x: bool) -> bool = x;
+         fn main() = id(true);",
+        &[
+            "fn main() -> bool = id$bool$bool(true:bool):bool;",
+            "fn id$bool$bool(bool) -> bool = var_0:bool;",
+        ],
+    );
+}
+
+#[test]
+fn numeric_literal_where_bool_required_is_an_error() {
+    // The numeric literal `0` is `Integral`, but `&&`'s only overload takes `bool`;
+    // pinning the literal to `bool` violates its kind bound.
+    let errs = compile("fn main() = true && 0;").expect_err("0 is not a bool");
+    assert!(matches!(errs[0], FloErr::UnsatisfiedTypeKind { .. }));
+}
+
+// -------------------------------------------------------------------------
+// Scopes
+// -------------------------------------------------------------------------
+
+#[test]
+fn empty_scope_is_void() {
+    // Regression: an empty scope has no tail, so its type is `void`. Without the
+    // scope-type constraint the scope variable would float free and fail to
+    // resolve (it has no kind bound, so defaulting can't touch it).
+    assert_blocks("fn main() = {};", &["fn main() -> void = {\n\n};"]);
+}
+
+#[test]
+fn scope_evaluates_to_its_tail_expression() {
+    // Regression for the reported bug: a scope's type is its tail expression's
+    // type. `main`'s block ends in `foo()`, so `main` returns i32; the leading
+    // statements are still type-checked and monomorphized.
+    assert_blocks(
+        "fn main() = {
+             nop();
+             foo();
+             foo()
+         };
+         fn nop() -> void = {};
+         fn foo() = 0;",
+        &[
+            "fn main() -> i32 = {\n  nop$void():void;\n  foo$i32():i32;\n  foo$i32():i32\n};",
+            "fn nop$void() -> void = {\n\n};",
+            "fn foo$i32() -> i32 = 0:i32;",
+        ],
+    );
+}
+
+#[test]
+fn scope_tail_can_be_bool() {
+    // The tail's type flows out as the scope's type regardless of what that type
+    // is — here a `bool`, so `main` returns `bool`.
+    // A tail-only scope prints a blank line after `{` (it has no leading
+    // statements), and a scope expression carries no `:type` suffix of its own.
+    assert_blocks(
+        "fn main() = { true };",
+        &["fn main() -> bool = {\n\n  true:bool\n};"],
+    );
+}
+
+#[test]
+fn nested_scope_type_propagates_outward() {
+    // The inner scope's tail (`0`) types the inner scope, which is the outer
+    // scope's tail, which types `main` — i32 all the way up.
+    assert_blocks(
+        "fn main() = { { 0 } };",
+        &["fn main() -> i32 = {\n\n  {\n\n    0:i32\n}\n};"],
+    );
+}
+
+#[test]
+fn scope_can_be_a_call_argument() {
+    // A scope is an ordinary expression, so it may appear as a call argument; its
+    // tail type (i32) is what flows into the call.
+    assert_blocks(
+        "fn id(x: i32) -> i32 = x;
+         fn main() = id({ 0 });",
+        &[
+            "fn main() -> i32 = id$i32$i32({\n\n  0:i32\n}):i32;",
+            "fn id$i32$i32(i32) -> i32 = var_0:i32;",
+        ],
+    );
 }
