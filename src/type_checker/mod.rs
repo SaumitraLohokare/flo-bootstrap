@@ -12,9 +12,9 @@ mod callgraph;
 mod infer;
 mod specialize;
 mod subst;
-mod unify;
 #[cfg(test)]
 mod tests;
+mod unify;
 
 use callgraph::CallGraph;
 use infer::{residual_same, solve_func};
@@ -184,6 +184,23 @@ fn register_builtins(module: &mut Module) {
         let func = builtin_func(vec![ty.clone()], ty.clone());
         module.funcs.entry("-".to_string()).or_default().push(func);
     }
+
+    // Boolean operators
+    module
+        .funcs
+        .entry("&&".to_string())
+        .or_default()
+        .push(builtin_func(vec![Type::Bool, Type::Bool], Type::Bool));
+    module
+        .funcs
+        .entry("||".to_string())
+        .or_default()
+        .push(builtin_func(vec![Type::Bool, Type::Bool], Type::Bool));
+    module
+        .funcs
+        .entry("!".to_string())
+        .or_default()
+        .push(builtin_func(vec![Type::Bool], Type::Bool));
 }
 
 /// Build a body-less built-in `Func` with the given (already concrete) parameter

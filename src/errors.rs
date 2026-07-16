@@ -257,6 +257,8 @@ impl TokenKind {
     fn pretty_name(&self) -> &str {
         match self {
             TokenKind::Fn => "fn",
+            TokenKind::True => "true",
+            TokenKind::False => "false",
             TokenKind::Ident => "identifier",
             TokenKind::Num => "number",
             TokenKind::LParen => "(",
@@ -272,6 +274,9 @@ impl TokenKind {
             TokenKind::Colon => ":",
             TokenKind::Comma => ",",
             TokenKind::SingleQuote => "'",
+            TokenKind::Exclamation => "!",
+            TokenKind::AmpAmp => "&&",
+            TokenKind::PipePipe => "||",
         }
     }
 }

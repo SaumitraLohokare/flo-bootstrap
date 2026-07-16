@@ -27,7 +27,7 @@ impl CallGraph {
         let mut calls = Vec::new();
 
         match &expr.kind {
-            Num(_) | Var(_) | Intrinsic => {}
+            Num(_) | Bool(_) | Var(_) | Intrinsic => {}
             Call(name, args) => {
                 calls.push(name.as_str());
                 for arg in args {

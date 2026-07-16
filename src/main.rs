@@ -10,7 +10,26 @@ mod type_checker;
 mod types;
 mod util;
 
-// TODO: Allow parsing these functions
+// TODO: Add booleans
+// TODO: Add writing custom operator overloads
+// TODO: Add scope
+// TODO: Add If Else + early returns
+// TODO: Add variables
+// TODO: Add While + Continue/Break
+// TODO: Add |>
+// TODO: Add defer
+// TODO: Add other primitive types
+// TODO: Add pointers
+// TODO: Add Arrays & Slices
+// TODO: Add Strings
+// TODO: Add globals
+// TODO: Add defining external functions/globals
+// TODO: Add structs
+// TODO: Add enums
+// TODO: Add match? or simplify using enums?
+// TODO: Work on interpreter
+// TODO: Add support for multiple files
+// TODO: Implement compiler in flo
 
 fn main() {
     let src = r#"
@@ -20,10 +39,14 @@ fn main() {
         -- are type-checked like any other function. Bare literals default to i32
         -- (resolve -> default -> resolve), so no annotations are needed here.
 
-        fn main() = double(1 + 2 * 3) - -4;
-        fn double(x) = x + is_even(x);
+        fn main() = and(or(truth(), lie()), not(lie()));
 
-        fn is_even(n) = n % 2;
+        fn truth() = true;
+        fn lie() = false;
+
+        fn not(b) = !b;
+        fn and(a, b) = a && b;
+        fn or(a, b) = a || b;
     "#
     .to_string();
 

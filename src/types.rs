@@ -34,6 +34,9 @@ pub enum Type {
     /// void
     Void,
 
+    /// bool
+    Bool,
+
     /// i32
     I32,
 
@@ -43,9 +46,11 @@ pub enum Type {
 
 impl Debug for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Type::*;
+        
         match self {
-            Self::T(n) => write!(f, "t{n}"),
-            Self::Fn(args, ret) => {
+            T(n) => write!(f, "t{n}"),
+            Fn(args, ret) => {
                 let arg_list = args
                     .iter()
                     .map(|a| format!("{a:?}"))
@@ -53,9 +58,10 @@ impl Debug for Type {
                     .join(", ");
                 write!(f, "({arg_list}) -> {ret:?}")
             }
-            Self::Void => write!(f, "void"),
-            Self::I32 => write!(f, "i32"),
-            Self::U8 => write!(f, "u8"),
+            Void => write!(f, "void"),
+            Bool => write!(f, "bool"),
+            I32 => write!(f, "i32"),
+            U8 => write!(f, "u8"),
         }
     }
 }

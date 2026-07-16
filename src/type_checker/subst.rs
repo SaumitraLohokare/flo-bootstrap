@@ -7,8 +7,8 @@ use crate::{
     types::Type,
 };
 
-use super::unify::UnionFind;
 use super::Residual;
+use super::unify::UnionFind;
 
 /// Produce a fresh copy of a type: each schema variable maps to a brand-new id,
 /// consistently within one instantiation (`map`).
@@ -35,7 +35,7 @@ pub(super) fn freshen(ty: &Type, map: &mut HashMap<usize, usize>, fresh: &mut us
 pub(super) fn freshen_expr(expr: &mut Expr, map: &mut HashMap<usize, usize>, fresh: &mut usize) {
     expr.ty = freshen(&expr.ty, map, fresh);
     match &mut expr.kind {
-        ExprKind::Num(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
+        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
         ExprKind::Call(_, args) => {
             for arg in args {
                 freshen_expr(arg, map, fresh);
@@ -96,7 +96,7 @@ pub(super) fn resolve_expr_canon(
 ) {
     expr.ty = resolve_canon(&expr.ty, uf, map, next);
     match &mut expr.kind {
-        ExprKind::Num(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
+        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
         ExprKind::Call(_, args) => {
             for arg in args {
                 resolve_expr_canon(arg, uf, map, next);

@@ -219,18 +219,37 @@ impl Parser {
     fn parse_unary(&mut self, scope: &mut Scope) -> FloResult<Expr> {
         use TokenKind::*;
 
-        if self.peek()?.kind == Minus {
-            let minus = self.expect_get(Minus)?;
-            let operand = self.parse_unary(scope)?;
-            let loc = Loc {
-                start: minus.loc.start,
-                end: operand.loc.end,
-            };
-            return Ok(Expr {
-                kind: ExprKind::Call("-".to_string(), vec![operand]),
-                ty: self.fresh_type(),
-                loc,
-            });
+        let token = self.peek()?;
+        match token.kind {
+            Minus => {
+                let minus = self.expect_get(Minus)?;
+                let operand = self.parse_unary(scope)?;
+                let loc = Loc {
+                    start: minus.loc.start,
+                    end: operand.loc.end,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call("-".to_string(), vec![operand]),
+                    ty: self.fresh_type(),
+                    loc,
+                });
+            }
+
+            Exclamation => {
+                let not = self.expect_get(Exclamation)?;
+                let operand = self.parse_unary(scope)?;
+                let loc = Loc {
+                    start: not.loc.start,
+                    end: operand.loc.end,
+                };
+                return Ok(Expr {
+                    kind: ExprKind::Call("!".to_string(), vec![operand]),
+                    ty: self.fresh_type(),
+                    loc,
+                });
+            }
+
+            _ => {}
         }
 
         self.parse_atom(scope)
@@ -241,11 +260,13 @@ impl Parser {
     fn peek_binop(&self) -> Option<(&'static str, i32)> {
         use TokenKind::*;
         match self.peek_kind().ok()? {
-            Plus => Some(("+", 1)),
-            Minus => Some(("-", 1)),
-            Star => Some(("*", 2)),
-            Slash => Some(("/", 2)),
-            Percent => Some(("%", 2)),
+            AmpAmp => Some(("&&", 1)),
+            PipePipe => Some(("||", 1)),
+            Plus => Some(("+", 2)),
+            Minus => Some(("-", 2)),
+            Star => Some(("*", 3)),
+            Slash => Some(("/", 3)),
+            Percent => Some(("%", 3)),
             _ => None,
         }
     }
@@ -263,6 +284,19 @@ impl Parser {
                 self.skip();
 
                 let kind = ExprKind::Num(num);
+                Ok(Expr {
+                    kind,
+                    ty: self.fresh_type(),
+                    loc,
+                })
+            }
+
+            True | False => {
+                let bool_value = token.kind == True;
+                let loc = token.loc;
+                self.skip();
+
+                let kind = ExprKind::Bool(bool_value);
                 Ok(Expr {
                     kind,
                     ty: self.fresh_type(),

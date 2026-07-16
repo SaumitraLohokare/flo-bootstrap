@@ -5,7 +5,7 @@ use crate::{tokenizer::Loc, types::Type};
 #[derive(Debug, Clone)]
 pub struct FuncLocs {
     pub definition: Loc,
-    pub arg_types: Vec<Loc>, 
+    pub arg_types: Vec<Loc>,
     pub ret_type: Loc,
 }
 
@@ -43,6 +43,7 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Num(u64),
+    Bool(bool),
     Var(usize),
     Call(String, Vec<Expr>),
     /// A body-less built-in. Operators desugar to `Call`s against built-in
@@ -87,9 +88,14 @@ impl Expr {
         let indent = " ".repeat(indent);
         match &self.kind {
             ExprKind::Num(num) => format!("{indent}{num}:{:?}", self.ty),
+            ExprKind::Bool(value) => format!("{indent}{value}:{:?}", self.ty),
             ExprKind::Var(id) => format!("{indent}var_{id}:{:?}", self.ty),
             ExprKind::Call(name, exprs) => {
-                let arg_list = exprs.iter().map(|arg| arg.pretty_print(0)).collect::<Vec<_>>().join(", ");
+                let arg_list = exprs
+                    .iter()
+                    .map(|arg| arg.pretty_print(0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("{name}({arg_list}):{:?}", self.ty)
             }
             ExprKind::Intrinsic => format!("{indent}<intrinsic>:{:?}", self.ty),

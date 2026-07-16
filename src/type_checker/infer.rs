@@ -7,9 +7,9 @@ use crate::{
     types::{Type, TypeKind},
 };
 
+use super::Residual;
 use super::subst::{freshen, resolve_canon, resolve_expr_canon};
 use super::unify::UnionFind;
-use super::Residual;
 
 /// A deferred call: which name is called, the argument types (with their locs for
 /// error reporting), the call's own result type, and where the call is. Overload
@@ -86,6 +86,7 @@ pub(super) fn gen_expr(
 ) {
     match &expr.kind {
         ExprKind::Num(_) => kinds.push((expr.ty.clone(), TypeKind::Integral, expr.loc)),
+        ExprKind::Bool(_) => eqs.push((expr.ty.clone(), Type::Bool, expr.loc)),
         // A variable reference already shares its parameter's type variable, so
         // there's nothing to relate here. A built-in's body is a sentinel with no
         // constraints of its own.
@@ -333,11 +334,7 @@ pub(super) fn residual_same(stored: Option<&Vec<Residual>>, new: &[Residual]) ->
     match stored {
         None => new.is_empty(),
         Some(old) => {
-            old.len() == new.len()
-                && old
-                    .iter()
-                    .zip(new)
-                    .all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+            old.len() == new.len() && old.iter().zip(new).all(|(a, b)| a.0 == b.0 && a.1 == b.1)
         }
     }
 }

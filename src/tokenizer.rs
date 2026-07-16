@@ -2,6 +2,9 @@
 pub enum TokenKind {
     Fn,
 
+    True,
+    False,
+
     Ident,
     Num,
 
@@ -13,6 +16,10 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
+
+    Exclamation,
+    AmpAmp,
+    PipePipe,
 
     Colon,
     Comma,
@@ -82,6 +89,14 @@ impl Tokenizer {
                 '/' => tokens.push(self.tokenize_symbol("/", TokenKind::Slash)),
                 '%' => tokens.push(self.tokenize_symbol("%", TokenKind::Percent)),
 
+                '!' => tokens.push(self.tokenize_symbol("!", TokenKind::Exclamation)),
+                '&' if self.peek_n(1) == Some('&') => {
+                    tokens.push(self.tokenize_symbol("&&", TokenKind::AmpAmp))
+                }
+                '|' if self.peek_n(1) == Some('|') => {
+                    tokens.push(self.tokenize_symbol("||", TokenKind::PipePipe))
+                }
+
                 '(' => tokens.push(self.tokenize_symbol("(", TokenKind::LParen)),
                 ')' => tokens.push(self.tokenize_symbol(")", TokenKind::RParen)),
 
@@ -116,6 +131,8 @@ impl Tokenizer {
 
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
+            "true" => TokenKind::True,
+            "false" => TokenKind::False,
 
             _ => TokenKind::Ident,
         };

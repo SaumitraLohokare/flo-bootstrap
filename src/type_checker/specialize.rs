@@ -7,10 +7,10 @@ use crate::{
     types::{Type, TypeKind},
 };
 
-use super::infer::{candidates, gen_expr, no_match_err, solve, Obligation};
+use super::Residual;
+use super::infer::{Obligation, candidates, gen_expr, no_match_err, solve};
 use super::subst::{freshen, freshen_expr, freshen_residuals, resolve_concrete};
 use super::unify::UnionFind;
-use super::Residual;
 
 /// A monomorphic instance key: `(function name, concrete arg types, concrete
 /// return type)`. The return type is part of the key because a function can be
@@ -181,7 +181,7 @@ impl<'m> Specializer<'m> {
         let this_ret = expr.ty.clone();
 
         match &mut expr.kind {
-            ExprKind::Num(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
+            ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Var(_) | ExprKind::Intrinsic => {}
             ExprKind::Call(name, args) => {
                 let old_args = std::mem::take(args);
                 let mut new_args = Vec::with_capacity(old_args.len());
@@ -265,5 +265,6 @@ fn type_tag(ty: &Type) -> String {
             format!("fn_{args}_{}", type_tag(ret))
         }
         Type::U8 => "u8".to_string(),
+        Type::Bool => "bool".to_string(),
     }
 }
