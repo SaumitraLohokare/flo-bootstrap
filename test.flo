@@ -1,0 +1,169 @@
+import casl "casl";
+import rl   "raylib";
+
+var N;
+var saturation;
+var value;
+
+fn main() = {
+    let casl = casl::init();
+    defer casl |> close();
+
+    casl |> file("./config.casl");
+    casl |> var(&mut N,          "config.N");
+    casl |> var(&mut saturation, "config.saturation");
+    casl |> var(&mut value,      "config.value");
+
+    rl::init_window(800, 600, "Experiment");
+    defer rl::close_window();
+
+    while !rl::window_should_close() {
+        casl |> hot_reload();
+        
+        rl::begin_draw();
+        -- draw stuff
+
+        rl::draw_rect(Rect(width: 20, height: 30), Color(0x181818FF));
+
+        rl::end_draw();
+    }
+
+    --------
+
+    var watcher;
+    fw::init(&mut watcher) { change ->
+        log("Change for path ", change.path, " : ", change.events);
+    } |> or_abort("Failed to open file watcher");
+};
+
+-- casl.flo
+
+fn var(ptr: *mut 'a, path: string, fallback: 'a = default()) = {
+    -- TODO
+};
+
+---------
+
+type Color = {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+};
+
+fn Color(r = 0, g = 0, b = 0, a = 255) -> Color = { r, g, b, a };
+
+---------
+
+fn Rect(x: i32 = 0, y: i32 = 0, w: i32 = 0, h: i32 = 0)
+    = { x, y, w, h };
+
+type Rect = { x: i32, y: i32, w: i32, h: i32 };
+type Foo = { x: i32, y: i32, w: i32, h: i32 };
+
+extern fn DrawRect(rect: Rect) -> void;
+
+fn test() = {
+    let foo = Foo();
+    foo |> draw_rect;
+}
+
+---------------
+
+fn distance(a: {x: i32, y: i32, ..}, b: {x: i32, y: i32, ..}) -> i32 = TODO;
+
+fn distance({x: x1, y: y1, ..}, {x: x2, y: y2, ..}) = TODO;
+
+type Point = { x: i32, y: i32 };
+type Entity = { x: i32, y: i32, hp: i32 };
+
+---------------
+
+type Status =
+    | Ok
+    | NotOk { msg: String };
+
+fn foo(status: Status) = match status {
+    | Ok => 200
+    | NotOk { msg } => match msg {
+        | "not_found" => 404
+        | "internal_error" => 500
+        | _ => 400
+    } 
+};
+
+let x: i32;
+match x {
+    | 0 => true
+    | 1 => false
+    | 2 => true
+    | 3 => false
+    | _ => n %% 2
+}
+
+fn foo() = if something() { Ok } else { NotOk { msg: "not_found" } };
+
+---------------
+
+fn default() -> i32 = 0;
+fn default() -> f64 = 0.0;
+fn default() -> bool = false;
+
+type Point = {
+    x: i32,
+    y: f64,
+    ok: bool,
+};
+
+fn Point(x = default(), y = default(), ok = default()) = { x, y, z };
+
+fn bleh() = {
+    let point = Point();
+    let _: i32 = point.x;
+};
+
+
+---------------------------
+
+type FooBar = union {
+    Foo: { x: i16, y: i16 },
+    Bar, -- omitting type means void?
+};
+
+type Foo = Ok | NotOk;
+
+type Foo = [ Ok, NotOk ];
+
+fn is_foo() -> Ok | .. = Ok; -- How do I know that this isn't a variable or function name?
+fn is_not_foo() -> NotOk | .. = NotOk;
+
+Ok | NotOk
+[] i32
+[3]i32
+
+fn foo() = {
+    let x = Faah; -- <- does this get converted into a Sum type?
+};
+
+{ .type = NotOk, .data = (union Foo) { .msg = "not_found" } }
+
+op +(x: Result, y: i32) = match x {
+    Ok => y + 1,
+    Err => y,
+};
+
+op +(x: MyResult, y: i32) = match x {
+    Ok => y + 1,
+    Err1 => y,
+    Err2 => y - 1,
+};
+
+type Result = Ok | Err;
+
+type MyResult = Ok | Err1 | Err2;
+
+fn bleh() = {
+    let foo: Ok | .. = Ok;
+
+    foo + 2
+};

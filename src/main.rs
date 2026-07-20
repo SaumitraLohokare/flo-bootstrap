@@ -39,15 +39,10 @@ fn main() {
         -- are type-checked like any other function. Bare literals default to i32
         -- (resolve -> default -> resolve), so no annotations are needed here.
 
-        fn main() = {
-            nop();
-            foo(); -- Discarded result
-            foo()
-        };
-
-        fn nop() -> void = {};
-
-        fn foo() = 0;
+        fn main() = 1 - i32(is_even(2));
+ 
+        fn is_even(n) = n % 2 == 0;
+        fn i32(b) = if b { 1 } else { 0 };
     "#
     .to_string();
 
