@@ -10,6 +10,9 @@ use crate::{
 
 mod replace_set;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug)]
 struct IsEqual(Type, Type, Loc);
 
