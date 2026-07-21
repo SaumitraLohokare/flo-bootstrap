@@ -7,17 +7,14 @@ pub type FloResult<T> = Result<T, FloErr>;
 #[derive(Debug)]
 pub enum FloErr {
     UnexpectedEOF,
+
     UnexpectedToken {
         found: Token,
     },
+
     ExpectedTokenNotFound {
         expected: TokenKind,
         found: Token,
-    },
-
-    RedifinitionOfFunction {
-        name: String,
-        loc: Loc,
     },
 
     RedifinitionOfArgument {
@@ -26,6 +23,8 @@ pub enum FloErr {
     },
 
     MainFunctionNotFound,
+
+    MultipleMainFunction,
 
     NotAType {
         token: Token,
@@ -53,22 +52,39 @@ pub enum FloErr {
         loc: Loc,
     },
 
+    UnresolvedType {
+        ty: Type,
+        loc: Loc,
+    },
+
     InfiniteType {
+        loc: Loc,
+    },
+
+    NoPossibleOverloads {
+        name: String,
+        loc: Loc,
+    },
+
+    AmbiguousOverloads {
+        name: String,
         loc: Loc,
     },
 }
 
 impl FloErr {
     pub fn pretty_print(self, src: &String) {
+        use FloErr::*;
+
         eprint!("Error: ");
 
         match self {
-            FloErr::UnexpectedEOF => eprintln!("Unexpected EOF"),
-            FloErr::UnexpectedToken { found } => {
+            UnexpectedEOF => eprintln!("Unexpected EOF"),
+            UnexpectedToken { found } => {
                 eprintln!("Unexpected token `{}`", found.kind.pretty_name());
                 print_src(src, &[found.loc]);
             }
-            FloErr::ExpectedTokenNotFound { expected, found } => {
+            ExpectedTokenNotFound { expected, found } => {
                 eprintln!(
                     "Expected `{}`, but found `{}`",
                     expected.pretty_name(),
@@ -76,19 +92,15 @@ impl FloErr {
                 );
                 print_src(src, &[found.loc]);
             }
-            FloErr::RedifinitionOfFunction { name, loc } => {
-                eprintln!("Redifinition of function `{name}`");
-                print_src(src, &[loc]);
-            }
-            FloErr::RedifinitionOfArgument { name, loc } => {
+            RedifinitionOfArgument { name, loc } => {
                 eprintln!("Redifinition of argument `{name}`");
                 print_src(src, &[loc]);
             }
-            FloErr::NotAType { token } => {
+            NotAType { token } => {
                 eprintln!("`{}` is not a type", token.kind.pretty_name(),);
                 print_src(src, &[token.loc]);
             }
-            FloErr::TypeMismatch {
+            TypeMismatch {
                 expected: t1,
                 got: t2,
                 loc,
@@ -96,23 +108,38 @@ impl FloErr {
                 eprintln!("Expected `{t1:?}` but got `{t2:?}`");
                 print_src(src, &[loc]);
             }
-            FloErr::MainFunctionNotFound => {
+            MainFunctionNotFound => {
                 eprintln!("Main function not found.");
             }
-            FloErr::UndefinedIdentifier { name, loc } => {
+            MultipleMainFunction => {
+                eprintln!("Multiple definitions of `main` function found.");
+            }
+            UndefinedIdentifier { name, loc } => {
                 eprintln!("Undefined identifier `{name}`");
                 print_src(src, &[loc]);
             }
-            FloErr::UndefinedFunction { name, loc } => {
+            UndefinedFunction { name, loc } => {
                 eprintln!("Undefined function `{name}`");
                 print_src(src, &[loc]);
             }
-            FloErr::CallArityMismatch { expected, got, loc } => {
+            CallArityMismatch { expected, got, loc } => {
                 eprintln!("Function call expected {expected} arguments, but got {got} instead");
                 print_src(src, &[loc]);
             }
-            FloErr::InfiniteType { loc } => {
+            InfiniteType { loc } => {
                 eprintln!("Infinite Type");
+                print_src(src, &[loc]);
+            }
+            UnresolvedType { ty, loc } => {
+                eprintln!("Unresolved type `{ty:?}`");
+                print_src(src, &[loc]);
+            }
+            NoPossibleOverloads { name, loc } => {
+                eprintln!("No possible overloads found for `{name}`");
+                print_src(src, &[loc]);
+            }
+            AmbiguousOverloads { name, loc } => {
+                eprintln!("Multiple possible overloads found for `{name}`");
                 print_src(src, &[loc]);
             }
         }

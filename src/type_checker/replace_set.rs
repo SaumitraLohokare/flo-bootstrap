@@ -75,19 +75,26 @@ impl ReplaceSet {
         let result = match (t1, t2) {
             (T(a), T(b)) => {
                 self.unify(a, b, loc)?;
-                self.resolve(&T(a))?
+                self.resolve(&T(a))
             }
             (T(a), t2) => {
                 self.bind(a, t2, loc)?;
-                self.resolve(&T(a))?
+                self.resolve(&T(a))
             }
             (t1, T(b)) => {
                 self.bind(b, t1, loc)?;
-                self.resolve(&T(b))?
+                self.resolve(&T(b))
             }
 
             (Integer, Integer) => Integer,
+            (Integer, I8) | (I8, Integer) => I8,
+            (Integer, I16) | (I16, Integer) => I16,
             (Integer, I32) | (I32, Integer) => I32,
+            (Integer, I64) | (I64, Integer) => I64,
+            (Integer, U8) | (U8, Integer) => U8,
+            (Integer, U16) | (U16, Integer) => U16,
+            (Integer, U32) | (U32, Integer) => U32,
+            (Integer, U64) | (U64, Integer) => U64,
 
             (Fn(a1, r1), Fn(a2, r2)) => {
                 if a1.len() != a2.len() {
@@ -138,24 +145,29 @@ impl ReplaceSet {
         Ok(())
     }
 
-    pub(super) fn resolve(&self, ty: &Type) -> FloResult<Type> {
+    pub(super) fn resolve(&mut self, ty: &Type) -> Type {
         use Type::*;
 
         match ty {
-            T(id) => self.resolve(self.bindings.get(&id).unwrap()),
+            T(id) => {
+                let root_id = self.find(*id);
+                if let Some(ty) = self.bindings.get(&root_id).cloned() {
+                    self.resolve(&ty)
+                } else {
+                    T(*id) // If binding doesn't exist, just return the type itself
+                }
+            }
 
             Fn(args, ret) => {
                 let mut new_args = Vec::new();
                 for arg in args {
-                    new_args.push(self.resolve(arg)?);
+                    new_args.push(self.resolve(arg));
                 }
-                let new_ret = Box::new(self.resolve(ret)?);
-                Ok(Fn(new_args, new_ret))
+                let new_ret = Box::new(self.resolve(ret));
+                Fn(new_args, new_ret)
             }
 
-            Integer => unreachable!(),
-
-            x => Ok(x.clone()),
+            x => x.clone(),
         }
     }
 

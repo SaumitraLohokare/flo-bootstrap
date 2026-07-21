@@ -11,16 +11,16 @@ mod types;
 mod util;
 
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
-// TODO: Overloading
+// DONE: Overloading
 
 fn main() {
     let src = r#"
-        -- This is a comment
-        fn main() -> i32 = foo(0);
+        fn main() -> i32 = outer(inner());
 
-        fn foo(a: i32) -> i32 = id(a);
+        fn inner() -> i32 = 0;
 
-        fn id(a: i32) -> i32 = a;
+        fn outer(x: i32) -> i32 = x;
+        fn outer(x: u8) -> i32 = 0;
     "#
     .to_string();
 
@@ -35,7 +35,7 @@ fn main() {
 
     println!("{module:?}");
 
-    let module = match TypeChecker::new().check(&module) {
+    let module = match TypeChecker::new().check(module) {
         Ok(module) => module,
         Err(errs) => {
             for err in errs {

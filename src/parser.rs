@@ -49,7 +49,7 @@ pub struct Parser {
 
     type_iota: Iota,
 
-    funcs: HashMap<String, Func>,
+    funcs: HashMap<String, Vec<Func>>,
 }
 
 impl Parser {
@@ -75,10 +75,10 @@ impl Parser {
             }
         }
 
-        if !self.funcs.contains_key("main") {
-            Err(FloErr::MainFunctionNotFound)
-        } else {
-            Ok(Module { funcs: self.funcs })
+        match self.funcs.entry("main".to_string()).or_default().len() {
+            0 => Err(FloErr::MainFunctionNotFound),
+            1 => Ok(Module { funcs: self.funcs }),
+            _ => Err(FloErr::MultipleMainFunction),
         }
     }
 
@@ -146,11 +146,10 @@ impl Parser {
 
         self.expect(Semicolon)?;
 
-        if self.funcs.contains_key(&name) {
-            return Err(FloErr::RedifinitionOfFunction { name, loc });
-        } else {
-            self.funcs.insert(name, Func { body, ty, loc });
-        }
+        self.funcs
+            .entry(name)
+            .or_default()
+            .push(Func { body, ty, loc });
 
         Ok(())
     }
@@ -206,7 +205,8 @@ impl Parser {
 
                     let r_paren = self.expect_get(RParen)?;
 
-                    let kind = ExprKind::Call(name, args);
+                    // All calls are unresolved initially
+                    let kind = ExprKind::Call(name, args, None);
                     Ok(Expr {
                         kind,
                         ty: self.fresh_type(),
@@ -249,7 +249,14 @@ impl Parser {
                 };
 
                 match value.as_str() {
+                    "u8" => Ok((Type::U8, loc)),
+                    "u16" => Ok((Type::U16, loc)),
+                    "u32" => Ok((Type::U32, loc)),
+                    "u64" => Ok((Type::U64, loc)),
+                    "i8" => Ok((Type::I8, loc)),
+                    "i16" => Ok((Type::I16, loc)),
                     "i32" => Ok((Type::I32, loc)),
+                    "i64" => Ok((Type::I64, loc)),
                     "void" => Ok((Type::Void, loc)),
 
                     _ => Err(FloErr::NotAType { token }),
