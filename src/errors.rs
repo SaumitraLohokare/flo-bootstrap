@@ -1,6 +1,6 @@
 use crate::{
     tokenizer::{Loc, Token, TokenKind},
-    types::{Type, TypeKind},
+    types::Type,
 };
 
 pub type FloResult<T> = Result<T, FloErr>;
@@ -35,6 +35,7 @@ pub enum FloErr {
         name: String,
         loc: Loc,
     },
+
     UndefinedFunction {
         name: String,
         loc: Loc,
@@ -46,19 +47,13 @@ pub enum FloErr {
         loc: Loc,
     },
 
-    UnsatisfiedTypeKind {
-        ty: Type,
-        ty_loc: Loc,
-        kind: TypeKind,
+    TypeMismatch {
+        expected: Type,
+        got: Type,
         loc: Loc,
     },
-    TypeMismatch {
-        t1: Type,
-        loc1: Loc,
-        t2: Type,
-        loc2: Loc,
-    },
-    UnresolvedType {
+
+    InfiniteType {
         loc: Loc,
     },
 }
@@ -93,21 +88,12 @@ impl FloErr {
                 eprintln!("`{}` is not a type", token.kind.pretty_name(),);
                 print_src(src, &[token.loc]);
             }
-            FloErr::UnsatisfiedTypeKind {
-                ty,
-                ty_loc,
-                kind,
+            FloErr::TypeMismatch {
+                expected: t1,
+                got: t2,
                 loc,
             } => {
-                eprintln!("Type `{kind:?}` does not match `{ty:?}`");
-                print_src(src, &[ty_loc, loc]);
-            }
-            FloErr::TypeMismatch { t1, loc1, t2, loc2 } => {
-                eprintln!("Type `{t1:?}` does not match `{t2:?}`");
-                print_src(src, &[loc1, loc2]);
-            }
-            FloErr::UnresolvedType { loc } => {
-                eprintln!("Type of expression could not be resolved");
+                eprintln!("Expected `{t1:?}` but got `{t2:?}`");
                 print_src(src, &[loc]);
             }
             FloErr::MainFunctionNotFound => {
@@ -123,6 +109,10 @@ impl FloErr {
             }
             FloErr::CallArityMismatch { expected, got, loc } => {
                 eprintln!("Function call expected {expected} arguments, but got {got} instead");
+                print_src(src, &[loc]);
+            }
+            FloErr::InfiniteType { loc } => {
+                eprintln!("Infinite Type");
                 print_src(src, &[loc]);
             }
         }
