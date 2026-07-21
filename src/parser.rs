@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, Func, FuncLocs, Module},
+    ast::{Expr, ExprKind, Func, Module},
     errors::{FloErr, FloResult},
     tokenizer::{Loc, Token, TokenKind, TokenValue},
     types::Type,
@@ -96,16 +96,14 @@ impl Parser {
         self.expect(LParen)?;
 
         let mut arg_types = Vec::new();
-        let mut arg_locs = Vec::new();
         while self.peek()?.kind == Ident {
             let arg = self.expect_get(Ident)?;
             let TokenValue::String(arg_name) = arg.value else {
                 unreachable!()
             };
             self.expect(Colon)?;
-            let (arg_type, arg_type_loc) = self.parse_type()?;
+            let (arg_type, _) = self.parse_type()?;
             arg_types.push(arg_type.clone());
-            arg_locs.push(arg_type_loc);
 
             // EW: clone might be unneccessary
             if !scope.add_arg(arg_name.clone(), arg_type) {
@@ -135,15 +133,9 @@ impl Parser {
             )
         };
 
-        let func_definition_loc = Loc {
+        let loc = Loc {
             start: name_loc.start,
             end: ret_type_loc.end,
-        };
-
-        let loc = FuncLocs {
-            definition: func_definition_loc,
-            arg_types: arg_locs,
-            ret_type: ret_type_loc,
         };
 
         let ty = self.func_type(arg_types, ret_type);
@@ -155,10 +147,7 @@ impl Parser {
         self.expect(Semicolon)?;
 
         if self.funcs.contains_key(&name) {
-            return Err(FloErr::RedifinitionOfFunction {
-                name,
-                loc: loc.definition,
-            });
+            return Err(FloErr::RedifinitionOfFunction { name, loc });
         } else {
             self.funcs.insert(name, Func { body, ty, loc });
         }

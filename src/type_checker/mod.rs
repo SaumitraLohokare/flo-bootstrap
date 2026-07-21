@@ -1,128 +1,105 @@
-mod replace_set;
-
-use replace_set::ReplaceSet;
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, Func, FuncLocs, Module},
+    ast::{Expr, ExprKind, Func, Module},
     errors::{FloErr, FloResult},
     tokenizer::Loc,
-    types::{Type, TypeKind},
+    type_checker::replace_set::ReplaceSet,
+    types::Type,
 };
 
-type TypeLoc = (Type, Loc);
+mod replace_set;
 
-
-#[derive(Debug, Clone, Copy)]
-enum Constraint {
-    IsEqual(usize, usize),
-    IsKind(usize, TypeKind, Loc),
-}
+#[derive(Debug)]
+struct IsEqual(Type, Type, Loc);
 
 pub struct TypeChecker {
     func_types: HashMap<String, Type>,
-    func_locs: HashMap<String, FuncLocs>,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
         Self {
             func_types: HashMap::new(),
-            func_locs: HashMap::new(),
         }
     }
 
-    pub fn check(mut self, module: &mut Module) -> Vec<FloErr> {
+    // Was thinking this should return a new Module
+    // instead of modifying the old one?
+    pub fn check(mut self, module: &Module) -> Result<Module, Vec<FloErr>> {
         for (name, func) in &module.funcs {
             self.func_types.insert(name.clone(), func.ty.clone());
-            self.func_locs.insert(name.clone(), func.loc.clone());
         }
 
         let mut errs = Vec::new();
-        for (_, func) in &mut module.funcs {
-            if let Err(err) = self.check_func(func) {
-                errs.push(err);
+        let mut funcs = HashMap::new();
+        for (name, func) in &module.funcs {
+            match self.check_func(func) {
+                Ok(func) => {
+                    funcs.insert(name.clone(), func);
+                }
+                Err(err) => errs.push(err),
             }
         }
 
-        errs
+        if errs.is_empty() {
+            Ok(Module { funcs })
+        } else {
+            Err(errs)
+        }
     }
 
-    fn check_func(&self, func: &mut Func) -> FloResult<()> {
-        // 1. Generate Constraints
+    fn check_func(&self, func: &Func) -> FloResult<Func> {
+        // 1. Collect Constraints
 
-        let mut set = ReplaceSet::new();
         let mut constraints = Vec::new();
-        self.generate_func_constraints(func, &mut set, &mut constraints);
-        self.generate_expr_constraints(&func.body, &mut set, &mut constraints)?;
+        self.collect_func_constraints(func, &mut constraints);
+        self.collect_expr_constraints(&func.body, &mut constraints)?;
 
         // 2. Solve Constraints
 
-        constraints = self.solve_constraints(&mut set, &mut constraints)?;
+        let mut set = ReplaceSet::new();
+        self.solve_constraints(&mut set, constraints)?;
 
         // 3. Default Types
 
-        for constraint in &constraints {
-            use Constraint::*;
-            if let IsKind(id, kind, loc) = constraint {
-                let root = set.find(*id);
-                if !set.id_to_ty[root].0.is_known() {
-                    let default_id = set.add(kind.default_type(), *loc);
-                    set.union(root, default_id)?;
-                }
-            }
-        }
+        set.default_types();
 
-        // 4. Solve Constraints
+        // 5. Make Resolved Func & return it
 
-        constraints = self.solve_constraints(&mut set, &mut constraints)?;
-        debug_assert!(constraints.is_empty());
-
-        // 5. Replace Types in Func
-
-        self.resolve_func(func, &mut set)
+        self.resolve_func(func, &set)
     }
 
-    fn generate_func_constraints(
-        &self,
-        func: &Func,
-        set: &mut ReplaceSet,
-        constraints: &mut Vec<Constraint>,
-    ) {
-        use Constraint::*;
-
-        let Type::Fn(arg_tys, ret_ty) = &func.ty else {
+    fn collect_func_constraints(&self, func: &Func, constraints: &mut Vec<IsEqual>) {
+        // Constraints for argument types are not added, because they're already
+        // concrete types
+        let Type::Fn(_arg_tys, ret_ty) = &func.ty else {
             unreachable!()
         };
 
-        for (arg_ty, &arg_loc) in arg_tys.iter().zip(&func.loc.arg_types) {
-            set.add(arg_ty.clone(), arg_loc);
-        }
-
-        let a = set.add(*ret_ty.clone(), func.loc.ret_type);
-        let b = set.add(func.body.ty.clone(), func.body.loc);
-        constraints.push(IsEqual(b, a));
+        constraints.push(IsEqual(
+            *ret_ty.clone(),
+            func.body.ty.clone(),
+            func.body.loc,
+        ));
     }
 
-    fn generate_expr_constraints(
+    fn collect_expr_constraints(
         &self,
         expr: &Expr,
-        set: &mut ReplaceSet,
-        constraints: &mut Vec<Constraint>,
+        constraints: &mut Vec<IsEqual>,
     ) -> FloResult<()> {
-        use Constraint::*;
         use ExprKind::*;
-        use TypeKind::*;
+        use Type::*;
 
         match &expr.kind {
             Num(_) => {
-                let id = set.add(expr.ty.clone(), expr.loc);
-                constraints.push(IsKind(id, Integral, expr.loc));
+                constraints.push(IsEqual(Integer, expr.ty.clone(), expr.loc));
             }
             Var(_) => {}
             Call(name, args) => {
                 for arg in args {
-                    self.generate_expr_constraints(arg, set, constraints)?;
+                    self.collect_expr_constraints(arg, constraints)?;
                 }
 
                 let Type::Fn(arg_tys, ret_ty) =
@@ -142,83 +119,80 @@ impl TypeChecker {
                     });
                 }
 
-                let callee_locs = self.func_locs.get(name).unwrap();
-
-                for (arg, (arg_ty, arg_ty_loc)) in
-                    args.iter().zip(arg_tys.iter().zip(&callee_locs.arg_types))
-                {
-                    let a = set.add(arg.ty.clone(), arg.loc);
-                    let b = set.add(arg_ty.clone(), *arg_ty_loc);
-                    constraints.push(IsEqual(a, b));
+                for (arg, arg_ty) in args.iter().zip(arg_tys) {
+                    constraints.push(IsEqual(arg_ty.clone(), arg.ty.clone(), arg.loc));
                 }
 
-                let a = set.add(expr.ty.clone(), expr.loc);
-                let b = set.add(*ret_ty.clone(), expr.loc);
-                constraints.push(IsEqual(b, a));
+                constraints.push(IsEqual(*ret_ty.clone(), expr.ty.clone(), expr.loc));
             }
         }
 
         Ok(())
     }
 
-    fn solve_constraints(
-        &self,
-        set: &mut ReplaceSet,
-        constraints: &mut Vec<Constraint>,
-    ) -> FloResult<Vec<Constraint>> {
-        let mut pending = Vec::new();
+    fn solve_constraints(&self, set: &mut ReplaceSet, constraints: Vec<IsEqual>) -> FloResult<()> {
+        use Type::*;
 
-        for constraint in constraints {
-            match constraint {
-                Constraint::IsEqual(a, b) => set.union(*a, *b)?,
-                Constraint::IsKind(id, kind, loc) => {
-                    let root = set.find(*id);
-                    let (ty, ty_loc) = set.id_to_ty[root].clone();
-                    if ty.is_known() {
-                        if !kind.satisfies_type(&ty) {
-                            return Err(FloErr::UnsatisfiedTypeKind {
-                                ty,
-                                ty_loc,
-                                kind: *kind,
-                                loc: *loc,
-                            });
-                        }
-                    } else {
-                        pending.push(*constraint);
-                    }
-                }
+        for IsEqual(t1, t2, loc) in constraints {
+            match (t1, t2) {
+                (T(a), T(b)) => set.unify(a, b, loc)?,
+                (T(id), ty) | (ty, T(id)) => set.bind(id, ty, loc)?,
+                (t1, t2) if t1 != t2 => Err(FloErr::TypeMismatch {
+                    expected: t1,
+                    got: t2,
+                    loc,
+                })?,
+                _ => {}
             }
         }
 
-        Ok(pending)
+        Ok(())
     }
 
-    fn resolve_func(&self, func: &mut Func, set: &mut ReplaceSet) -> FloResult<()> {
-        let Type::Fn(arg_types, ret_type) = &mut func.ty else {
-            unreachable!()
-        };
-
-        for (arg_ty, arg_loc) in arg_types.iter_mut().zip(&func.loc.arg_types) {
-            *arg_ty = set.resolve(arg_ty.clone(), *arg_loc)?;
-        }
-        *ret_type = Box::new(set.resolve(*ret_type.clone(), func.loc.ret_type)?);
-
-        self.resolve_expr(&mut func.body, set)
+    fn resolve_func(&self, func: &Func, set: &ReplaceSet) -> FloResult<Func> {
+        func.resolve(set)
     }
+}
 
-    fn resolve_expr(&self, expr: &mut Expr, set: &mut ReplaceSet) -> FloResult<()> {
-        expr.ty = set.resolve(expr.ty.clone(), expr.loc)?;
+impl Func {
+    fn resolve(&self, set: &ReplaceSet) -> FloResult<Self> {
+        let ty = set.resolve(&self.ty)?;
+        Ok(Func {
+            body: self.body.resolve(set)?,
+            ty,
+            loc: self.loc.clone(),
+        })
+    }
+}
 
-        match &mut expr.kind {
-            ExprKind::Num(_) => {}
-            ExprKind::Var(_) => {}
-            ExprKind::Call(_, args) => {
+impl Expr {
+    fn resolve(&self, set: &ReplaceSet) -> FloResult<Self> {
+        use ExprKind::*;
+
+        let ty = set.resolve(&self.ty)?;
+        let loc = self.loc;
+        Ok(match &self.kind {
+            Num(n) => Expr {
+                kind: Num(*n),
+                ty,
+                loc,
+            },
+            Var(v) => Expr {
+                kind: Var(*v),
+                ty,
+                loc,
+            },
+            Call(name, args) => {
+                let mut new_args = Vec::new();
                 for arg in args {
-                    self.resolve_expr(arg, set)?;
+                    new_args.push(arg.resolve(set)?);
+                }
+                Expr {
+                    kind: Call(name.clone(), new_args),
+                    ty,
+                    loc,
                 }
             }
-        }
-
-        Ok(())
+        })
     }
 }

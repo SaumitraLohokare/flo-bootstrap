@@ -2,13 +2,6 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::{tokenizer::Loc, types::Type};
 
-#[derive(Debug, Clone)]
-pub struct FuncLocs {
-    pub definition: Loc,
-    pub arg_types: Vec<Loc>, 
-    pub ret_type: Loc,
-}
-
 #[derive(Clone)]
 pub struct Module {
     pub funcs: HashMap<String, Func>,
@@ -18,7 +11,7 @@ pub struct Module {
 pub struct Func {
     pub body: Expr,
     pub ty: Type,
-    pub loc: FuncLocs,
+    pub loc: Loc,
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +50,12 @@ impl Expr {
             ExprKind::Num(num) => format!("{indent}{num}:{:?}", self.ty),
             ExprKind::Var(id) => format!("{indent}var_{id}:{:?}", self.ty),
             ExprKind::Call(name, exprs) => {
-                let arg_list = exprs.iter().map(|arg| arg.pretty_print(0)).collect::<Vec<_>>().join(", ");
-                format!("{name}({arg_list}):{:?}", self.ty)
+                let arg_list = exprs
+                    .iter()
+                    .map(|arg| arg.pretty_print(0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{indent}{name}({arg_list}):{:?}", self.ty)
             }
         }
     }
