@@ -16,6 +16,8 @@ pub enum TokenKind {
     Comma,
     Arrow,
 
+    PipeGreaterThan,
+
     Equal,
 
     Plus,
@@ -131,6 +133,9 @@ impl Tokenizer {
 
                 '|' if self.peek_n(1) == Some('|') => {
                     tokens.push(self.tokenize_symbol("||", TokenKind::PipePipe))
+                }
+                '|' if self.peek_n(1) == Some('>') => {
+                    tokens.push(self.tokenize_symbol("|>", TokenKind::PipeGreaterThan))
                 }
                 '|' => tokens.push(self.tokenize_symbol("|", TokenKind::Pipe)),
 

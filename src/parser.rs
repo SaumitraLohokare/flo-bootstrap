@@ -75,7 +75,7 @@ impl Parser {
             }
         }
 
-        // Register builtin ops (body is a Nop expr with ty = ret_ty)
+        // Register builtin ops
         self.register_builtin_ops();
 
         match self.funcs.entry("main".to_string()).or_default().len() {
@@ -161,33 +161,55 @@ impl Parser {
 
     fn parse_expr(&mut self, precedence: i32, scope: &Scope) -> FloResult<Expr> {
         use ExprKind::*;
+        use TokenKind::*;
         let mut lhs = self.parse_unary(scope)?;
 
         loop {
             let tok = self.peek()?;
             let op = tok.kind;
 
-            if !op.is_binary_op() {
+            if op.is_binary_op() {
+                let op_precedence = op.precedence();
+                if op_precedence < precedence {
+                    break;
+                }
+
+                self.skip();
+
+                let rhs = self.parse_expr(op_precedence + 1, scope)?;
+                let loc = Loc {
+                    start: lhs.loc.start,
+                    end: rhs.loc.end,
+                };
+                lhs = Expr {
+                    kind: Call(format!("{}", op.pretty_name()), vec![lhs, rhs], None),
+                    ty: self.fresh_type(),
+                    loc,
+                };
+            } else if op == PipeGreaterThan {
+                self.skip();
+
+                let func = self.expect_get(Ident)?;
+                let TokenValue::String(func_name) = func.value else {
+                    unreachable!()
+                };
+                let start = lhs.loc.start;
+                let default_end = func.loc.end;
+
+                let (mut args, end) = match self.parse_call_args(scope)? {
+                    Some((args, end)) => (args, end),
+                    None => (Vec::new(), default_end),
+                };
+                args.insert(0, lhs); // lhs becomes the first arg
+
+                lhs = Expr {
+                    kind: ExprKind::Call(func_name, args, None),
+                    ty: self.fresh_type(),
+                    loc: Loc { start, end },
+                };
+            } else {
                 break;
             }
-
-            let op_precedence = op.precedence();
-            if op_precedence < precedence {
-                break;
-            }
-
-            self.skip();
-
-            let rhs = self.parse_expr(op_precedence + 1, scope)?;
-            let loc = Loc {
-                start: lhs.loc.start,
-                end: rhs.loc.end,
-            };
-            lhs = Expr {
-                kind: Call(format!("{}", op.pretty_name()), vec![lhs, rhs], None),
-                ty: self.fresh_type(),
-                loc,
-            };
         }
 
         Ok(lhs)
@@ -269,46 +291,32 @@ impl Parser {
                     unreachable!()
                 };
                 let name_loc = token.loc;
-
                 self.skip();
 
-                if let Ok(LParen) = self.peek_kind() {
-                    self.skip();
-
-                    let mut args = Vec::new();
-                    while let Ok(next_kind) = self.peek_kind()
-                        && next_kind != RParen
-                    {
-                        args.push(self.parse_expr(-1, scope)?);
-                        if self.expect(Comma).is_err() {
-                            break;
-                        }
+                match self.parse_call_args(scope)? {
+                    Some((args, end)) => {
+                        let kind = ExprKind::Call(name, args, None); // unresolved
+                        Ok(Expr {
+                            kind,
+                            ty: self.fresh_type(),
+                            loc: Loc {
+                                start: name_loc.start,
+                                end,
+                            },
+                        })
                     }
+                    None => {
+                        let var_id = scope.get_var(&name).ok_or(FloErr::UndefinedIdentifier {
+                            name: name.clone(),
+                            loc: name_loc,
+                        })?;
 
-                    let r_paren = self.expect_get(RParen)?;
-
-                    // All calls are unresolved initially
-                    let kind = ExprKind::Call(name, args, None);
-                    Ok(Expr {
-                        kind,
-                        ty: self.fresh_type(),
-                        loc: Loc {
-                            start: name_loc.start,
-                            end: r_paren.loc.end,
-                        },
-                    })
-                } else {
-                    let var_id = scope.get_var(&name).ok_or(FloErr::UndefinedIdentifier {
-                        name: name.clone(),
-                        loc: name_loc,
-                    })?;
-
-                    let kind = ExprKind::Var(var_id);
-                    Ok(Expr {
-                        kind,
-                        ty: scope.get_var_type(var_id),
-                        loc: name_loc,
-                    })
+                        Ok(Expr {
+                            kind: ExprKind::Var(var_id),
+                            ty: scope.get_var_type(var_id),
+                            loc: name_loc,
+                        })
+                    }
                 }
             }
 
@@ -316,6 +324,30 @@ impl Parser {
                 found: token.clone(),
             }),
         }
+    }
+
+    /// Parses an optional parenthesized, comma-separated argument list.
+    /// parsing `::<T>` will go in here later.
+    fn parse_call_args(&mut self, scope: &Scope) -> FloResult<Option<(Vec<Expr>, usize)>> {
+        use TokenKind::*;
+
+        if !matches!(self.peek_kind(), Ok(LParen)) {
+            return Ok(None);
+        }
+        self.skip();
+
+        let mut args = Vec::new();
+        while let Ok(next_kind) = self.peek_kind()
+            && next_kind != RParen
+        {
+            args.push(self.parse_expr(-1, scope)?);
+            if self.expect(Comma).is_err() {
+                break;
+            }
+        }
+
+        let r_paren = self.expect_get(RParen)?;
+        Ok(Some((args, r_paren.loc.end)))
     }
 
     fn parse_type(&mut self) -> FloResult<(Type, Loc)> {

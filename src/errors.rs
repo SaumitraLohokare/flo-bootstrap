@@ -289,6 +289,7 @@ impl TokenKind {
             TokenKind::GreaterThan => ">",
             TokenKind::LessThanEqual => "<=",
             TokenKind::GreaterThanEqual => ">=",
+            TokenKind::PipeGreaterThan => "|>",
         }
     }
 }

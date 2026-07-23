@@ -869,6 +869,249 @@ fn division_is_left_associative() {
 }
 
 // --------------------------------------------------------------------------
+// Unary operators
+//
+// Only `+` and `-` are unary, and only over the numeric types (there is no
+// unary bool overload). A unary op parses to a single-argument `Call`, so it
+// resolves and mangles exactly like a one-arg function.
+// --------------------------------------------------------------------------
+
+#[test]
+fn unary_minus_resolves_to_builtin() {
+    let module = check_ok("fn main() -> i32 = -5;");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("-", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(main.body.ty, Type::I32);
+    let args = call_args(&main.body);
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0].ty, Type::I32);
+}
+
+#[test]
+fn unary_plus_resolves_to_builtin() {
+    let module = check_ok("fn main() -> i32 = +5;");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(main.body.ty, Type::I32);
+}
+
+#[test]
+fn unary_minus_takes_narrow_return_type() {
+    // The i8 return type flows into the operand and picks the i8 overload.
+    let module = check_ok("fn main() -> i8 = -1;");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("-", vec![Type::I8], Type::I8)
+    );
+    assert_eq!(main.body.ty, Type::I8);
+    assert_eq!(call_args(&main.body)[0].ty, Type::I8);
+}
+
+#[test]
+fn unary_minus_on_float() {
+    let module = check_ok("fn main() -> f32 = -1.5;");
+    let main = func_sig(&module, "main", vec![], Type::F32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("-", vec![Type::F32], Type::F32)
+    );
+    assert_eq!(main.body.ty, Type::F32);
+}
+
+#[test]
+fn unary_minus_over_a_variable() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = neg(5);
+        fn neg(a: i32) -> i32 = -a;
+        ",
+    );
+    let neg = func_sig(&module, "neg", vec![Type::I32], Type::I32);
+    assert_eq!(
+        resolved_call_name(&neg.body),
+        m("-", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(neg.body.ty, Type::I32);
+    assert!(matches!(call_args(&neg.body)[0].kind, ExprKind::Var(_)));
+}
+
+#[test]
+fn double_unary_minus_nests() {
+    // `- -5` == `-(-5)`: an outer unary `-` wrapping an inner unary `-`.
+    let module = check_ok("fn main() -> i32 = - -5;");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("-", vec![Type::I32], Type::I32)
+    );
+    let inner = &call_args(&main.body)[0];
+    assert_eq!(resolved_call_name(inner), m("-", vec![Type::I32], Type::I32));
+    assert!(matches!(call_args(inner)[0].kind, ExprKind::Num(5)));
+}
+
+#[test]
+fn unary_minus_binds_tighter_than_addition() {
+    // `-1 + 2` == `(-1) + 2` -> unary `-` nested under the left arg of `+`.
+    let module = check_ok("fn main() -> i32 = -1 + 2;");
+    let (root, nested) = op_and_nested(&module, 0);
+    assert_eq!(root, op("+", Type::I32, Type::I32));
+    assert_eq!(nested, m("-", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn unary_operator_on_bool_is_an_error() {
+    // There is no unary `-` overload for bool.
+    let errs = check_err("fn main() -> bool = -true;");
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+#[test]
+fn unary_minus_result_where_bool_expected_is_an_error() {
+    // `-1` can only be a numeric type, never bool.
+    let errs = check_err("fn main() -> bool = -1;");
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+// --------------------------------------------------------------------------
+// Function piping
+//
+// `x |> f(rest...)` desugars during parsing into `f(x, rest...)` — the
+// left-hand side is inserted as the first argument. Because the desugaring
+// happens in the parser, the type checker sees an ordinary call: these tests
+// verify the resulting call resolves the way the equivalent direct call would.
+// --------------------------------------------------------------------------
+
+#[test]
+fn pipe_becomes_first_argument() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = 5 |> id();
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("id", vec![Type::I32], Type::I32)
+    );
+    let args = call_args(&main.body);
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0].ty, Type::I32);
+    assert!(matches!(args[0].kind, ExprKind::Num(5)));
+}
+
+#[test]
+fn pipe_without_parens_still_calls() {
+    // The argument list is optional after `|>`; `5 |> id` is `id(5)`.
+    let module = check_ok(
+        "
+        fn main() -> i32 = 5 |> id;
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("id", vec![Type::I32], Type::I32)
+    );
+    assert!(matches!(call_args(&main.body)[0].kind, ExprKind::Num(5)));
+}
+
+#[test]
+fn pipe_prepends_to_existing_arguments() {
+    // `1 |> add(2)` == `add(1, 2)`: the piped value goes *before* the written
+    // arguments.
+    let module = check_ok(
+        "
+        fn main() -> i32 = 1 |> add(2);
+        fn add(a: i32, b: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("add", vec![Type::I32, Type::I32], Type::I32)
+    );
+    let args = call_args(&main.body);
+    assert_eq!(args.len(), 2);
+    assert!(matches!(args[0].kind, ExprKind::Num(1)));
+    assert!(matches!(args[1].kind, ExprKind::Num(2)));
+}
+
+#[test]
+fn chained_pipes_nest_left_to_right() {
+    // `1 |> inc() |> inc()` == `inc(inc(1))`: the outer call is the last stage.
+    let module = check_ok(
+        "
+        fn main() -> i32 = 1 |> inc() |> inc();
+        fn inc(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let outer = &main.body;
+    assert_eq!(resolved_call_name(outer), m("inc", vec![Type::I32], Type::I32));
+    let inner = &call_args(outer)[0];
+    assert_eq!(resolved_call_name(inner), m("inc", vec![Type::I32], Type::I32));
+    assert!(matches!(call_args(inner)[0].kind, ExprKind::Num(1)));
+}
+
+#[test]
+fn pipe_selects_overload_by_return_type() {
+    let module = check_ok(
+        "
+        fn main() -> u8 = 3 |> id();
+        fn id(a: i32) -> i32 = a;
+        fn id(a: u8) -> u8 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::U8);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("id", vec![Type::U8], Type::U8)
+    );
+}
+
+#[test]
+fn pipe_binds_tighter_than_binary_operator() {
+    // `1 |> inc() + 2` == `inc(1) + 2`: the pipe is consumed before the parser
+    // considers the trailing `+`, so it does not pipe the whole `... + 2`.
+    let module = check_ok(
+        "
+        fn main() -> i32 = 1 |> inc() + 2;
+        fn inc(a: i32) -> i32 = a;
+        ",
+    );
+    let (root, nested) = op_and_nested(&module, 0);
+    assert_eq!(root, op("+", Type::I32, Type::I32));
+    assert_eq!(nested, m("inc", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn pipe_into_undefined_function_is_an_error() {
+    let errs = check_err("fn main() -> i32 = 5 |> ghost();");
+    assert_err!(errs, FloErr::UndefinedFunction { .. });
+}
+
+#[test]
+fn pipe_argument_type_incompatible_is_an_error() {
+    // `true |> inc()` is `inc(true)`, but `inc` needs an i32.
+    let errs = check_err(
+        "
+        fn main() -> bool = true |> inc();
+        fn inc(a: i32) -> i32 = a;
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+// --------------------------------------------------------------------------
 // Name mangling unit test
 //
 // This is the one place that deliberately pins the exact mangled-name format,

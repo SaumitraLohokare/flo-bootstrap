@@ -48,6 +48,10 @@ impl Debug for Module {
         for name in names {
             let funcs = self.funcs.get(name).unwrap();
             for func in funcs {
+                if let ExprKind::BuiltinOp(_) = func.body.kind {
+                    break; // Don't print if function was builtin
+                }
+
                 let expr_string = func.body.pretty_print(0);
                 writeln!(f, "fn {name}{:?} = {expr_string};", func.ty)?;
             }
