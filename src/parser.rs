@@ -161,9 +161,8 @@ impl Parser {
 
     fn parse_expr(&mut self, precedence: i32, scope: &Scope) -> FloResult<Expr> {
         use ExprKind::*;
-        let mut lhs = self.parse_atom(scope)?;
+        let mut lhs = self.parse_unary(scope)?;
 
-        // TODO
         loop {
             let tok = self.peek()?;
             let op = tok.kind;
@@ -192,6 +191,29 @@ impl Parser {
         }
 
         Ok(lhs)
+    }
+
+    fn parse_unary(&mut self, scope: &Scope) -> FloResult<Expr> {
+        use ExprKind::*;
+
+        let token = self.peek()?;
+        let op = token.kind;
+        if op.is_unary_op() {
+            let start = token.loc.start;
+            self.skip();
+
+            let operand = self.parse_unary(scope)?;
+            let end = operand.loc.end;
+            let kind = Call(format!("{}", op.pretty_name()), vec![operand], None);
+            let loc = Loc { start, end };
+            Ok(Expr {
+                kind,
+                ty: self.fresh_type(),
+                loc,
+            })
+        } else {
+            self.parse_atom(scope)
+        }
     }
 
     fn parse_atom(&mut self, scope: &Scope) -> FloResult<Expr> {
@@ -387,6 +409,7 @@ impl Parser {
         use Type::*;
 
         let plus_op = self.funcs.entry("+".to_string()).or_default();
+        // binary
         plus_op.push(builtin_op(Plus, vec![U8, U8], U8));
         plus_op.push(builtin_op(Plus, vec![U16, U16], U16));
         plus_op.push(builtin_op(Plus, vec![U32, U32], U32));
@@ -397,8 +420,20 @@ impl Parser {
         plus_op.push(builtin_op(Plus, vec![I64, I64], I64));
         plus_op.push(builtin_op(Plus, vec![F32, F32], F32));
         plus_op.push(builtin_op(Plus, vec![F64, F64], F64));
+        // unary
+        plus_op.push(builtin_op(Plus, vec![U8], U8));
+        plus_op.push(builtin_op(Plus, vec![U16], U16));
+        plus_op.push(builtin_op(Plus, vec![U32], U32));
+        plus_op.push(builtin_op(Plus, vec![U64], U64));
+        plus_op.push(builtin_op(Plus, vec![I8], I8));
+        plus_op.push(builtin_op(Plus, vec![I16], I16));
+        plus_op.push(builtin_op(Plus, vec![I32], I32));
+        plus_op.push(builtin_op(Plus, vec![I64], I64));
+        plus_op.push(builtin_op(Plus, vec![F32], F32));
+        plus_op.push(builtin_op(Plus, vec![F64], F64));
 
         let minus_op = self.funcs.entry("-".to_string()).or_default();
+        // binary
         minus_op.push(builtin_op(Minus, vec![U8, U8], U8));
         minus_op.push(builtin_op(Minus, vec![U16, U16], U16));
         minus_op.push(builtin_op(Minus, vec![U32, U32], U32));
@@ -409,6 +444,17 @@ impl Parser {
         minus_op.push(builtin_op(Minus, vec![I64, I64], I64));
         minus_op.push(builtin_op(Minus, vec![F32, F32], F32));
         minus_op.push(builtin_op(Minus, vec![F64, F64], F64));
+        // unary
+        minus_op.push(builtin_op(Minus, vec![U8], U8));
+        minus_op.push(builtin_op(Minus, vec![U16], U16));
+        minus_op.push(builtin_op(Minus, vec![U32], U32));
+        minus_op.push(builtin_op(Minus, vec![U64], U64));
+        minus_op.push(builtin_op(Minus, vec![I8], I8));
+        minus_op.push(builtin_op(Minus, vec![I16], I16));
+        minus_op.push(builtin_op(Minus, vec![I32], I32));
+        minus_op.push(builtin_op(Minus, vec![I64], I64));
+        minus_op.push(builtin_op(Minus, vec![F32], F32));
+        minus_op.push(builtin_op(Minus, vec![F64], F64));
 
         let star_op = self.funcs.entry("*".to_string()).or_default();
         star_op.push(builtin_op(Star, vec![U8, U8], U8));
@@ -580,6 +626,11 @@ fn builtin_op(op: TokenKind, args: Vec<Type>, ret: Type) -> Func {
 }
 
 impl TokenKind {
+    fn is_unary_op(&self) -> bool {
+        use TokenKind::*;
+        matches!(self, Plus | Minus)
+    }
+
     #[rustfmt::skip]
     fn is_binary_op(&self) -> bool {
         use TokenKind::*;

@@ -339,7 +339,7 @@ fn mangle_name(fn_ty: &Type, name: &str) -> String {
         .collect::<Vec<_>>()
         .join("_");
 
-    format!("{name}__{arg_list}_{ret:?}")
+    format!("{name}__{arg_list}__{ret:?}")
 }
 
 impl Func {

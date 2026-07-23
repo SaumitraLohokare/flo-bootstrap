@@ -14,12 +14,14 @@ mod util;
 // DONE: Operators (*, /, %)
 // DONE: Bool & F32
 // DONE: Remaining operators (logical, comaprison)
-// TODO: Unary operators
-// TODO: bitwise
+// DONE: Unary operators
+// TODO: bitwise shift
 
 fn main() {
     let src = r#"
-        fn main() -> bool = false;
+        fn main() -> i32 = -+foo(0);
+
+        fn foo(x: i32) -> i32 = x;
     "#
     .to_string();
 

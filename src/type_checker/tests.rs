@@ -4,6 +4,11 @@
 //! small Flo programs and assert on the resolved output or the reported errors.
 //! Because Flo is a binary crate (no `lib.rs`), these live in-crate as a
 //! `#[cfg(test)]` module rather than under `tests/`.
+//!
+//! Expected mangled names are never hard-coded: they are computed with the
+//! checker's own [`mangle_name`] via the [`m`] / [`func_sig`] helpers. That way
+//! changing the mangling scheme or adding new operators/overloads can't break
+//! these tests — only a genuine change in *resolution* behavior can.
 
 use super::{TypeChecker, mangle_name};
 use crate::ast::{Expr, ExprKind, Func, Module};
@@ -45,7 +50,19 @@ fn fn_ty(args: Vec<Type>, ret: Type) -> Type {
     Type::Fn(args, Box::new(ret))
 }
 
-/// Look up a resolved (mangled) function by name.
+/// The mangled name for a `(name, args, ret)` signature, produced by the
+/// checker's own scheme. Using this instead of a string literal keeps tests
+/// correct when the mangling format changes.
+fn m(name: &str, args: Vec<Type>, ret: Type) -> String {
+    mangle_name(&fn_ty(args, ret), name)
+}
+
+/// Look up a resolved function by its `name`, argument types and return type.
+fn func_sig<'a>(module: &'a Module, name: &str, args: Vec<Type>, ret: Type) -> &'a Func {
+    func(module, &m(name, args, ret))
+}
+
+/// Look up a resolved (mangled) function by its already-mangled name.
 fn func<'a>(module: &'a Module, mangled: &str) -> &'a Func {
     match module.funcs.get(mangled) {
         Some(funcs) => &funcs[0],
@@ -92,7 +109,7 @@ macro_rules! assert_err {
 #[test]
 fn literal_body_defaults_to_i32() {
     let module = check_ok("fn main() -> i32 = 0;");
-    let main = func(&module, "main___i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
     assert_eq!(main.ty, fn_ty(vec![], Type::I32));
     assert_eq!(main.body.ty, Type::I32);
     assert!(matches!(main.body.kind, ExprKind::Num(0)));
@@ -101,7 +118,7 @@ fn literal_body_defaults_to_i32() {
 #[test]
 fn return_type_propagates_to_literal_i8() {
     let module = check_ok("fn main() -> i8 = 42;");
-    let main = func(&module, "main___i8");
+    let main = func_sig(&module, "main", vec![], Type::I8);
     assert_eq!(main.ty, fn_ty(vec![], Type::I8));
     assert_eq!(main.body.ty, Type::I8);
 }
@@ -109,7 +126,7 @@ fn return_type_propagates_to_literal_i8() {
 #[test]
 fn return_type_propagates_to_literal_u64() {
     let module = check_ok("fn main() -> u64 = 7;");
-    let main = func(&module, "main___u64");
+    let main = func_sig(&module, "main", vec![], Type::U64);
     assert_eq!(main.body.ty, Type::U64);
 }
 
@@ -121,7 +138,7 @@ fn argument_variable_keeps_its_type() {
         fn id(a: i32) -> i32 = a;
         ",
     );
-    let id = func(&module, "id__i32_i32");
+    let id = func_sig(&module, "id", vec![Type::I32], Type::I32);
     assert_eq!(id.ty, fn_ty(vec![Type::I32], Type::I32));
     assert_eq!(id.body.ty, Type::I32);
     assert!(matches!(id.body.kind, ExprKind::Var(_)));
@@ -137,9 +154,9 @@ fn void_function_resolves() {
         fn a() = a();
         ",
     );
-    let main = func(&module, "main___void");
+    let main = func_sig(&module, "main", vec![], Type::Void);
     assert_eq!(main.ty, fn_ty(vec![], Type::Void));
-    assert_eq!(resolved_call_name(&main.body), "a___void");
+    assert_eq!(resolved_call_name(&main.body), m("a", vec![], Type::Void));
 }
 
 // --------------------------------------------------------------------------
@@ -154,8 +171,11 @@ fn single_call_gets_resolved_and_mangled() {
         fn id(a: i32) -> i32 = a;
         ",
     );
-    let main = func(&module, "main___i32");
-    assert_eq!(resolved_call_name(&main.body), "id__i32_i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("id", vec![Type::I32], Type::I32)
+    );
     // The literal argument was coerced to the parameter type.
     assert_eq!(call_args(&main.body)[0].ty, Type::I32);
 }
@@ -170,13 +190,13 @@ fn chained_calls_resolve() {
         fn c(x: i32) -> i32 = x;
         ",
     );
-    let main = func(&module, "main___i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
     let a = &main.body;
-    assert_eq!(resolved_call_name(a), "a__i32_i32");
+    assert_eq!(resolved_call_name(a), m("a", vec![Type::I32], Type::I32));
     let b = &call_args(a)[0];
-    assert_eq!(resolved_call_name(b), "b__i32_i32");
+    assert_eq!(resolved_call_name(b), m("b", vec![Type::I32], Type::I32));
     let c = &call_args(b)[0];
-    assert_eq!(resolved_call_name(c), "c__i32_i32");
+    assert_eq!(resolved_call_name(c), m("c", vec![Type::I32], Type::I32));
     assert_eq!(call_args(c)[0].ty, Type::I32);
 }
 
@@ -188,8 +208,11 @@ fn literal_argument_takes_narrow_param_type() {
         fn take(a: i8) -> i8 = a;
         ",
     );
-    let main = func(&module, "main___i8");
-    assert_eq!(resolved_call_name(&main.body), "take__i8_i8");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("take", vec![Type::I8], Type::I8)
+    );
     assert_eq!(call_args(&main.body)[0].ty, Type::I8);
 }
 
@@ -201,8 +224,11 @@ fn multi_arg_mangling_and_per_arg_coercion() {
         fn f(a: i8, b: u16, c: i64) -> i64 = c;
         ",
     );
-    let main = func(&module, "main___i64");
-    assert_eq!(resolved_call_name(&main.body), "f__i8_u16_i64_i64");
+    let main = func_sig(&module, "main", vec![], Type::I64);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("f", vec![Type::I8, Type::U16, Type::I64], Type::I64)
+    );
     let args = call_args(&main.body);
     assert_eq!(args[0].ty, Type::I8);
     assert_eq!(args[1].ty, Type::U16);
@@ -222,11 +248,14 @@ fn overload_selected_by_return_type() {
         fn id(a: i32) -> i32 = a;
         ",
     );
-    let main = func(&module, "main___i8");
-    assert_eq!(resolved_call_name(&main.body), "id__i8_i8");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("id", vec![Type::I8], Type::I8)
+    );
     // Both overloads are still emitted (each is independently well typed).
-    func(&module, "id__i8_i8");
-    func(&module, "id__i32_i32");
+    func_sig(&module, "id", vec![Type::I8], Type::I8);
+    func_sig(&module, "id", vec![Type::I32], Type::I32);
 }
 
 #[test]
@@ -238,8 +267,11 @@ fn overload_selected_by_arity() {
         fn foo(a: i32, b: i32) -> i32 = a;
         ",
     );
-    let main = func(&module, "main___i32");
-    assert_eq!(resolved_call_name(&main.body), "foo__i32_i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("foo", vec![Type::I32], Type::I32)
+    );
 }
 
 #[test]
@@ -253,11 +285,20 @@ fn nested_overloads_resolve_via_parent_params() {
         fn id(a: u8) -> u8 = a;
         ",
     );
-    let main = func(&module, "main___i32");
-    assert_eq!(resolved_call_name(&main.body), "foo__i32_u8_i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("foo", vec![Type::I32, Type::U8], Type::I32)
+    );
     let args = call_args(&main.body);
-    assert_eq!(resolved_call_name(&args[0]), "id__i32_i32");
-    assert_eq!(resolved_call_name(&args[1]), "id__u8_u8");
+    assert_eq!(
+        resolved_call_name(&args[0]),
+        m("id", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(
+        resolved_call_name(&args[1]),
+        m("id", vec![Type::U8], Type::U8)
+    );
 }
 
 #[test]
@@ -272,9 +313,15 @@ fn parent_overload_disambiguated_by_child_return() {
         fn outer(x: u8) -> i32 = 0;
         ",
     );
-    let main = func(&module, "main___i32");
-    assert_eq!(resolved_call_name(&main.body), "outer__i32_i32");
-    assert_eq!(resolved_call_name(&call_args(&main.body)[0]), "inner___i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("outer", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(
+        resolved_call_name(&call_args(&main.body)[0]),
+        m("inner", vec![], Type::I32)
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -374,7 +421,7 @@ fn integer_literal_matching_multiple_narrow_overloads_defaults_and_misses() {
 #[test]
 fn float_literal_propagates_from_return_type_f32() {
     let module = check_ok("fn main() -> f32 = 1.5;");
-    let main = func(&module, "main___f32");
+    let main = func_sig(&module, "main", vec![], Type::F32);
     assert_eq!(main.ty, fn_ty(vec![], Type::F32));
     assert_eq!(main.body.ty, Type::F32);
     assert!(matches!(main.body.kind, ExprKind::Flt(_)));
@@ -383,7 +430,7 @@ fn float_literal_propagates_from_return_type_f32() {
 #[test]
 fn float_literal_propagates_from_return_type_f64() {
     let module = check_ok("fn main() -> f64 = 3.25;");
-    let main = func(&module, "main___f64");
+    let main = func_sig(&module, "main", vec![], Type::F64);
     assert_eq!(main.body.ty, Type::F64);
 }
 
@@ -392,8 +439,11 @@ fn decimal_literal_defaults_to_f32() {
     // Neither float literal is pinned to a concrete width by the `<` operator
     // (its float overloads accept f32 and f64), so both default to f32.
     let module = check_ok("fn main() -> bool = 1.5 < 2.5;");
-    let main = func(&module, "main___bool");
-    assert_eq!(resolved_call_name(&main.body), "<__f32_f32_bool");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("<", vec![Type::F32, Type::F32], Type::Bool)
+    );
     let args = call_args(&main.body);
     assert_eq!(args[0].ty, Type::F32);
     assert_eq!(args[1].ty, Type::F32);
@@ -409,8 +459,11 @@ fn float_argument_coerces_literal_to_param_type() {
         fn take(a: f64) -> f64 = a;
         ",
     );
-    let main = func(&module, "main___f64");
-    assert_eq!(resolved_call_name(&main.body), "take__f64_f64");
+    let main = func_sig(&module, "main", vec![], Type::F64);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("take", vec![Type::F64], Type::F64)
+    );
     assert_eq!(call_args(&main.body)[0].ty, Type::F64);
 }
 
@@ -427,7 +480,7 @@ fn float_literal_for_integer_return_is_an_error() {
 #[test]
 fn bool_literal_resolves() {
     let module = check_ok("fn main() -> bool = true;");
-    let main = func(&module, "main___bool");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
     assert_eq!(main.ty, fn_ty(vec![], Type::Bool));
     assert_eq!(main.body.ty, Type::Bool);
     assert!(matches!(main.body.kind, ExprKind::Bool(true)));
@@ -441,8 +494,11 @@ fn bool_argument_keeps_its_type() {
         fn negate(a: bool) -> bool = a;
         ",
     );
-    let main = func(&module, "main___bool");
-    assert_eq!(resolved_call_name(&main.body), "negate__bool_bool");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("negate", vec![Type::Bool], Type::Bool)
+    );
     assert_eq!(call_args(&main.body)[0].ty, Type::Bool);
 }
 
@@ -459,8 +515,11 @@ fn bool_body_for_integer_return_is_an_error() {
 #[test]
 fn arithmetic_operator_resolves_to_builtin() {
     let module = check_ok("fn main() -> i32 = 1 + 2;");
-    let main = func(&module, "main___i32");
-    assert_eq!(resolved_call_name(&main.body), "+__i32_i32_i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::I32, Type::I32], Type::I32)
+    );
     assert_eq!(main.body.ty, Type::I32);
     let args = call_args(&main.body);
     assert_eq!(args[0].ty, Type::I32);
@@ -471,8 +530,11 @@ fn arithmetic_operator_resolves_to_builtin() {
 fn arithmetic_operator_takes_narrow_return_type() {
     // The i8 return type flows down into both operands and picks the i8 overload.
     let module = check_ok("fn main() -> i8 = 1 + 2;");
-    let main = func(&module, "main___i8");
-    assert_eq!(resolved_call_name(&main.body), "+__i8_i8_i8");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::I8, Type::I8], Type::I8)
+    );
     assert_eq!(main.body.ty, Type::I8);
 }
 
@@ -484,49 +546,48 @@ fn arithmetic_operator_over_variables() {
         fn add(a: i32, b: i32) -> i32 = a * b;
         ",
     );
-    let add = func(&module, "add__i32_i32_i32");
-    assert_eq!(resolved_call_name(&add.body), "*__i32_i32_i32");
+    let add = func_sig(&module, "add", vec![Type::I32, Type::I32], Type::I32);
+    assert_eq!(
+        resolved_call_name(&add.body),
+        m("*", vec![Type::I32, Type::I32], Type::I32)
+    );
     assert_eq!(add.body.ty, Type::I32);
 }
 
 #[test]
 fn all_arithmetic_operators_resolve() {
-    for (src_op, mangled_op) in [
-        ("+", "+__i32_i32_i32"),
-        ("-", "-__i32_i32_i32"),
-        ("*", "*__i32_i32_i32"),
-        ("/", "/__i32_i32_i32"),
-        ("%", "%__i32_i32_i32"),
-    ] {
-        let src = format!("fn main() -> i32 = 6 {src_op} 3;");
+    for op in ["+", "-", "*", "/", "%"] {
+        let src = format!("fn main() -> i32 = 6 {op} 3;");
         let module = check_ok(&src);
-        let main = func(&module, "main___i32");
-        assert_eq!(resolved_call_name(&main.body), mangled_op);
+        let main = func_sig(&module, "main", vec![], Type::I32);
+        assert_eq!(
+            resolved_call_name(&main.body),
+            m(op, vec![Type::I32, Type::I32], Type::I32)
+        );
     }
 }
 
 #[test]
 fn float_arithmetic_operator_resolves() {
     let module = check_ok("fn main() -> f32 = 1.0 + 2.0;");
-    let main = func(&module, "main___f32");
-    assert_eq!(resolved_call_name(&main.body), "+__f32_f32_f32");
+    let main = func_sig(&module, "main", vec![], Type::F32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::F32, Type::F32], Type::F32)
+    );
     assert_eq!(main.body.ty, Type::F32);
 }
 
 #[test]
 fn comparison_operators_yield_bool() {
-    for (src_op, mangled_op) in [
-        ("==", "==__i32_i32_bool"),
-        ("!=", "!=__i32_i32_bool"),
-        ("<", "<__i32_i32_bool"),
-        (">", ">__i32_i32_bool"),
-        ("<=", "<=__i32_i32_bool"),
-        (">=", ">=__i32_i32_bool"),
-    ] {
-        let src = format!("fn main() -> bool = 1 {src_op} 2;");
+    for op in ["==", "!=", "<", ">", "<=", ">="] {
+        let src = format!("fn main() -> bool = 1 {op} 2;");
         let module = check_ok(&src);
-        let main = func(&module, "main___bool");
-        assert_eq!(resolved_call_name(&main.body), mangled_op);
+        let main = func_sig(&module, "main", vec![], Type::Bool);
+        assert_eq!(
+            resolved_call_name(&main.body),
+            m(op, vec![Type::I32, Type::I32], Type::Bool)
+        );
         // Operands defaulted to i32, but the result is bool.
         assert_eq!(main.body.ty, Type::Bool);
         assert_eq!(call_args(&main.body)[0].ty, Type::I32);
@@ -536,32 +597,37 @@ fn comparison_operators_yield_bool() {
 #[test]
 fn equality_operator_works_on_bools() {
     let module = check_ok("fn main() -> bool = true == false;");
-    let main = func(&module, "main___bool");
-    assert_eq!(resolved_call_name(&main.body), "==__bool_bool_bool");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("==", vec![Type::Bool, Type::Bool], Type::Bool)
+    );
     assert_eq!(main.body.ty, Type::Bool);
 }
 
 #[test]
 fn logical_operators_require_bools() {
-    for (src_op, mangled_op) in [("&&", "&&__bool_bool_bool"), ("||", "||__bool_bool_bool")] {
-        let src = format!("fn main() -> bool = true {src_op} false;");
+    for op in ["&&", "||"] {
+        let src = format!("fn main() -> bool = true {op} false;");
         let module = check_ok(&src);
-        let main = func(&module, "main___bool");
-        assert_eq!(resolved_call_name(&main.body), mangled_op);
+        let main = func_sig(&module, "main", vec![], Type::Bool);
+        assert_eq!(
+            resolved_call_name(&main.body),
+            m(op, vec![Type::Bool, Type::Bool], Type::Bool)
+        );
     }
 }
 
 #[test]
 fn bitwise_operators_resolve_on_integers() {
-    for (src_op, mangled_op) in [
-        ("&", "&__i32_i32_i32"),
-        ("|", "|__i32_i32_i32"),
-        ("^", "^__i32_i32_i32"),
-    ] {
-        let src = format!("fn main() -> i32 = 6 {src_op} 3;");
+    for op in ["&", "|", "^"] {
+        let src = format!("fn main() -> i32 = 6 {op} 3;");
         let module = check_ok(&src);
-        let main = func(&module, "main___i32");
-        assert_eq!(resolved_call_name(&main.body), mangled_op);
+        let main = func_sig(&module, "main", vec![], Type::I32);
+        assert_eq!(
+            resolved_call_name(&main.body),
+            m(op, vec![Type::I32, Type::I32], Type::I32)
+        );
         assert_eq!(main.body.ty, Type::I32);
     }
 }
@@ -569,15 +635,14 @@ fn bitwise_operators_resolve_on_integers() {
 #[test]
 fn bitwise_operators_resolve_on_bools() {
     // `&`, `|` and `^` also have bool overloads (unlike `&&`/`||`).
-    for (src_op, mangled_op) in [
-        ("&", "&__bool_bool_bool"),
-        ("|", "|__bool_bool_bool"),
-        ("^", "^__bool_bool_bool"),
-    ] {
-        let src = format!("fn main() -> bool = true {src_op} false;");
+    for op in ["&", "|", "^"] {
+        let src = format!("fn main() -> bool = true {op} false;");
         let module = check_ok(&src);
-        let main = func(&module, "main___bool");
-        assert_eq!(resolved_call_name(&main.body), mangled_op);
+        let main = func_sig(&module, "main", vec![], Type::Bool);
+        assert_eq!(
+            resolved_call_name(&main.body),
+            m(op, vec![Type::Bool, Type::Bool], Type::Bool)
+        );
     }
 }
 
@@ -644,13 +709,18 @@ fn op_and_nested(module: &Module, arg_idx: usize) -> (String, String) {
     (root, nested)
 }
 
+/// A binary operator's mangled name for `(lhs, rhs) -> ret`, all the same width.
+fn op(name: &str, operand: Type, ret: Type) -> String {
+    m(name, vec![operand.clone(), operand], ret)
+}
+
 #[test]
 fn mul_binds_tighter_than_add_on_the_right() {
     // 1 + 2 * 3  ==  1 + (2 * 3)  -> `*` nested under the right arg of `+`.
     let module = check_ok("fn main() -> i32 = 1 + 2 * 3;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "+__i32_i32_i32");
-    assert_eq!(nested, "*__i32_i32_i32");
+    assert_eq!(root, op("+", Type::I32, Type::I32));
+    assert_eq!(nested, op("*", Type::I32, Type::I32));
 }
 
 #[test]
@@ -658,8 +728,8 @@ fn mul_binds_tighter_than_add_on_the_left() {
     // 1 * 2 + 3  ==  (1 * 2) + 3  -> `*` nested under the left arg of `+`.
     let module = check_ok("fn main() -> i32 = 1 * 2 + 3;");
     let (root, nested) = op_and_nested(&module, 0);
-    assert_eq!(root, "+__i32_i32_i32");
-    assert_eq!(nested, "*__i32_i32_i32");
+    assert_eq!(root, op("+", Type::I32, Type::I32));
+    assert_eq!(nested, op("*", Type::I32, Type::I32));
 }
 
 #[test]
@@ -667,8 +737,8 @@ fn div_and_mod_bind_tighter_than_sub() {
     // 8 - 6 / 2  ==  8 - (6 / 2)
     let module = check_ok("fn main() -> i32 = 8 - 6 / 2;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "-__i32_i32_i32");
-    assert_eq!(nested, "/__i32_i32_i32");
+    assert_eq!(root, op("-", Type::I32, Type::I32));
+    assert_eq!(nested, op("/", Type::I32, Type::I32));
 }
 
 #[test]
@@ -676,8 +746,8 @@ fn add_binds_tighter_than_comparison() {
     // 1 + 2 < 3  ==  (1 + 2) < 3
     let module = check_ok("fn main() -> bool = 1 + 2 < 3;");
     let (root, nested) = op_and_nested(&module, 0);
-    assert_eq!(root, "<__i32_i32_bool");
-    assert_eq!(nested, "+__i32_i32_i32");
+    assert_eq!(root, op("<", Type::I32, Type::Bool));
+    assert_eq!(nested, op("+", Type::I32, Type::I32));
 }
 
 #[test]
@@ -685,8 +755,8 @@ fn comparison_binds_tighter_than_equality() {
     // 1 < 2 == true  ==  (1 < 2) == true
     let module = check_ok("fn main() -> bool = 1 < 2 == true;");
     let (root, nested) = op_and_nested(&module, 0);
-    assert_eq!(root, "==__bool_bool_bool");
-    assert_eq!(nested, "<__i32_i32_bool");
+    assert_eq!(root, op("==", Type::Bool, Type::Bool));
+    assert_eq!(nested, op("<", Type::I32, Type::Bool));
 }
 
 #[test]
@@ -694,8 +764,8 @@ fn equality_binds_tighter_than_bitwise_and() {
     // true & false == true  ==  true & (false == true)
     let module = check_ok("fn main() -> bool = true & false == true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "&__bool_bool_bool");
-    assert_eq!(nested, "==__bool_bool_bool");
+    assert_eq!(root, op("&", Type::Bool, Type::Bool));
+    assert_eq!(nested, op("==", Type::Bool, Type::Bool));
 }
 
 #[test]
@@ -703,8 +773,8 @@ fn bitwise_and_binds_tighter_than_bitwise_xor() {
     // true ^ false & true  ==  true ^ (false & true)
     let module = check_ok("fn main() -> bool = true ^ false & true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "^__bool_bool_bool");
-    assert_eq!(nested, "&__bool_bool_bool");
+    assert_eq!(root, op("^", Type::Bool, Type::Bool));
+    assert_eq!(nested, op("&", Type::Bool, Type::Bool));
 }
 
 #[test]
@@ -712,8 +782,8 @@ fn bitwise_xor_binds_tighter_than_bitwise_or() {
     // true | false ^ true  ==  true | (false ^ true)
     let module = check_ok("fn main() -> bool = true | false ^ true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "|__bool_bool_bool");
-    assert_eq!(nested, "^__bool_bool_bool");
+    assert_eq!(root, op("|", Type::Bool, Type::Bool));
+    assert_eq!(nested, op("^", Type::Bool, Type::Bool));
 }
 
 #[test]
@@ -721,8 +791,8 @@ fn bitwise_or_binds_tighter_than_logical_and() {
     // true && false | true  ==  true && (false | true)
     let module = check_ok("fn main() -> bool = true && false | true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "&&__bool_bool_bool");
-    assert_eq!(nested, "|__bool_bool_bool");
+    assert_eq!(root, op("&&", Type::Bool, Type::Bool));
+    assert_eq!(nested, op("|", Type::Bool, Type::Bool));
 }
 
 #[test]
@@ -730,8 +800,8 @@ fn logical_and_binds_tighter_than_logical_or() {
     // true || false && true  ==  true || (false && true)
     let module = check_ok("fn main() -> bool = true || false && true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, "||__bool_bool_bool");
-    assert_eq!(nested, "&&__bool_bool_bool");
+    assert_eq!(root, op("||", Type::Bool, Type::Bool));
+    assert_eq!(nested, op("&&", Type::Bool, Type::Bool));
 }
 
 #[test]
@@ -746,20 +816,21 @@ fn full_precedence_ladder_nests_deepest_operator_last() {
         "fn main() -> bool =
             true || true && true | true ^ true & true == 2 < 3 + 4 * 5;",
     );
-    let main = func(&module, "main___bool");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    let expected = [
+        op("||", Type::Bool, Type::Bool),
+        op("&&", Type::Bool, Type::Bool),
+        op("|", Type::Bool, Type::Bool),
+        op("^", Type::Bool, Type::Bool),
+        op("&", Type::Bool, Type::Bool),
+        op("==", Type::Bool, Type::Bool),
+        op("<", Type::I32, Type::Bool),
+        op("+", Type::I32, Type::I32),
+        op("*", Type::I32, Type::I32),
+    ];
     let mut node = &main.body;
-    for expected in [
-        "||__bool_bool_bool",
-        "&&__bool_bool_bool",
-        "|__bool_bool_bool",
-        "^__bool_bool_bool",
-        "&__bool_bool_bool",
-        "==__bool_bool_bool",
-        "<__i32_i32_bool",
-        "+__i32_i32_i32",
-        "*__i32_i32_i32",
-    ] {
-        assert_eq!(resolved_call_name(node), expected);
+    for expected_name in expected {
+        assert_eq!(resolved_call_name(node), expected_name);
         // Every level nests its tighter-binding neighbour in the right arg.
         node = &call_args(node)[1];
     }
@@ -775,10 +846,13 @@ fn binary_operators_are_left_associative() {
     // recurses with `parse_expr(op_precedence + 1)`, so `1 - 2 - 3` parses as
     // `(1 - 2) - 3`. The nested subtraction therefore sits in the LEFT operand.
     let module = check_ok("fn main() -> i32 = 1 - 2 - 3;");
-    let main = func(&module, "main___i32");
-    assert_eq!(resolved_call_name(&main.body), "-__i32_i32_i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        op("-", Type::I32, Type::I32)
+    );
     let args = call_args(&main.body);
-    assert_eq!(resolved_call_name(&args[0]), "-__i32_i32_i32");
+    assert_eq!(resolved_call_name(&args[0]), op("-", Type::I32, Type::I32));
     assert!(matches!(args[1].kind, ExprKind::Num(3)));
 }
 
@@ -788,32 +862,29 @@ fn division_is_left_associative() {
     // comes out right if `/` associates leftward (a right-assoc parse would
     // change the result), so it's a meaningful associativity guard.
     let module = check_ok("fn main() -> i32 = 16 / 4 / 2;");
-    let main = func(&module, "main___i32");
+    let main = func_sig(&module, "main", vec![], Type::I32);
     let args = call_args(&main.body);
-    assert_eq!(resolved_call_name(&args[0]), "/__i32_i32_i32");
+    assert_eq!(resolved_call_name(&args[0]), op("/", Type::I32, Type::I32));
     assert!(matches!(args[1].kind, ExprKind::Num(2)));
 }
 
 // --------------------------------------------------------------------------
 // Name mangling unit test
+//
+// This is the one place that deliberately pins the exact mangled-name format,
+// so it is the single test that must be updated if the scheme changes.
 // --------------------------------------------------------------------------
 
 #[test]
 fn mangle_name_format() {
-    assert_eq!(
-        mangle_name(&fn_ty(vec![], Type::I32), "main"),
-        "main___i32"
-    );
+    assert_eq!(mangle_name(&fn_ty(vec![], Type::I32), "main"), "main____i32");
     assert_eq!(
         mangle_name(&fn_ty(vec![Type::I32], Type::I32), "id"),
-        "id__i32_i32"
+        "id__i32__i32"
     );
     assert_eq!(
         mangle_name(&fn_ty(vec![Type::I32, Type::U8], Type::I32), "foo"),
-        "foo__i32_u8_i32"
+        "foo__i32_u8__i32"
     );
-    assert_eq!(
-        mangle_name(&fn_ty(vec![], Type::Void), "a"),
-        "a___void"
-    );
+    assert_eq!(mangle_name(&fn_ty(vec![], Type::Void), "a"), "a____void");
 }
