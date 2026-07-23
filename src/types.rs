@@ -12,11 +12,18 @@ pub enum Type {
 
     Void,
 
+    Bool,
+
     // {integer}
     Integer,
 
     U8, U16, U32, U64,
     I8, I16, I32, I64,
+
+    // {decimal}
+    Decimal,
+
+    F32, F64,
 }
 
 impl Type {
@@ -32,7 +39,8 @@ impl Type {
                 known & ret.is_known()
             }
             Integer => false,
-            Void | U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 => true,
+            Decimal => false,
+            Void | Bool | U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 | F32 | F64 => true,
         }
     }
 
@@ -65,6 +73,8 @@ impl Type {
             | (I32, Integer)
             | (I64, Integer) => true,
 
+            (Decimal, F32) | (F32, Decimal) | (Decimal, F64) | (F64, Decimal) => true,
+
             (a, b) if a == b => true,
             _ => false,
         }
@@ -75,8 +85,9 @@ impl Debug for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use Type::*;
         match self {
-            T(n) => write!(f, "t{n}"),
+            T(n) => write!(f, "'t{n}"),
             Void => write!(f, "void"),
+            Bool => write!(f, "bool"),
             U8 => write!(f, "u8"),
             U16 => write!(f, "u16"),
             U32 => write!(f, "u32"),
@@ -85,7 +96,10 @@ impl Debug for Type {
             I16 => write!(f, "i16"),
             I32 => write!(f, "i32"),
             I64 => write!(f, "i64"),
+            F32 => write!(f, "f32"),
+            F64 => write!(f, "f64"),
             Integer => write!(f, "{{integer}}"),
+            Decimal => write!(f, "{{decimal}}"),
             Fn(args, ret) => {
                 let arg_list = args
                     .iter()

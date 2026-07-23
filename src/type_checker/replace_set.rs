@@ -86,7 +86,6 @@ impl ReplaceSet {
                 self.resolve(&T(b))
             }
 
-            (Integer, Integer) => Integer,
             (Integer, I8) | (I8, Integer) => I8,
             (Integer, I16) | (I16, Integer) => I16,
             (Integer, I32) | (I32, Integer) => I32,
@@ -95,6 +94,9 @@ impl ReplaceSet {
             (Integer, U16) | (U16, Integer) => U16,
             (Integer, U32) | (U32, Integer) => U32,
             (Integer, U64) | (U64, Integer) => U64,
+
+            (Decimal, F32) | (F32, Decimal) => F32,
+            (Decimal, F64) | (F64, Decimal) => F64,
 
             (Fn(a1, r1), Fn(a2, r2)) => {
                 if a1.len() != a2.len() {
@@ -198,9 +200,13 @@ impl ReplaceSet {
     }
 
     pub(super) fn default_types(&mut self) {
+        use Type::*;
+
         for (_, ty) in self.bindings.iter_mut() {
-            if *ty == Type::Integer {
-                *ty = Type::I32;
+            match ty {
+                Integer => *ty = I32,
+                Decimal => *ty = F32,
+                _ => {}
             }
         }
     }

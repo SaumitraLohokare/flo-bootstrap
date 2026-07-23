@@ -11,16 +11,15 @@ mod types;
 mod util;
 
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
-// DONE: Overloading
+// DONE: Operators (*, /, %)
+// DONE: Bool & F32
+// DONE: Remaining operators (logical, comaprison)
+// TODO: Unary operators
+// TODO: bitwise
 
 fn main() {
     let src = r#"
-        fn main() -> i32 = outer(inner());
-
-        fn inner() -> i32 = 0;
-
-        fn outer(x: i32) -> i32 = x;
-        fn outer(x: u8) -> i32 = 0;
+        fn main() -> bool = false;
     "#
     .to_string();
 

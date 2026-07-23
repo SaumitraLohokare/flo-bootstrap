@@ -61,13 +61,21 @@ pub enum FloErr {
         loc: Loc,
     },
 
+    AmbiguousOverload {
+        name: String,
+        found_loc: Loc,
+        previous_loc: Loc,
+    },
+
     NoPossibleOverloads {
         name: String,
+        known_ty: Type,
         loc: Loc,
     },
 
-    AmbiguousOverloads {
+    MultiplePossibleOverloads {
         name: String,
+        possible_tys: Vec<Type>,
         loc: Loc,
     },
 }
@@ -76,7 +84,7 @@ impl FloErr {
     pub fn pretty_print(self, src: &String) {
         use FloErr::*;
 
-        eprint!("Error: ");
+        eprint!("\x1b[1;31merror\x1b[0m: ");
 
         match self {
             UnexpectedEOF => eprintln!("Unexpected EOF"),
@@ -134,13 +142,35 @@ impl FloErr {
                 eprintln!("Unresolved type `{ty:?}`");
                 print_src(src, &[loc]);
             }
-            NoPossibleOverloads { name, loc } => {
-                eprintln!("No possible overloads found for `{name}`");
+            NoPossibleOverloads {
+                name,
+                known_ty,
+                loc,
+            } => {
+                eprintln!("No possible overloads found for `{name}{known_ty:?}`");
                 print_src(src, &[loc]);
             }
-            AmbiguousOverloads { name, loc } => {
-                eprintln!("Multiple possible overloads found for `{name}`");
+            MultiplePossibleOverloads {
+                name,
+                loc,
+                possible_tys,
+            } => {
+                let possible_tys = possible_tys
+                    .iter()
+                    .map(|t| format!("{name}{t:?}"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                eprintln!("Multiple possible overloads found for `{name}`:");
+                eprintln!("    {possible_tys}");
                 print_src(src, &[loc]);
+            }
+            AmbiguousOverload {
+                name,
+                found_loc,
+                previous_loc,
+            } => {
+                eprintln!("Ambiguous overload `{name}`");
+                print_src(src, &[found_loc, previous_loc]);
             }
         }
     }
@@ -228,11 +258,14 @@ fn print_src(src: &String, locs: &[Loc]) {
 }
 
 impl TokenKind {
-    fn pretty_name(&self) -> &str {
+    pub fn pretty_name(&self) -> &str {
         match self {
             TokenKind::Fn => "fn",
+            TokenKind::True => "true",
+            TokenKind::False => "false",
             TokenKind::Ident => "identifier",
             TokenKind::Num => "number",
+            TokenKind::Flt => "decimal",
             TokenKind::LParen => "(",
             TokenKind::RParen => ")",
             TokenKind::Arrow => "->",
@@ -240,6 +273,22 @@ impl TokenKind {
             TokenKind::Semicolon => ";",
             TokenKind::Colon => ":",
             TokenKind::Comma => ",",
+            TokenKind::Plus => "+",
+            TokenKind::Minus => "-",
+            TokenKind::Star => "*",
+            TokenKind::Slash => "/",
+            TokenKind::Percent => "%",
+            TokenKind::Amp => "&",
+            TokenKind::Pipe => "|",
+            TokenKind::Cap => "^",
+            TokenKind::AmpAmp => "&&",
+            TokenKind::PipePipe => "||",
+            TokenKind::EqualEqual => "==",
+            TokenKind::BangEqual => "!=",
+            TokenKind::LessThan => "<",
+            TokenKind::GreaterThan => ">",
+            TokenKind::LessThanEqual => "<=",
+            TokenKind::GreaterThanEqual => ">=",
         }
     }
 }

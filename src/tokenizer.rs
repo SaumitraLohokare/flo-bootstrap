@@ -2,8 +2,12 @@
 pub enum TokenKind {
     Fn,
 
+    True,
+    False,
+
     Ident,
     Num,
+    Flt,
 
     LParen,
     RParen,
@@ -14,14 +18,35 @@ pub enum TokenKind {
 
     Equal,
 
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+
+    Amp,
+    Pipe,
+    Cap,
+
+    AmpAmp,
+    PipePipe,
+
+    EqualEqual,
+    BangEqual,
+    LessThan,
+    GreaterThan,
+    LessThanEqual,
+    GreaterThanEqual,
+
     Semicolon,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TokenValue {
     None,
     String(String),
     Num(u64),
+    Flt(f64),
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -30,7 +55,7 @@ pub struct Loc {
     pub end: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
     pub value: TokenValue,
@@ -74,7 +99,42 @@ impl Tokenizer {
                 ':' => tokens.push(self.tokenize_symbol(":", TokenKind::Colon)),
                 ',' => tokens.push(self.tokenize_symbol(",", TokenKind::Comma)),
 
+                '=' if self.peek_n(1) == Some('=') => {
+                    tokens.push(self.tokenize_symbol("==", TokenKind::EqualEqual))
+                }
                 '=' => tokens.push(self.tokenize_symbol("=", TokenKind::Equal)),
+
+                '!' if self.peek_n(1) == Some('=') => {
+                    tokens.push(self.tokenize_symbol("!=", TokenKind::BangEqual))
+                }
+
+                '<' if self.peek_n(1) == Some('=') => {
+                    tokens.push(self.tokenize_symbol("<=", TokenKind::LessThanEqual))
+                }
+                '<' => tokens.push(self.tokenize_symbol("<", TokenKind::LessThan)),
+
+                '>' if self.peek_n(1) == Some('=') => {
+                    tokens.push(self.tokenize_symbol(">=", TokenKind::GreaterThanEqual))
+                }
+                '>' => tokens.push(self.tokenize_symbol(">", TokenKind::GreaterThan)),
+
+                '+' => tokens.push(self.tokenize_symbol("+", TokenKind::Plus)),
+                '-' => tokens.push(self.tokenize_symbol("-", TokenKind::Minus)),
+                '*' => tokens.push(self.tokenize_symbol("*", TokenKind::Star)),
+                '/' => tokens.push(self.tokenize_symbol("/", TokenKind::Slash)),
+                '%' => tokens.push(self.tokenize_symbol("%", TokenKind::Percent)),
+
+                '&' if self.peek_n(1) == Some('&') => {
+                    tokens.push(self.tokenize_symbol("&&", TokenKind::AmpAmp))
+                }
+                '&' => tokens.push(self.tokenize_symbol("&", TokenKind::Amp)),
+
+                '|' if self.peek_n(1) == Some('|') => {
+                    tokens.push(self.tokenize_symbol("||", TokenKind::PipePipe))
+                }
+                '|' => tokens.push(self.tokenize_symbol("|", TokenKind::Pipe)),
+
+                '^' => tokens.push(self.tokenize_symbol("^", TokenKind::Cap)),
 
                 ';' => tokens.push(self.tokenize_symbol(";", TokenKind::Semicolon)),
 
@@ -100,6 +160,8 @@ impl Tokenizer {
 
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
+            "true" => TokenKind::True,
+            "false" => TokenKind::False,
 
             _ => TokenKind::Ident,
         };
@@ -122,8 +184,13 @@ impl Tokenizer {
         let mut num = String::new();
         let start = self.idx;
 
+        let mut is_decimal = false;
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '_' {
+                num.push(ch);
+                self.skip();
+            } else if ch == '.' && !is_decimal {
+                is_decimal = true;
                 num.push(ch);
                 self.skip();
             } else {
@@ -131,8 +198,18 @@ impl Tokenizer {
             }
         }
 
-        let kind = TokenKind::Num;
-        let value = TokenValue::Num(num.parse::<u64>().unwrap());
+        let kind = if !is_decimal {
+            TokenKind::Num
+        } else {
+            TokenKind::Flt
+        };
+
+        let value = if !is_decimal {
+            TokenValue::Num(num.parse::<u64>().unwrap())
+        } else {
+            TokenValue::Flt(num.parse::<f64>().unwrap())
+        };
+
         let loc = Loc {
             start,
             end: self.idx - 1,

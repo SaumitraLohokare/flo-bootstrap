@@ -43,9 +43,17 @@ impl TypeChecker {
             for func in funcs {
                 match self.check_func(func) {
                     Ok(func) => {
-                        let name = mangle_name(&func.ty, name);
-                        assert!(!new_funcs.contains_key(&name));
-                        new_funcs.entry(name).or_default().push(func);
+                        let mangled_name = mangle_name(&func.ty, name);
+                        if !new_funcs.contains_key(&mangled_name) {
+                            new_funcs.entry(mangled_name).or_default().push(func);
+                        } else {
+                            let previous_loc = new_funcs.get(&mangled_name).unwrap()[0].loc;
+                            errs.push(FloErr::AmbiguousOverload {
+                                name: name.clone(),
+                                found_loc: func.loc,
+                                previous_loc,
+                            });
+                        }
                     }
                     Err(err) => errs.push(err),
                 }
@@ -110,7 +118,15 @@ impl TypeChecker {
                 let constraint = IsEqual(Integer, expr.ty.clone(), expr.loc);
                 self.solve_constraint(set, constraint)?;
             }
-            Var(_) => {}
+            Flt(_) => {
+                let constraint = IsEqual(Decimal, expr.ty.clone(), expr.loc);
+                self.solve_constraint(set, constraint)?;
+            }
+            ExprKind::Bool(_) => {
+                let constraint = IsEqual(Type::Bool, expr.ty.clone(), expr.loc);
+                self.solve_constraint(set, constraint)?;
+            }
+            BuiltinOp(_) | Var(_) => {}
             Call(_, arg_exprs, _) => {
                 for arg_expr in arg_exprs {
                     self.solve_expr_constraints(arg_expr, set)?;
@@ -278,16 +294,22 @@ impl TypeChecker {
             if resolved.is_none() {
                 let possible = self.possible_overloads(name, args, &expr.ty, expr.loc, set)?;
 
-                // TODO: Might wanna add locations of the possible overloads to
-                // the ambiguous error
                 if possible.is_empty() {
+                    let arg_tys = args.iter().map(|a| set.resolve(&a.ty)).collect();
+                    let known_ty = Type::Fn(arg_tys, Box::new(set.resolve(&expr.ty)));
                     Err(FloErr::NoPossibleOverloads {
                         name: name.clone(),
+                        known_ty,
                         loc: expr.loc,
                     })?
                 } else {
-                    Err(FloErr::AmbiguousOverloads {
+                    let possible_tys = possible
+                        .into_iter()
+                        .map(|t| set.resolve(t))
+                        .collect::<Vec<Type>>();
+                    Err(FloErr::MultiplePossibleOverloads {
                         name: name.clone(),
+                        possible_tys,
                         loc: expr.loc,
                     })?
                 }
@@ -345,17 +367,7 @@ impl Expr {
             })?
         }
 
-        Ok(match &self.kind {
-            Num(n) => Expr {
-                kind: Num(*n),
-                ty,
-                loc,
-            },
-            Var(v) => Expr {
-                kind: Var(*v),
-                ty,
-                loc,
-            },
+        let kind = match &self.kind {
             Call(name, args, resolved) => {
                 let mut new_args = Vec::new();
                 for arg in args {
@@ -363,14 +375,17 @@ impl Expr {
                 }
                 assert!(
                     resolved.is_some(),
-                    "All calls should be resolved at this point"
+                    "Unresolved call {name} (args: {args:?})"
                 );
-                Expr {
-                    kind: Call(name.clone(), new_args, resolved.clone()),
-                    ty,
-                    loc,
-                }
+                Call(name.clone(), new_args, resolved.clone())
             }
-        })
+            Num(n) => Num(*n),
+            Flt(n) => Flt(*n),
+            Bool(n) => Bool(*n),
+            Var(v) => Var(*v),
+            BuiltinOp(op) => BuiltinOp(*op),
+        };
+
+        Ok(Expr { kind, ty, loc })
     }
 }

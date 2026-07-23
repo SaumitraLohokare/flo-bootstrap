@@ -75,6 +75,9 @@ impl Parser {
             }
         }
 
+        // Register builtin ops (body is a Nop expr with ty = ret_ty)
+        self.register_builtin_ops();
+
         match self.funcs.entry("main".to_string()).or_default().len() {
             0 => Err(FloErr::MainFunctionNotFound),
             1 => Ok(Module { funcs: self.funcs }),
@@ -146,6 +149,8 @@ impl Parser {
 
         self.expect(Semicolon)?;
 
+        // It would be good to check for ambiguous overloads
+        // here. It would give more consistent errors
         self.funcs
             .entry(name)
             .or_default()
@@ -154,10 +159,37 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_expr(&mut self, _precedence: i32, scope: &Scope) -> FloResult<Expr> {
-        let lhs = self.parse_atom(scope)?;
+    fn parse_expr(&mut self, precedence: i32, scope: &Scope) -> FloResult<Expr> {
+        use ExprKind::*;
+        let mut lhs = self.parse_atom(scope)?;
 
         // TODO
+        loop {
+            let tok = self.peek()?;
+            let op = tok.kind;
+
+            if !op.is_binary_op() {
+                break;
+            }
+
+            let op_precedence = op.precedence();
+            if op_precedence < precedence {
+                break;
+            }
+
+            self.skip();
+
+            let rhs = self.parse_expr(op_precedence, scope)?;
+            let loc = Loc {
+                start: lhs.loc.start,
+                end: rhs.loc.end,
+            };
+            lhs = Expr {
+                kind: Call(format!("{}", op.pretty_name()), vec![lhs, rhs], None),
+                ty: self.fresh_type(),
+                loc,
+            };
+        }
 
         Ok(lhs)
     }
@@ -175,6 +207,34 @@ impl Parser {
                 self.skip();
 
                 let kind = ExprKind::Num(num);
+                Ok(Expr {
+                    kind,
+                    ty: self.fresh_type(),
+                    loc,
+                })
+            }
+
+            Flt => {
+                let TokenValue::Flt(num) = token.value else {
+                    unreachable!()
+                };
+                let loc = token.loc;
+                self.skip();
+
+                let kind = ExprKind::Flt(num);
+                Ok(Expr {
+                    kind,
+                    ty: self.fresh_type(),
+                    loc,
+                })
+            }
+
+            True | False => {
+                let value = token.kind == True;
+                let loc = token.loc;
+                self.skip();
+
+                let kind = ExprKind::Bool(value);
                 Ok(Expr {
                     kind,
                     ty: self.fresh_type(),
@@ -257,7 +317,10 @@ impl Parser {
                     "i16" => Ok((Type::I16, loc)),
                     "i32" => Ok((Type::I32, loc)),
                     "i64" => Ok((Type::I64, loc)),
+                    "f32" => Ok((Type::F32, loc)),
+                    "f64" => Ok((Type::F64, loc)),
                     "void" => Ok((Type::Void, loc)),
+                    "bool" => Ok((Type::Bool, loc)),
 
                     _ => Err(FloErr::NotAType { token }),
                 }
@@ -317,5 +380,229 @@ impl Parser {
 
     fn func_type(&self, arg_types: Vec<Type>, ret_type: Type) -> Type {
         Type::Fn(arg_types, Box::new(ret_type))
+    }
+
+    fn register_builtin_ops(&mut self) {
+        use TokenKind::*;
+        use Type::*;
+
+        let plus_op = self.funcs.entry("+".to_string()).or_default();
+        plus_op.push(builtin_op(Plus, vec![U8, U8], U8));
+        plus_op.push(builtin_op(Plus, vec![U16, U16], U16));
+        plus_op.push(builtin_op(Plus, vec![U32, U32], U32));
+        plus_op.push(builtin_op(Plus, vec![U64, U64], U64));
+        plus_op.push(builtin_op(Plus, vec![I8, I8], I8));
+        plus_op.push(builtin_op(Plus, vec![I16, I16], I16));
+        plus_op.push(builtin_op(Plus, vec![I32, I32], I32));
+        plus_op.push(builtin_op(Plus, vec![I64, I64], I64));
+        plus_op.push(builtin_op(Plus, vec![F32, F32], F32));
+        plus_op.push(builtin_op(Plus, vec![F64, F64], F64));
+
+        let minus_op = self.funcs.entry("-".to_string()).or_default();
+        minus_op.push(builtin_op(Minus, vec![U8, U8], U8));
+        minus_op.push(builtin_op(Minus, vec![U16, U16], U16));
+        minus_op.push(builtin_op(Minus, vec![U32, U32], U32));
+        minus_op.push(builtin_op(Minus, vec![U64, U64], U64));
+        minus_op.push(builtin_op(Minus, vec![I8, I8], I8));
+        minus_op.push(builtin_op(Minus, vec![I16, I16], I16));
+        minus_op.push(builtin_op(Minus, vec![I32, I32], I32));
+        minus_op.push(builtin_op(Minus, vec![I64, I64], I64));
+        minus_op.push(builtin_op(Minus, vec![F32, F32], F32));
+        minus_op.push(builtin_op(Minus, vec![F64, F64], F64));
+
+        let star_op = self.funcs.entry("*".to_string()).or_default();
+        star_op.push(builtin_op(Star, vec![U8, U8], U8));
+        star_op.push(builtin_op(Star, vec![U16, U16], U16));
+        star_op.push(builtin_op(Star, vec![U32, U32], U32));
+        star_op.push(builtin_op(Star, vec![U64, U64], U64));
+        star_op.push(builtin_op(Star, vec![I8, I8], I8));
+        star_op.push(builtin_op(Star, vec![I16, I16], I16));
+        star_op.push(builtin_op(Star, vec![I32, I32], I32));
+        star_op.push(builtin_op(Star, vec![I64, I64], I64));
+        star_op.push(builtin_op(Star, vec![F32, F32], F32));
+        star_op.push(builtin_op(Star, vec![F64, F64], F64));
+
+        let slash_op = self.funcs.entry("/".to_string()).or_default();
+        slash_op.push(builtin_op(Slash, vec![U8, U8], U8));
+        slash_op.push(builtin_op(Slash, vec![U16, U16], U16));
+        slash_op.push(builtin_op(Slash, vec![U32, U32], U32));
+        slash_op.push(builtin_op(Slash, vec![U64, U64], U64));
+        slash_op.push(builtin_op(Slash, vec![I8, I8], I8));
+        slash_op.push(builtin_op(Slash, vec![I16, I16], I16));
+        slash_op.push(builtin_op(Slash, vec![I32, I32], I32));
+        slash_op.push(builtin_op(Slash, vec![I64, I64], I64));
+        slash_op.push(builtin_op(Slash, vec![F32, F32], F32));
+        slash_op.push(builtin_op(Slash, vec![F64, F64], F64));
+
+        let percent_op = self.funcs.entry("%".to_string()).or_default();
+        percent_op.push(builtin_op(Percent, vec![U8, U8], U8));
+        percent_op.push(builtin_op(Percent, vec![U16, U16], U16));
+        percent_op.push(builtin_op(Percent, vec![U32, U32], U32));
+        percent_op.push(builtin_op(Percent, vec![U64, U64], U64));
+        percent_op.push(builtin_op(Percent, vec![I8, I8], I8));
+        percent_op.push(builtin_op(Percent, vec![I16, I16], I16));
+        percent_op.push(builtin_op(Percent, vec![I32, I32], I32));
+        percent_op.push(builtin_op(Percent, vec![I64, I64], I64));
+        percent_op.push(builtin_op(Percent, vec![F32, F32], F32));
+        percent_op.push(builtin_op(Percent, vec![F64, F64], F64));
+
+        let amp_op = self.funcs.entry("&".to_string()).or_default();
+        amp_op.push(builtin_op(Amp, vec![U8, U8], U8));
+        amp_op.push(builtin_op(Amp, vec![U16, U16], U16));
+        amp_op.push(builtin_op(Amp, vec![U32, U32], U32));
+        amp_op.push(builtin_op(Amp, vec![U64, U64], U64));
+        amp_op.push(builtin_op(Amp, vec![I8, I8], I8));
+        amp_op.push(builtin_op(Amp, vec![I16, I16], I16));
+        amp_op.push(builtin_op(Amp, vec![I32, I32], I32));
+        amp_op.push(builtin_op(Amp, vec![I64, I64], I64));
+        amp_op.push(builtin_op(Amp, vec![Bool, Bool], Bool));
+
+        let pipe_op = self.funcs.entry("|".to_string()).or_default();
+        pipe_op.push(builtin_op(Pipe, vec![U8, U8], U8));
+        pipe_op.push(builtin_op(Pipe, vec![U16, U16], U16));
+        pipe_op.push(builtin_op(Pipe, vec![U32, U32], U32));
+        pipe_op.push(builtin_op(Pipe, vec![U64, U64], U64));
+        pipe_op.push(builtin_op(Pipe, vec![I8, I8], I8));
+        pipe_op.push(builtin_op(Pipe, vec![I16, I16], I16));
+        pipe_op.push(builtin_op(Pipe, vec![I32, I32], I32));
+        pipe_op.push(builtin_op(Pipe, vec![I64, I64], I64));
+        pipe_op.push(builtin_op(Pipe, vec![Bool, Bool], Bool));
+
+        let cap_op = self.funcs.entry("^".to_string()).or_default();
+        cap_op.push(builtin_op(Cap, vec![U8, U8], U8));
+        cap_op.push(builtin_op(Cap, vec![U16, U16], U16));
+        cap_op.push(builtin_op(Cap, vec![U32, U32], U32));
+        cap_op.push(builtin_op(Cap, vec![U64, U64], U64));
+        cap_op.push(builtin_op(Cap, vec![I8, I8], I8));
+        cap_op.push(builtin_op(Cap, vec![I16, I16], I16));
+        cap_op.push(builtin_op(Cap, vec![I32, I32], I32));
+        cap_op.push(builtin_op(Cap, vec![I64, I64], I64));
+        cap_op.push(builtin_op(Cap, vec![Bool, Bool], Bool));
+
+        let amp_amp_op = self.funcs.entry("&&".to_string()).or_default();
+        amp_amp_op.push(builtin_op(AmpAmp, vec![Bool, Bool], Bool));
+
+        let pipe_pipe_op = self.funcs.entry("||".to_string()).or_default();
+        pipe_pipe_op.push(builtin_op(PipePipe, vec![Bool, Bool], Bool));
+
+        let eq_eq_op = self.funcs.entry("==".to_string()).or_default();
+        eq_eq_op.push(builtin_op(EqualEqual, vec![U8, U8], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![U16, U16], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![U32, U32], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![U64, U64], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![I8, I8], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![I16, I16], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![I32, I32], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![I64, I64], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![F32, F32], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![F64, F64], Bool));
+        eq_eq_op.push(builtin_op(EqualEqual, vec![Bool, Bool], Bool));
+
+        let bang_eq_op = self.funcs.entry("!=".to_string()).or_default();
+        bang_eq_op.push(builtin_op(BangEqual, vec![U8, U8], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![U16, U16], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![U32, U32], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![U64, U64], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![I8, I8], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![I16, I16], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![I32, I32], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![I64, I64], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![F32, F32], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![F64, F64], Bool));
+        bang_eq_op.push(builtin_op(BangEqual, vec![Bool, Bool], Bool));
+
+        let lt_op = self.funcs.entry("<".to_string()).or_default();
+        lt_op.push(builtin_op(LessThan, vec![U8, U8], Bool));
+        lt_op.push(builtin_op(LessThan, vec![U16, U16], Bool));
+        lt_op.push(builtin_op(LessThan, vec![U32, U32], Bool));
+        lt_op.push(builtin_op(LessThan, vec![U64, U64], Bool));
+        lt_op.push(builtin_op(LessThan, vec![I8, I8], Bool));
+        lt_op.push(builtin_op(LessThan, vec![I16, I16], Bool));
+        lt_op.push(builtin_op(LessThan, vec![I32, I32], Bool));
+        lt_op.push(builtin_op(LessThan, vec![I64, I64], Bool));
+        lt_op.push(builtin_op(LessThan, vec![F32, F32], Bool));
+        lt_op.push(builtin_op(LessThan, vec![F64, F64], Bool));
+
+        let gt_op = self.funcs.entry(">".to_string()).or_default();
+        gt_op.push(builtin_op(GreaterThan, vec![U8, U8], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![U16, U16], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![U32, U32], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![U64, U64], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![I8, I8], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![I16, I16], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![I32, I32], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![I64, I64], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![F32, F32], Bool));
+        gt_op.push(builtin_op(GreaterThan, vec![F64, F64], Bool));
+
+        let le_op = self.funcs.entry("<=".to_string()).or_default();
+        le_op.push(builtin_op(LessThanEqual, vec![U8, U8], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![U16, U16], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![U32, U32], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![U64, U64], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![I8, I8], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![I16, I16], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![I32, I32], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![I64, I64], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![F32, F32], Bool));
+        le_op.push(builtin_op(LessThanEqual, vec![F64, F64], Bool));
+
+        let ge_op = self.funcs.entry(">=".to_string()).or_default();
+        ge_op.push(builtin_op(GreaterThanEqual, vec![U8, U8], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![U16, U16], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![U32, U32], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![U64, U64], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![I8, I8], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![I16, I16], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![I32, I32], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![I64, I64], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![F32, F32], Bool));
+        ge_op.push(builtin_op(GreaterThanEqual, vec![F64, F64], Bool));
+    }
+}
+
+fn builtin_op(op: TokenKind, args: Vec<Type>, ret: Type) -> Func {
+    use ExprKind::*;
+    use Type::*;
+
+    let ty = Fn(args, Box::new(ret.clone()));
+    let body = Expr {
+        kind: BuiltinOp(op),
+        ty: ret,
+        loc: Loc { start: 0, end: 0 },
+    };
+
+    Func {
+        body,
+        ty,
+        loc: Loc { start: 0, end: 0 },
+    }
+}
+
+impl TokenKind {
+    #[rustfmt::skip]
+    fn is_binary_op(&self) -> bool {
+        use TokenKind::*;
+        matches!(self,
+            Plus | Minus | Star | Slash | Percent | Amp | Pipe | Cap | AmpAmp | PipePipe |
+            EqualEqual | BangEqual | LessThan | GreaterThan | LessThanEqual | GreaterThanEqual
+        )
+    }
+
+    fn precedence(&self) -> i32 {
+        use TokenKind::*;
+
+        match self {
+            PipePipe => 0,
+            AmpAmp => 1,
+            Pipe => 2,
+            Cap => 3,
+            Amp => 4,
+            EqualEqual | BangEqual => 5,
+            LessThan | LessThanEqual | GreaterThan | GreaterThanEqual => 6,
+            Minus | Plus => 7,
+            Star | Slash | Percent => 8,
+            _ => unreachable!("Called TokenKind::precedence(`{self:?}`)"),
+        }
     }
 }
