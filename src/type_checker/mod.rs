@@ -250,6 +250,10 @@ impl TypeChecker {
                             Integer if let T(id) = arg_expr.ty => {
                                 set.bind(id, param.clone(), arg_expr.loc)?;
                             }
+                            // Pin a {decimal} literal to the concrete param type
+                            Decimal if let T(id) = arg_expr.ty => {
+                                set.bind(id, param.clone(), arg_expr.loc)?;
+                            }
                             _ => {}
                         }
                     }

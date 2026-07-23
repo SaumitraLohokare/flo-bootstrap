@@ -179,7 +179,7 @@ impl Parser {
 
             self.skip();
 
-            let rhs = self.parse_expr(op_precedence, scope)?;
+            let rhs = self.parse_expr(op_precedence + 1, scope)?;
             let loc = Loc {
                 start: lhs.loc.start,
                 end: rhs.loc.end,
