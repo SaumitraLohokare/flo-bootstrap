@@ -3,6 +3,9 @@ pub enum TokenKind {
     Fn,
     Op,
 
+    If,
+    Else,
+
     True,
     False,
 
@@ -171,6 +174,8 @@ impl Tokenizer {
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
             "op" => TokenKind::Op,
+            "if" => TokenKind::If,
+            "else" => TokenKind::Else,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
 

@@ -35,6 +35,9 @@ pub enum ExprKind {
 
     // Scope(stmts, tail)
     Scope(Vec<Expr>, Option<Box<Expr>>),
+
+    // If(cond, then, else)
+    If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,16 +111,36 @@ impl Expr {
             }
             ExprKind::BuiltinOp(op) => format!("{indent}@builtin({op:?})"),
             ExprKind::Scope(exprs, tail) => {
-                let exprs_list = exprs
-                    .iter()
-                    .map(|e| e.pretty_print(indent_amt + 2))
-                    .collect::<Vec<_>>()
-                    .join(";\n");
+                let exprs_list = if !exprs.is_empty() {
+                    format!(
+                        "{}\n",
+                        exprs
+                            .iter()
+                            .map(|e| e.pretty_print(indent_amt + 2))
+                            .collect::<Vec<_>>()
+                            .join(";\n")
+                    )
+                } else {
+                    "".to_string()
+                };
                 let tail = match tail {
                     Some(e) => format!("{}\n", e.pretty_print(indent_amt + 2)),
                     None => "".to_string(),
                 };
-                format!("{indent}{{\n{exprs_list}\n{tail}}}")
+                format!("{indent}{{\n{exprs_list}{tail}}}:{:?}", self.ty)
+            }
+            ExprKind::If(cond, then, otherwise) => {
+                let otherwise = match otherwise {
+                    Some(e) => format!(" else {}", e.pretty_print(indent_amt)),
+                    None => "".to_string(),
+                };
+                format!(
+                    "{indent}if:{:?} {} {}{}",
+                    self.ty,
+                    cond.pretty_print(indent_amt),
+                    then.pretty_print(indent_amt),
+                    otherwise
+                )
             }
         }
     }

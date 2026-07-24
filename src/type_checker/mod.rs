@@ -144,6 +144,24 @@ impl TypeChecker {
                     self.solve_constraint(set, constraint)?;
                 }
             }
+            If(cond, then, otherwise) => {
+                self.solve_expr_constraints(cond, set)?;
+                let then_constr = IsEqual(Type::Bool, cond.ty.clone(), cond.loc);
+                self.solve_constraint(set, then_constr)?;
+
+                self.solve_expr_constraints(then, set)?;
+                if let Some(otherwise) = otherwise {
+                    self.solve_expr_constraints(otherwise, set)?;
+                    // If `else` branch exists then the two branches must match type
+                    let branch_constr =
+                        IsEqual(then.ty.clone(), otherwise.ty.clone(), otherwise.loc);
+                    self.solve_constraint(set, branch_constr)?;
+                } else {
+                    // If `else` doesn't exist then `then` must be Void
+                    let void_constr = IsEqual(Void, then.ty.clone(), then.loc);
+                    self.solve_constraint(set, void_constr)?;
+                }
+            }
         }
 
         Ok(())
@@ -248,6 +266,15 @@ impl TypeChecker {
             }
             if let Some(tail) = tail {
                 self.try_solve_calls(tail, set, progress)?;
+            }
+            return Ok(());
+        }
+
+        if let If(cond, then, otherwise) = &mut expr.kind {
+            self.try_solve_calls(cond, set, progress)?;
+            self.try_solve_calls(then, set, progress)?;
+            if let Some(otherwise) = otherwise {
+                self.try_solve_calls(otherwise, set, progress)?;
             }
             return Ok(());
         }
@@ -426,6 +453,15 @@ impl Expr {
                     None => None,
                 };
                 Scope(new_exprs, new_tail)
+            }
+            If(cond, then, otherwise) => {
+                let cond = Box::new(cond.resolve(set)?);
+                let then = Box::new(then.resolve(set)?);
+                let otherwise = match otherwise {
+                    Some(e) => Some(Box::new(e.resolve(set)?)),
+                    None => None,
+                };
+                If(cond, then, otherwise)
             }
 
             Num(n) => Num(*n),

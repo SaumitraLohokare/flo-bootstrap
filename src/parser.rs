@@ -367,6 +367,8 @@ impl Parser {
 
             LCurly => self.parse_scope(scope),
 
+            If => self.parse_if_expr(scope),
+
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
             }),
@@ -406,6 +408,37 @@ impl Parser {
             end: r_curly.loc.end,
         };
 
+        Ok(Expr { kind, ty, loc })
+    }
+
+    fn parse_if_expr(&mut self, scope: &Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let if_tok = self.expect_get(If)?;
+        let start = if_tok.loc.start;
+
+        // Let/Var is also going to be an expression? thats why we need t duplicate it here as well
+        let scope = &scope.duplicate();
+        let cond = Box::new(self.parse_expr(-1, scope)?);
+
+        // Same here
+        let scope = &scope.duplicate();
+        let then = Box::new(self.parse_expr(-1, scope)?);
+        let mut end = then.loc.end;
+
+        // Same here
+        let otherwise = if self.expect(Else).is_ok() {
+            let scope = &scope.duplicate();
+            let otherwise = self.parse_expr(-1, scope)?;
+            end = otherwise.loc.end;
+            Some(Box::new(otherwise))
+        } else {
+            None
+        };
+
+        let loc = Loc { start, end };
+        let kind = ExprKind::If(cond, then, otherwise);
+        let ty = self.fresh_type();
         Ok(Expr { kind, ty, loc })
     }
 
