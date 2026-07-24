@@ -12,17 +12,18 @@ mod util;
 
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
 // FIXME: Add bitwise shift/not & logical not
-// FIXME: Combine parse_func & parse_op_overload
-// FIXME: Please remove var_iota from Scope
 
-// TODO: Scope
-//      - [ ] Add the tokens
-//      - [ ] Add it to ExprKind
-//      - [ ] write parse_scope (creates a new scope)
-//      - [ ] fix errors in type checker
-//          - [ ] Ensure type of scope is bound correctly
+// TODO: If & Return
+//      - [ ] register new tokens
+//      - [ ] Parse if exprs in parse_atom
+//      - [ ] in type checker ensure types are assigned correctly
+// Return:
+//      - [ ] Add return token
+//      - [ ] parse return expr in parse_atom
+//      - [ ] Add new NoReturn Type
+//      - [ ] Add proper type checking for return
 
-// Then: If & Return -> Variables & Globals -> While & Break/Continue -> Defer
+// Then: Variables & Globals -> While & Break/Continue -> Defer
 // Then: Pointers -> Arrays & Slices -> Strings
 // Then: Records & Sum Types -> Destructuring -> Match & Semantic Analysis
 // Then: Modules & Project Structure
@@ -30,12 +31,8 @@ mod util;
 
 fn main() {
     let src = r#"
-        fn main() -> bool = {
-            nop();
-            true && false
-        };
-
-        fn nop() -> void = {};
+        fn main() -> i32 = true |> i32;
+        fn i32(b: bool) -> i32 = if b { 1 } else 0;
     "#
     .to_string();
 

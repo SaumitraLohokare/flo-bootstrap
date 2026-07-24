@@ -8,8 +8,8 @@ use crate::{
     util::Iota,
 };
 
+#[derive(Debug, Clone)]
 struct Scope {
-    var_iota: Iota,
     vars: HashMap<String, usize>,
     var_types: HashMap<usize, Type>,
 }
@@ -17,7 +17,6 @@ struct Scope {
 impl Scope {
     fn new() -> Self {
         Self {
-            var_iota: Iota::new(),
             vars: HashMap::new(),
             var_types: HashMap::new(),
         }
@@ -25,21 +24,14 @@ impl Scope {
 
     fn duplicate(&self) -> Self {
         Self {
-            var_iota: self.var_iota,
             vars: self.vars.clone(),
             var_types: self.var_types.clone(),
         }
     }
 
-    fn add_arg(&mut self, name: String, ty: Type) -> bool {
-        if self.vars.contains_key(&name) {
-            return false;
-        }
-
-        let var_id = self.var_iota.next();
-        self.vars.insert(name, var_id);
-        self.var_types.insert(var_id, ty);
-        true
+    fn add_var(&mut self, name: String, id: usize, ty: Type) {
+        self.vars.insert(name, id);
+        self.var_types.insert(id, ty);
     }
 
     fn get_var(&self, name: &String) -> Option<usize> {
@@ -55,6 +47,7 @@ pub struct Parser {
     tokens: Vec<Token>,
     idx: usize,
 
+    var_iota: Iota,
     type_iota: Iota,
 
     funcs: HashMap<String, Vec<Func>>,
@@ -65,17 +58,18 @@ impl Parser {
         Self {
             tokens,
             idx: 0,
+            var_iota: Iota::new(),
             type_iota: Iota::new(),
             funcs: HashMap::new(),
         }
     }
 
     pub fn parse(mut self) -> FloResult<Module> {
+        use TokenKind::*;
+
         while let Ok(token) = self.peek() {
             match token.kind {
-                TokenKind::Fn => self.parse_func()?,
-
-                TokenKind::Op => self.parse_op_overload()?,
+                Fn | Op => self.parse_func()?,
 
                 _ => {
                     return Err(FloErr::UnexpectedToken {
@@ -97,11 +91,25 @@ impl Parser {
 
     fn parse_func(&mut self) -> FloResult<()> {
         use TokenKind::*;
-        self.expect(Fn)?;
-        let name_token = self.expect_get(Ident)?;
-        let name_loc = name_token.loc;
-        let TokenValue::String(name) = name_token.value.clone() else {
-            unreachable!()
+
+        let (name, name_loc) = match self.peek_kind()? {
+            Fn => {
+                self.expect(Fn)?;
+                let name_token = self.expect_get(Ident)?;
+                let name_loc = name_token.loc;
+                let TokenValue::String(name) = name_token.value.clone() else {
+                    unreachable!()
+                };
+                (name, name_loc)
+            }
+            Op => {
+                self.expect(Op)?;
+
+                let (_op, op_name, op_loc) = self.parse_operator()?;
+
+                (op_name, op_loc)
+            }
+            _ => unreachable!(),
         };
 
         let mut scope = Scope::new();
@@ -114,17 +122,13 @@ impl Parser {
             let TokenValue::String(arg_name) = arg.value else {
                 unreachable!()
             };
+
             self.expect(Colon)?;
             let (arg_type, _) = self.parse_type()?;
             arg_types.push(arg_type.clone());
 
-            // EW: clone might be unneccessary
-            if !scope.add_arg(arg_name.clone(), arg_type) {
-                return Err(FloErr::RedifinitionOfArgument {
-                    name: arg_name,
-                    loc: arg.loc,
-                });
-            }
+            // Register arg in scope
+            self.fresh_arg(arg_name, arg_type, arg.loc, &mut scope)?;
 
             if self.expect(Comma).is_err() {
                 break;
@@ -163,77 +167,6 @@ impl Parser {
         // here. It would give more consistent errors
         self.funcs
             .entry(name)
-            .or_default()
-            .push(Func { body, ty, loc });
-
-        Ok(())
-    }
-
-    fn parse_op_overload(&mut self) -> FloResult<()> {
-        use TokenKind::*;
-        self.expect(Op)?;
-
-        let (_op, op_name, op_loc) = self.parse_operator()?;
-
-        let mut scope = Scope::new();
-
-        self.expect(LParen)?;
-
-        let mut arg_types = Vec::new();
-        while self.peek()?.kind == Ident {
-            let arg = self.expect_get(Ident)?;
-            let TokenValue::String(arg_name) = arg.value else {
-                unreachable!()
-            };
-            self.expect(Colon)?;
-            let (arg_type, _) = self.parse_type()?;
-            arg_types.push(arg_type.clone());
-
-            // EW: clone might be unneccessary
-            if !scope.add_arg(arg_name.clone(), arg_type) {
-                return Err(FloErr::RedifinitionOfArgument {
-                    name: arg_name,
-                    loc: arg.loc,
-                });
-            }
-
-            if self.expect(Comma).is_err() {
-                break;
-            }
-        }
-
-        let r_paren_token = self.expect_get(RParen)?;
-        let r_paren_loc = r_paren_token.loc;
-
-        let (ret_type, ret_type_loc) = if self.expect(Arrow).is_ok() {
-            self.parse_type()?
-        } else {
-            (
-                Type::Void,
-                Loc {
-                    start: op_loc.start,
-                    end: r_paren_loc.end,
-                },
-            )
-        };
-
-        let loc = Loc {
-            start: op_loc.start,
-            end: ret_type_loc.end,
-        };
-
-        let ty = self.func_type(arg_types, ret_type);
-
-        self.expect(Equal)?;
-
-        let body = self.parse_expr(-1, &scope)?;
-
-        self.expect(Semicolon)?;
-
-        // It would be good to check for ambiguous overloads
-        // here. It would give more consistent errors
-        self.funcs
-            .entry(op_name)
             .or_default()
             .push(Func { body, ty, loc });
 
@@ -575,6 +508,19 @@ impl Parser {
             let token = token.clone();
             self.skip();
             Ok(token)
+        }
+    }
+
+    fn fresh_arg(&mut self, name: String, ty: Type, loc: Loc, scope: &mut Scope) -> FloResult<()> {
+        if let Some(_) = scope.get_var(&name) {
+            Err(FloErr::RedifinitionOfArgument {
+                name: name,
+                loc: loc,
+            })
+        } else {
+            let id = self.var_iota.next();
+            scope.add_var(name, id, ty);
+            Ok(())
         }
     }
 
