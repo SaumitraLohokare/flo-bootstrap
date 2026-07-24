@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, Func, Module},
+    ast::{Expr, ExprKind, Func, Module, Op},
     errors::{FloErr, FloResult},
     tokenizer::{Loc, Token, TokenKind, TokenValue},
     types::Type,
@@ -20,6 +20,14 @@ impl Scope {
             var_iota: Iota::new(),
             vars: HashMap::new(),
             var_types: HashMap::new(),
+        }
+    }
+
+    fn duplicate(&self) -> Self {
+        Self {
+            var_iota: self.var_iota,
+            vars: self.vars.clone(),
+            var_types: self.var_types.clone(),
         }
     }
 
@@ -66,6 +74,8 @@ impl Parser {
         while let Ok(token) = self.peek() {
             match token.kind {
                 TokenKind::Fn => self.parse_func()?,
+
+                TokenKind::Op => self.parse_op_overload()?,
 
                 _ => {
                     return Err(FloErr::UnexpectedToken {
@@ -157,6 +167,108 @@ impl Parser {
             .push(Func { body, ty, loc });
 
         Ok(())
+    }
+
+    fn parse_op_overload(&mut self) -> FloResult<()> {
+        use TokenKind::*;
+        self.expect(Op)?;
+
+        let (_op, op_name, op_loc) = self.parse_operator()?;
+
+        let mut scope = Scope::new();
+
+        self.expect(LParen)?;
+
+        let mut arg_types = Vec::new();
+        while self.peek()?.kind == Ident {
+            let arg = self.expect_get(Ident)?;
+            let TokenValue::String(arg_name) = arg.value else {
+                unreachable!()
+            };
+            self.expect(Colon)?;
+            let (arg_type, _) = self.parse_type()?;
+            arg_types.push(arg_type.clone());
+
+            // EW: clone might be unneccessary
+            if !scope.add_arg(arg_name.clone(), arg_type) {
+                return Err(FloErr::RedifinitionOfArgument {
+                    name: arg_name,
+                    loc: arg.loc,
+                });
+            }
+
+            if self.expect(Comma).is_err() {
+                break;
+            }
+        }
+
+        let r_paren_token = self.expect_get(RParen)?;
+        let r_paren_loc = r_paren_token.loc;
+
+        let (ret_type, ret_type_loc) = if self.expect(Arrow).is_ok() {
+            self.parse_type()?
+        } else {
+            (
+                Type::Void,
+                Loc {
+                    start: op_loc.start,
+                    end: r_paren_loc.end,
+                },
+            )
+        };
+
+        let loc = Loc {
+            start: op_loc.start,
+            end: ret_type_loc.end,
+        };
+
+        let ty = self.func_type(arg_types, ret_type);
+
+        self.expect(Equal)?;
+
+        let body = self.parse_expr(-1, &scope)?;
+
+        self.expect(Semicolon)?;
+
+        // It would be good to check for ambiguous overloads
+        // here. It would give more consistent errors
+        self.funcs
+            .entry(op_name)
+            .or_default()
+            .push(Func { body, ty, loc });
+
+        Ok(())
+    }
+
+    fn parse_operator(&mut self) -> FloResult<(Op, String, Loc)> {
+        use TokenKind as TK;
+
+        let tok = self.peek()?;
+        let result = match tok.kind {
+            TK::Plus => Ok((Op::Add, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Minus => Ok((Op::Sub, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Star => Ok((Op::Mul, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Slash => Ok((Op::Div, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Percent => Ok((Op::Mod, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Amp => Ok((Op::BitAnd, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Pipe => Ok((Op::BitOr, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Cap => Ok((Op::BitXor, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::AmpAmp => Ok((Op::And, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::PipePipe => Ok((Op::Or, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::EqualEqual => Ok((Op::Eq, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::BangEqual => Ok((Op::NEq, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::LessThan => Ok((Op::Lt, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::LessThanEqual => Ok((Op::Lte, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::GreaterThan => Ok((Op::Gt, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::GreaterThanEqual => Ok((Op::Gte, tok.kind.pretty_name().to_string(), tok.loc)),
+            found => Err(FloErr::ExpectedOp {
+                found,
+                loc: tok.loc,
+            })?,
+        };
+
+        self.skip();
+        result
     }
 
     fn parse_expr(&mut self, precedence: i32, scope: &Scope) -> FloResult<Expr> {
@@ -320,10 +432,48 @@ impl Parser {
                 }
             }
 
+            LCurly => self.parse_scope(scope),
+
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
             }),
         }
+    }
+
+    fn parse_scope(&mut self, scope: &Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+        let l_curly = self.expect_get(LCurly)?;
+
+        // We don't want variables created inside to affect outside
+        let scope = scope.duplicate();
+
+        let mut exprs = Vec::new();
+        let mut tail = None;
+        while self.peek_kind()? != RCurly {
+            tail = Some(self.parse_expr(-1, &scope)?);
+
+            if self.expect(Semicolon).is_err() {
+                break;
+            } else {
+                let Some(expr) = tail else { unreachable!() };
+                exprs.push(expr);
+                tail = None;
+            }
+        }
+
+        let r_curly = self.expect_get(RCurly)?;
+
+        let ty = match &tail {
+            Some(_) => self.fresh_type(),
+            None => Type::Void,
+        };
+        let kind = ExprKind::Scope(exprs, tail.map(|e| Box::new(e)));
+        let loc = Loc {
+            start: l_curly.loc.start,
+            end: r_curly.loc.end,
+        };
+
+        Ok(Expr { kind, ty, loc })
     }
 
     /// Parses an optional parenthesized, comma-separated argument list.
@@ -437,209 +587,209 @@ impl Parser {
     }
 
     fn register_builtin_ops(&mut self) {
-        use TokenKind::*;
+        use Op::*;
         use Type::*;
 
         let plus_op = self.funcs.entry("+".to_string()).or_default();
         // binary
-        plus_op.push(builtin_op(Plus, vec![U8, U8], U8));
-        plus_op.push(builtin_op(Plus, vec![U16, U16], U16));
-        plus_op.push(builtin_op(Plus, vec![U32, U32], U32));
-        plus_op.push(builtin_op(Plus, vec![U64, U64], U64));
-        plus_op.push(builtin_op(Plus, vec![I8, I8], I8));
-        plus_op.push(builtin_op(Plus, vec![I16, I16], I16));
-        plus_op.push(builtin_op(Plus, vec![I32, I32], I32));
-        plus_op.push(builtin_op(Plus, vec![I64, I64], I64));
-        plus_op.push(builtin_op(Plus, vec![F32, F32], F32));
-        plus_op.push(builtin_op(Plus, vec![F64, F64], F64));
+        plus_op.push(builtin_op(Add, vec![U8, U8], U8));
+        plus_op.push(builtin_op(Add, vec![U16, U16], U16));
+        plus_op.push(builtin_op(Add, vec![U32, U32], U32));
+        plus_op.push(builtin_op(Add, vec![U64, U64], U64));
+        plus_op.push(builtin_op(Add, vec![I8, I8], I8));
+        plus_op.push(builtin_op(Add, vec![I16, I16], I16));
+        plus_op.push(builtin_op(Add, vec![I32, I32], I32));
+        plus_op.push(builtin_op(Add, vec![I64, I64], I64));
+        plus_op.push(builtin_op(Add, vec![F32, F32], F32));
+        plus_op.push(builtin_op(Add, vec![F64, F64], F64));
         // unary
-        plus_op.push(builtin_op(Plus, vec![U8], U8));
-        plus_op.push(builtin_op(Plus, vec![U16], U16));
-        plus_op.push(builtin_op(Plus, vec![U32], U32));
-        plus_op.push(builtin_op(Plus, vec![U64], U64));
-        plus_op.push(builtin_op(Plus, vec![I8], I8));
-        plus_op.push(builtin_op(Plus, vec![I16], I16));
-        plus_op.push(builtin_op(Plus, vec![I32], I32));
-        plus_op.push(builtin_op(Plus, vec![I64], I64));
-        plus_op.push(builtin_op(Plus, vec![F32], F32));
-        plus_op.push(builtin_op(Plus, vec![F64], F64));
+        plus_op.push(builtin_op(Add, vec![U8], U8));
+        plus_op.push(builtin_op(Add, vec![U16], U16));
+        plus_op.push(builtin_op(Add, vec![U32], U32));
+        plus_op.push(builtin_op(Add, vec![U64], U64));
+        plus_op.push(builtin_op(Add, vec![I8], I8));
+        plus_op.push(builtin_op(Add, vec![I16], I16));
+        plus_op.push(builtin_op(Add, vec![I32], I32));
+        plus_op.push(builtin_op(Add, vec![I64], I64));
+        plus_op.push(builtin_op(Add, vec![F32], F32));
+        plus_op.push(builtin_op(Add, vec![F64], F64));
 
         let minus_op = self.funcs.entry("-".to_string()).or_default();
         // binary
-        minus_op.push(builtin_op(Minus, vec![U8, U8], U8));
-        minus_op.push(builtin_op(Minus, vec![U16, U16], U16));
-        minus_op.push(builtin_op(Minus, vec![U32, U32], U32));
-        minus_op.push(builtin_op(Minus, vec![U64, U64], U64));
-        minus_op.push(builtin_op(Minus, vec![I8, I8], I8));
-        minus_op.push(builtin_op(Minus, vec![I16, I16], I16));
-        minus_op.push(builtin_op(Minus, vec![I32, I32], I32));
-        minus_op.push(builtin_op(Minus, vec![I64, I64], I64));
-        minus_op.push(builtin_op(Minus, vec![F32, F32], F32));
-        minus_op.push(builtin_op(Minus, vec![F64, F64], F64));
+        minus_op.push(builtin_op(Sub, vec![U8, U8], U8));
+        minus_op.push(builtin_op(Sub, vec![U16, U16], U16));
+        minus_op.push(builtin_op(Sub, vec![U32, U32], U32));
+        minus_op.push(builtin_op(Sub, vec![U64, U64], U64));
+        minus_op.push(builtin_op(Sub, vec![I8, I8], I8));
+        minus_op.push(builtin_op(Sub, vec![I16, I16], I16));
+        minus_op.push(builtin_op(Sub, vec![I32, I32], I32));
+        minus_op.push(builtin_op(Sub, vec![I64, I64], I64));
+        minus_op.push(builtin_op(Sub, vec![F32, F32], F32));
+        minus_op.push(builtin_op(Sub, vec![F64, F64], F64));
         // unary
-        minus_op.push(builtin_op(Minus, vec![U8], U8));
-        minus_op.push(builtin_op(Minus, vec![U16], U16));
-        minus_op.push(builtin_op(Minus, vec![U32], U32));
-        minus_op.push(builtin_op(Minus, vec![U64], U64));
-        minus_op.push(builtin_op(Minus, vec![I8], I8));
-        minus_op.push(builtin_op(Minus, vec![I16], I16));
-        minus_op.push(builtin_op(Minus, vec![I32], I32));
-        minus_op.push(builtin_op(Minus, vec![I64], I64));
-        minus_op.push(builtin_op(Minus, vec![F32], F32));
-        minus_op.push(builtin_op(Minus, vec![F64], F64));
+        minus_op.push(builtin_op(Sub, vec![U8], U8));
+        minus_op.push(builtin_op(Sub, vec![U16], U16));
+        minus_op.push(builtin_op(Sub, vec![U32], U32));
+        minus_op.push(builtin_op(Sub, vec![U64], U64));
+        minus_op.push(builtin_op(Sub, vec![I8], I8));
+        minus_op.push(builtin_op(Sub, vec![I16], I16));
+        minus_op.push(builtin_op(Sub, vec![I32], I32));
+        minus_op.push(builtin_op(Sub, vec![I64], I64));
+        minus_op.push(builtin_op(Sub, vec![F32], F32));
+        minus_op.push(builtin_op(Sub, vec![F64], F64));
 
         let star_op = self.funcs.entry("*".to_string()).or_default();
-        star_op.push(builtin_op(Star, vec![U8, U8], U8));
-        star_op.push(builtin_op(Star, vec![U16, U16], U16));
-        star_op.push(builtin_op(Star, vec![U32, U32], U32));
-        star_op.push(builtin_op(Star, vec![U64, U64], U64));
-        star_op.push(builtin_op(Star, vec![I8, I8], I8));
-        star_op.push(builtin_op(Star, vec![I16, I16], I16));
-        star_op.push(builtin_op(Star, vec![I32, I32], I32));
-        star_op.push(builtin_op(Star, vec![I64, I64], I64));
-        star_op.push(builtin_op(Star, vec![F32, F32], F32));
-        star_op.push(builtin_op(Star, vec![F64, F64], F64));
+        star_op.push(builtin_op(Mul, vec![U8, U8], U8));
+        star_op.push(builtin_op(Mul, vec![U16, U16], U16));
+        star_op.push(builtin_op(Mul, vec![U32, U32], U32));
+        star_op.push(builtin_op(Mul, vec![U64, U64], U64));
+        star_op.push(builtin_op(Mul, vec![I8, I8], I8));
+        star_op.push(builtin_op(Mul, vec![I16, I16], I16));
+        star_op.push(builtin_op(Mul, vec![I32, I32], I32));
+        star_op.push(builtin_op(Mul, vec![I64, I64], I64));
+        star_op.push(builtin_op(Mul, vec![F32, F32], F32));
+        star_op.push(builtin_op(Mul, vec![F64, F64], F64));
 
         let slash_op = self.funcs.entry("/".to_string()).or_default();
-        slash_op.push(builtin_op(Slash, vec![U8, U8], U8));
-        slash_op.push(builtin_op(Slash, vec![U16, U16], U16));
-        slash_op.push(builtin_op(Slash, vec![U32, U32], U32));
-        slash_op.push(builtin_op(Slash, vec![U64, U64], U64));
-        slash_op.push(builtin_op(Slash, vec![I8, I8], I8));
-        slash_op.push(builtin_op(Slash, vec![I16, I16], I16));
-        slash_op.push(builtin_op(Slash, vec![I32, I32], I32));
-        slash_op.push(builtin_op(Slash, vec![I64, I64], I64));
-        slash_op.push(builtin_op(Slash, vec![F32, F32], F32));
-        slash_op.push(builtin_op(Slash, vec![F64, F64], F64));
+        slash_op.push(builtin_op(Div, vec![U8, U8], U8));
+        slash_op.push(builtin_op(Div, vec![U16, U16], U16));
+        slash_op.push(builtin_op(Div, vec![U32, U32], U32));
+        slash_op.push(builtin_op(Div, vec![U64, U64], U64));
+        slash_op.push(builtin_op(Div, vec![I8, I8], I8));
+        slash_op.push(builtin_op(Div, vec![I16, I16], I16));
+        slash_op.push(builtin_op(Div, vec![I32, I32], I32));
+        slash_op.push(builtin_op(Div, vec![I64, I64], I64));
+        slash_op.push(builtin_op(Div, vec![F32, F32], F32));
+        slash_op.push(builtin_op(Div, vec![F64, F64], F64));
 
         let percent_op = self.funcs.entry("%".to_string()).or_default();
-        percent_op.push(builtin_op(Percent, vec![U8, U8], U8));
-        percent_op.push(builtin_op(Percent, vec![U16, U16], U16));
-        percent_op.push(builtin_op(Percent, vec![U32, U32], U32));
-        percent_op.push(builtin_op(Percent, vec![U64, U64], U64));
-        percent_op.push(builtin_op(Percent, vec![I8, I8], I8));
-        percent_op.push(builtin_op(Percent, vec![I16, I16], I16));
-        percent_op.push(builtin_op(Percent, vec![I32, I32], I32));
-        percent_op.push(builtin_op(Percent, vec![I64, I64], I64));
-        percent_op.push(builtin_op(Percent, vec![F32, F32], F32));
-        percent_op.push(builtin_op(Percent, vec![F64, F64], F64));
+        percent_op.push(builtin_op(Mod, vec![U8, U8], U8));
+        percent_op.push(builtin_op(Mod, vec![U16, U16], U16));
+        percent_op.push(builtin_op(Mod, vec![U32, U32], U32));
+        percent_op.push(builtin_op(Mod, vec![U64, U64], U64));
+        percent_op.push(builtin_op(Mod, vec![I8, I8], I8));
+        percent_op.push(builtin_op(Mod, vec![I16, I16], I16));
+        percent_op.push(builtin_op(Mod, vec![I32, I32], I32));
+        percent_op.push(builtin_op(Mod, vec![I64, I64], I64));
+        percent_op.push(builtin_op(Mod, vec![F32, F32], F32));
+        percent_op.push(builtin_op(Mod, vec![F64, F64], F64));
 
         let amp_op = self.funcs.entry("&".to_string()).or_default();
-        amp_op.push(builtin_op(Amp, vec![U8, U8], U8));
-        amp_op.push(builtin_op(Amp, vec![U16, U16], U16));
-        amp_op.push(builtin_op(Amp, vec![U32, U32], U32));
-        amp_op.push(builtin_op(Amp, vec![U64, U64], U64));
-        amp_op.push(builtin_op(Amp, vec![I8, I8], I8));
-        amp_op.push(builtin_op(Amp, vec![I16, I16], I16));
-        amp_op.push(builtin_op(Amp, vec![I32, I32], I32));
-        amp_op.push(builtin_op(Amp, vec![I64, I64], I64));
-        amp_op.push(builtin_op(Amp, vec![Bool, Bool], Bool));
+        amp_op.push(builtin_op(BitAnd, vec![U8, U8], U8));
+        amp_op.push(builtin_op(BitAnd, vec![U16, U16], U16));
+        amp_op.push(builtin_op(BitAnd, vec![U32, U32], U32));
+        amp_op.push(builtin_op(BitAnd, vec![U64, U64], U64));
+        amp_op.push(builtin_op(BitAnd, vec![I8, I8], I8));
+        amp_op.push(builtin_op(BitAnd, vec![I16, I16], I16));
+        amp_op.push(builtin_op(BitAnd, vec![I32, I32], I32));
+        amp_op.push(builtin_op(BitAnd, vec![I64, I64], I64));
+        amp_op.push(builtin_op(BitAnd, vec![Bool, Bool], Bool));
 
         let pipe_op = self.funcs.entry("|".to_string()).or_default();
-        pipe_op.push(builtin_op(Pipe, vec![U8, U8], U8));
-        pipe_op.push(builtin_op(Pipe, vec![U16, U16], U16));
-        pipe_op.push(builtin_op(Pipe, vec![U32, U32], U32));
-        pipe_op.push(builtin_op(Pipe, vec![U64, U64], U64));
-        pipe_op.push(builtin_op(Pipe, vec![I8, I8], I8));
-        pipe_op.push(builtin_op(Pipe, vec![I16, I16], I16));
-        pipe_op.push(builtin_op(Pipe, vec![I32, I32], I32));
-        pipe_op.push(builtin_op(Pipe, vec![I64, I64], I64));
-        pipe_op.push(builtin_op(Pipe, vec![Bool, Bool], Bool));
+        pipe_op.push(builtin_op(BitOr, vec![U8, U8], U8));
+        pipe_op.push(builtin_op(BitOr, vec![U16, U16], U16));
+        pipe_op.push(builtin_op(BitOr, vec![U32, U32], U32));
+        pipe_op.push(builtin_op(BitOr, vec![U64, U64], U64));
+        pipe_op.push(builtin_op(BitOr, vec![I8, I8], I8));
+        pipe_op.push(builtin_op(BitOr, vec![I16, I16], I16));
+        pipe_op.push(builtin_op(BitOr, vec![I32, I32], I32));
+        pipe_op.push(builtin_op(BitOr, vec![I64, I64], I64));
+        pipe_op.push(builtin_op(BitOr, vec![Bool, Bool], Bool));
 
         let cap_op = self.funcs.entry("^".to_string()).or_default();
-        cap_op.push(builtin_op(Cap, vec![U8, U8], U8));
-        cap_op.push(builtin_op(Cap, vec![U16, U16], U16));
-        cap_op.push(builtin_op(Cap, vec![U32, U32], U32));
-        cap_op.push(builtin_op(Cap, vec![U64, U64], U64));
-        cap_op.push(builtin_op(Cap, vec![I8, I8], I8));
-        cap_op.push(builtin_op(Cap, vec![I16, I16], I16));
-        cap_op.push(builtin_op(Cap, vec![I32, I32], I32));
-        cap_op.push(builtin_op(Cap, vec![I64, I64], I64));
-        cap_op.push(builtin_op(Cap, vec![Bool, Bool], Bool));
+        cap_op.push(builtin_op(BitXor, vec![U8, U8], U8));
+        cap_op.push(builtin_op(BitXor, vec![U16, U16], U16));
+        cap_op.push(builtin_op(BitXor, vec![U32, U32], U32));
+        cap_op.push(builtin_op(BitXor, vec![U64, U64], U64));
+        cap_op.push(builtin_op(BitXor, vec![I8, I8], I8));
+        cap_op.push(builtin_op(BitXor, vec![I16, I16], I16));
+        cap_op.push(builtin_op(BitXor, vec![I32, I32], I32));
+        cap_op.push(builtin_op(BitXor, vec![I64, I64], I64));
+        cap_op.push(builtin_op(BitXor, vec![Bool, Bool], Bool));
 
         let amp_amp_op = self.funcs.entry("&&".to_string()).or_default();
-        amp_amp_op.push(builtin_op(AmpAmp, vec![Bool, Bool], Bool));
+        amp_amp_op.push(builtin_op(And, vec![Bool, Bool], Bool));
 
         let pipe_pipe_op = self.funcs.entry("||".to_string()).or_default();
-        pipe_pipe_op.push(builtin_op(PipePipe, vec![Bool, Bool], Bool));
+        pipe_pipe_op.push(builtin_op(Or, vec![Bool, Bool], Bool));
 
         let eq_eq_op = self.funcs.entry("==".to_string()).or_default();
-        eq_eq_op.push(builtin_op(EqualEqual, vec![U8, U8], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![U16, U16], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![U32, U32], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![U64, U64], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![I8, I8], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![I16, I16], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![I32, I32], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![I64, I64], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![F32, F32], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![F64, F64], Bool));
-        eq_eq_op.push(builtin_op(EqualEqual, vec![Bool, Bool], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![U8, U8], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![U16, U16], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![U32, U32], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![U64, U64], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![I8, I8], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![I16, I16], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![I32, I32], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![I64, I64], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![F32, F32], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![F64, F64], Bool));
+        eq_eq_op.push(builtin_op(Eq, vec![Bool, Bool], Bool));
 
         let bang_eq_op = self.funcs.entry("!=".to_string()).or_default();
-        bang_eq_op.push(builtin_op(BangEqual, vec![U8, U8], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![U16, U16], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![U32, U32], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![U64, U64], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![I8, I8], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![I16, I16], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![I32, I32], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![I64, I64], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![F32, F32], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![F64, F64], Bool));
-        bang_eq_op.push(builtin_op(BangEqual, vec![Bool, Bool], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![U8, U8], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![U16, U16], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![U32, U32], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![U64, U64], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![I8, I8], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![I16, I16], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![I32, I32], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![I64, I64], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![F32, F32], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![F64, F64], Bool));
+        bang_eq_op.push(builtin_op(NEq, vec![Bool, Bool], Bool));
 
         let lt_op = self.funcs.entry("<".to_string()).or_default();
-        lt_op.push(builtin_op(LessThan, vec![U8, U8], Bool));
-        lt_op.push(builtin_op(LessThan, vec![U16, U16], Bool));
-        lt_op.push(builtin_op(LessThan, vec![U32, U32], Bool));
-        lt_op.push(builtin_op(LessThan, vec![U64, U64], Bool));
-        lt_op.push(builtin_op(LessThan, vec![I8, I8], Bool));
-        lt_op.push(builtin_op(LessThan, vec![I16, I16], Bool));
-        lt_op.push(builtin_op(LessThan, vec![I32, I32], Bool));
-        lt_op.push(builtin_op(LessThan, vec![I64, I64], Bool));
-        lt_op.push(builtin_op(LessThan, vec![F32, F32], Bool));
-        lt_op.push(builtin_op(LessThan, vec![F64, F64], Bool));
+        lt_op.push(builtin_op(Lt, vec![U8, U8], Bool));
+        lt_op.push(builtin_op(Lt, vec![U16, U16], Bool));
+        lt_op.push(builtin_op(Lt, vec![U32, U32], Bool));
+        lt_op.push(builtin_op(Lt, vec![U64, U64], Bool));
+        lt_op.push(builtin_op(Lt, vec![I8, I8], Bool));
+        lt_op.push(builtin_op(Lt, vec![I16, I16], Bool));
+        lt_op.push(builtin_op(Lt, vec![I32, I32], Bool));
+        lt_op.push(builtin_op(Lt, vec![I64, I64], Bool));
+        lt_op.push(builtin_op(Lt, vec![F32, F32], Bool));
+        lt_op.push(builtin_op(Lt, vec![F64, F64], Bool));
 
         let gt_op = self.funcs.entry(">".to_string()).or_default();
-        gt_op.push(builtin_op(GreaterThan, vec![U8, U8], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![U16, U16], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![U32, U32], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![U64, U64], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![I8, I8], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![I16, I16], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![I32, I32], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![I64, I64], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![F32, F32], Bool));
-        gt_op.push(builtin_op(GreaterThan, vec![F64, F64], Bool));
+        gt_op.push(builtin_op(Gt, vec![U8, U8], Bool));
+        gt_op.push(builtin_op(Gt, vec![U16, U16], Bool));
+        gt_op.push(builtin_op(Gt, vec![U32, U32], Bool));
+        gt_op.push(builtin_op(Gt, vec![U64, U64], Bool));
+        gt_op.push(builtin_op(Gt, vec![I8, I8], Bool));
+        gt_op.push(builtin_op(Gt, vec![I16, I16], Bool));
+        gt_op.push(builtin_op(Gt, vec![I32, I32], Bool));
+        gt_op.push(builtin_op(Gt, vec![I64, I64], Bool));
+        gt_op.push(builtin_op(Gt, vec![F32, F32], Bool));
+        gt_op.push(builtin_op(Gt, vec![F64, F64], Bool));
 
         let le_op = self.funcs.entry("<=".to_string()).or_default();
-        le_op.push(builtin_op(LessThanEqual, vec![U8, U8], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![U16, U16], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![U32, U32], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![U64, U64], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![I8, I8], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![I16, I16], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![I32, I32], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![I64, I64], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![F32, F32], Bool));
-        le_op.push(builtin_op(LessThanEqual, vec![F64, F64], Bool));
+        le_op.push(builtin_op(Lte, vec![U8, U8], Bool));
+        le_op.push(builtin_op(Lte, vec![U16, U16], Bool));
+        le_op.push(builtin_op(Lte, vec![U32, U32], Bool));
+        le_op.push(builtin_op(Lte, vec![U64, U64], Bool));
+        le_op.push(builtin_op(Lte, vec![I8, I8], Bool));
+        le_op.push(builtin_op(Lte, vec![I16, I16], Bool));
+        le_op.push(builtin_op(Lte, vec![I32, I32], Bool));
+        le_op.push(builtin_op(Lte, vec![I64, I64], Bool));
+        le_op.push(builtin_op(Lte, vec![F32, F32], Bool));
+        le_op.push(builtin_op(Lte, vec![F64, F64], Bool));
 
         let ge_op = self.funcs.entry(">=".to_string()).or_default();
-        ge_op.push(builtin_op(GreaterThanEqual, vec![U8, U8], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![U16, U16], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![U32, U32], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![U64, U64], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![I8, I8], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![I16, I16], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![I32, I32], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![I64, I64], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![F32, F32], Bool));
-        ge_op.push(builtin_op(GreaterThanEqual, vec![F64, F64], Bool));
+        ge_op.push(builtin_op(Gte, vec![U8, U8], Bool));
+        ge_op.push(builtin_op(Gte, vec![U16, U16], Bool));
+        ge_op.push(builtin_op(Gte, vec![U32, U32], Bool));
+        ge_op.push(builtin_op(Gte, vec![U64, U64], Bool));
+        ge_op.push(builtin_op(Gte, vec![I8, I8], Bool));
+        ge_op.push(builtin_op(Gte, vec![I16, I16], Bool));
+        ge_op.push(builtin_op(Gte, vec![I32, I32], Bool));
+        ge_op.push(builtin_op(Gte, vec![I64, I64], Bool));
+        ge_op.push(builtin_op(Gte, vec![F32, F32], Bool));
+        ge_op.push(builtin_op(Gte, vec![F64, F64], Bool));
     }
 }
 
-fn builtin_op(op: TokenKind, args: Vec<Type>, ret: Type) -> Func {
+fn builtin_op(op: Op, args: Vec<Type>, ret: Type) -> Func {
     use ExprKind::*;
     use Type::*;
 

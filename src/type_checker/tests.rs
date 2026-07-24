@@ -1111,6 +1111,317 @@ fn pipe_argument_type_incompatible_is_an_error() {
     assert_err!(errs, FloErr::NoPossibleOverloads { .. });
 }
 
+/// The scope's statement expressions and its optional tail expression.
+fn scope_parts(expr: &Expr) -> (&[Expr], Option<&Expr>) {
+    match &expr.kind {
+        ExprKind::Scope(exprs, tail) => (exprs, tail.as_deref()),
+        other => panic!("expected a scope expression, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// Scope expressions
+//
+// A `{ stmt; stmt; tail }` block is an expression. Its type is the type of the
+// trailing (semicolon-less) expression, or `void` when there is no tail (empty
+// block, or one ending in `;`). Statement-position expressions still have to be
+// fully resolved even though their values are discarded — that is the property
+// the call-resolution passes must recurse into.
+// --------------------------------------------------------------------------
+
+#[test]
+fn empty_scope_is_void() {
+    let module = check_ok("fn main() = {};");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.ty, fn_ty(vec![], Type::Void));
+    assert_eq!(main.body.ty, Type::Void);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(stmts.is_empty());
+    assert!(tail.is_none());
+}
+
+#[test]
+fn scope_type_is_its_tail_type() {
+    let module = check_ok("fn main() -> bool = { true };");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(main.body.ty, Type::Bool);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(stmts.is_empty());
+    assert!(matches!(tail.unwrap().kind, ExprKind::Bool(true)));
+    assert_eq!(tail.unwrap().ty, Type::Bool);
+}
+
+#[test]
+fn scope_tail_literal_defaults_to_i32() {
+    let module = check_ok("fn main() -> i32 = { 0 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn scope_return_type_propagates_into_tail_literal() {
+    // The declared i8 return type flows through the scope into the tail literal.
+    let module = check_ok("fn main() -> i8 = { 42 };");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(main.body.ty, Type::I8);
+    let (_, tail) = scope_parts(&main.body);
+    assert_eq!(tail.unwrap().ty, Type::I8);
+}
+
+#[test]
+fn scope_with_trailing_semicolon_is_void() {
+    // A block ending in `;` has no tail, so it is `void` regardless of the last
+    // statement's own type.
+    let module = check_ok(
+        "
+        fn main() = { nop(); };
+        fn nop() = {};
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.body.ty, Type::Void);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts.len(), 1);
+    assert!(tail.is_none());
+}
+
+#[test]
+fn statement_position_calls_are_resolved() {
+    // Regression: calls that sit in statement position (before the tail) must be
+    // resolved by the call-resolution passes, not just the tail. Previously the
+    // passes only recursed into `Call` args and skipped `Scope` bodies entirely,
+    // leaving statement calls with unresolved type variables.
+    let module = check_ok(
+        "
+        fn main() -> bool = {
+            nop();
+            true && false
+        };
+        fn nop() = {};
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    let (stmts, tail) = scope_parts(&main.body);
+
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(resolved_call_name(&stmts[0]), m("nop", vec![], Type::Void));
+    assert_eq!(stmts[0].ty, Type::Void);
+
+    assert_eq!(
+        resolved_call_name(tail.unwrap()),
+        m("&&", vec![Type::Bool, Type::Bool], Type::Bool)
+    );
+}
+
+#[test]
+fn scope_resolves_statements_and_tail_calls_together() {
+    // Several calls across statement and tail positions all resolve.
+    let module = check_ok(
+        "
+        fn main() -> i32 = {
+            id(1);
+            id(2);
+            id(3)
+        };
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts.len(), 2);
+    for call in stmts.iter().chain(std::iter::once(tail.unwrap())) {
+        assert_eq!(resolved_call_name(call), m("id", vec![Type::I32], Type::I32));
+    }
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn nested_scopes_resolve() {
+    let module = check_ok("fn main() -> i32 = { { 7 } };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    let (_, outer_tail) = scope_parts(&main.body);
+    let inner = outer_tail.unwrap();
+    assert_eq!(inner.ty, Type::I32);
+    let (_, inner_tail) = scope_parts(inner);
+    assert_eq!(inner_tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn scope_sees_enclosing_function_arguments() {
+    // The block inherits the function's parameters, so `a` resolves inside it.
+    let module = check_ok(
+        "
+        fn id(a: i32) -> i32 = { a };
+        fn main() -> i32 = id(1);
+        ",
+    );
+    let id = func_sig(&module, "id", vec![Type::I32], Type::I32);
+    let (_, tail) = scope_parts(&id.body);
+    assert!(matches!(tail.unwrap().kind, ExprKind::Var(_)));
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn scope_tail_type_mismatch_is_an_error() {
+    // The tail is a bool but the declared return type is i32.
+    let errs = check_err("fn main() -> i32 = { true };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn empty_scope_for_non_void_return_is_an_error() {
+    // An empty block is `void`, which cannot satisfy an i32 return type.
+    let errs = check_err("fn main() -> i32 = {};");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn unresolved_statement_call_is_an_error() {
+    // A statement-position call to an unknown function is still reported.
+    let errs = check_err(
+        "
+        fn main() -> bool = {
+            ghost();
+            true
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::UndefinedFunction { .. });
+}
+
+// --------------------------------------------------------------------------
+// User-defined operator overloading
+//
+// `op <symbol>(params...) -> ret = body;` registers a new overload under the
+// operator's own name, alongside the built-in overloads. Because it shares the
+// operator's overload set, it participates in ordinary overload resolution:
+// it is chosen when its signature is the unique match, and it collides with a
+// built-in only if it mangles to an identical signature.
+// --------------------------------------------------------------------------
+
+#[test]
+fn user_operator_overload_is_selected() {
+    // There is no built-in `+` for bools, so this user overload is the only
+    // candidate for `true + false`.
+    let module = check_ok(
+        "
+        op +(a: bool, b: bool) -> bool = a;
+        fn main() -> bool = true + false;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::Bool, Type::Bool], Type::Bool)
+    );
+    assert_eq!(main.body.ty, Type::Bool);
+    let args = call_args(&main.body);
+    assert_eq!(args[0].ty, Type::Bool);
+    assert_eq!(args[1].ty, Type::Bool);
+    // The overload itself is emitted as a resolved function.
+    func_sig(&module, "+", vec![Type::Bool, Type::Bool], Type::Bool);
+}
+
+#[test]
+fn user_operator_overload_coexists_with_builtins() {
+    // Adding a bool overload for `+` leaves the built-in integer overloads
+    // untouched: `1 + 2` still resolves to the i32 built-in.
+    let module = check_ok(
+        "
+        op +(a: bool, b: bool) -> bool = a;
+        fn main() -> i32 = 1 + 2;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::I32, Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn unary_user_operator_overload_resolves() {
+    // A one-parameter `op` is a unary operator overload; there is no built-in
+    // unary `-` for bool, so this is the sole candidate.
+    let module = check_ok(
+        "
+        op -(a: bool) -> bool = a;
+        fn main() -> bool = -true;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("-", vec![Type::Bool], Type::Bool)
+    );
+    assert_eq!(call_args(&main.body).len(), 1);
+}
+
+#[test]
+fn user_operator_overload_without_return_type_is_void() {
+    // Omitting `-> ret` makes the overload return `void`. It is picked over the
+    // built-in `&&` (which returns bool) because the call site wants `void`.
+    let module = check_ok(
+        "
+        op &&(a: bool, b: bool) = nop();
+        fn nop() = {};
+        fn main() = true && false;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("&&", vec![Type::Bool, Type::Bool], Type::Void)
+    );
+    assert_eq!(main.body.ty, Type::Void);
+}
+
+#[test]
+fn user_operator_overload_selected_by_return_type() {
+    // Two `+` bool overloads differing only in return type; the call site's
+    // expected type disambiguates.
+    let module = check_ok(
+        "
+        op +(a: bool, b: bool) -> bool = a;
+        op +(a: bool, b: bool) -> i32 = 0;
+        fn main() -> i32 = true + false;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::Bool, Type::Bool], Type::I32)
+    );
+}
+
+#[test]
+fn user_operator_overload_body_type_mismatch_is_an_error() {
+    // The body is a bool but the declared operator return type is i32.
+    let errs = check_err(
+        "
+        op +(a: bool, b: bool) -> i32 = a;
+        fn main() -> i32 = 0;
+        ",
+    );
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn user_operator_overload_duplicating_a_builtin_is_ambiguous() {
+    // This mangles identically to the built-in `+__i32_i32__i32`, producing two
+    // functions with the same signature.
+    let errs = check_err(
+        "
+        op +(a: i32, b: i32) -> i32 = a;
+        fn main() -> i32 = 0;
+        ",
+    );
+    assert_err!(errs, FloErr::AmbiguousOverload { .. });
+}
+
 // --------------------------------------------------------------------------
 // Name mangling unit test
 //

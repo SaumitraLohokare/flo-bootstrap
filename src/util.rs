@@ -1,3 +1,4 @@
+#[derive(Debug, Clone, Copy)]
 pub struct Iota {
     counter: usize,
 }

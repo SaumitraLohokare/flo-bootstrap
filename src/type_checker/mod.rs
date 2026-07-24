@@ -132,6 +132,18 @@ impl TypeChecker {
                     self.solve_expr_constraints(arg_expr, set)?;
                 }
             }
+            Scope(exprs, tail) => {
+                for expr in exprs {
+                    self.solve_expr_constraints(expr, set)?;
+                }
+                if let Some(tail) = tail {
+                    self.solve_expr_constraints(tail, set)?;
+                    // Only add this constraint if we have a tail
+                    // Otherwise our type is already set to Void
+                    let constraint = IsEqual(tail.ty.clone(), expr.ty.clone(), expr.loc);
+                    self.solve_constraint(set, constraint)?;
+                }
+            }
         }
 
         Ok(())
@@ -230,6 +242,16 @@ impl TypeChecker {
         use ExprKind::*;
         use Type::*;
 
+        if let Scope(exprs, tail) = &mut expr.kind {
+            for expr in exprs.iter_mut() {
+                self.try_solve_calls(expr, set, progress)?;
+            }
+            if let Some(tail) = tail {
+                self.try_solve_calls(tail, set, progress)?;
+            }
+            return Ok(());
+        }
+
         if let Call(name, args, resolved) = &mut expr.kind {
             if resolved.is_none() {
                 let possible = self.possible_overloads(name, args, &expr.ty, expr.loc, set)?;
@@ -289,6 +311,16 @@ impl TypeChecker {
     /// error surfaces instead of an ambiguity it caused higher up.
     fn check_calls_resolved(&self, expr: &Expr, set: &mut ReplaceSet) -> FloResult<()> {
         use ExprKind::*;
+
+        if let Scope(exprs, tail) = &expr.kind {
+            for expr in exprs {
+                self.check_calls_resolved(expr, set)?;
+            }
+            if let Some(tail) = tail {
+                self.check_calls_resolved(tail, set)?;
+            }
+            return Ok(());
+        }
 
         if let Call(name, args, resolved) = &expr.kind {
             for arg in args {
@@ -383,6 +415,19 @@ impl Expr {
                 );
                 Call(name.clone(), new_args, resolved.clone())
             }
+            Scope(exprs, tail) => {
+                let mut new_exprs = Vec::new();
+                for expr in exprs {
+                    new_exprs.push(expr.resolve(set)?);
+                }
+
+                let new_tail = match tail {
+                    Some(e) => Some(Box::new(e.resolve(set)?)),
+                    None => None,
+                };
+                Scope(new_exprs, new_tail)
+            }
+
             Num(n) => Num(*n),
             Flt(n) => Flt(*n),
             Bool(n) => Bool(*n),

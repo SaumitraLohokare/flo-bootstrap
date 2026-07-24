@@ -1,9 +1,6 @@
 use std::{collections::HashMap, fmt::Debug};
 
-use crate::{
-    tokenizer::{Loc, TokenKind},
-    types::Type,
-};
+use crate::{tokenizer::Loc, types::Type};
 
 #[derive(Clone)]
 pub struct Module {
@@ -26,14 +23,41 @@ pub struct Expr {
 
 #[derive(Debug, Clone)]
 pub enum ExprKind {
-    BuiltinOp(TokenKind), // To specify it is a builtin function for a specific op
+    BuiltinOp(Op), // To specify it is a builtin function for a specific op
 
     Num(u64),
     Flt(f64),
     Bool(bool),
     Var(usize),
+
     // Call(name, args, resolved_name)
     Call(String, Vec<Expr>, Option<String>),
+
+    // Scope(stmts, tail)
+    Scope(Vec<Expr>, Option<Box<Expr>>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Op {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+
+    BitAnd,
+    BitOr,
+    BitXor,
+
+    And,
+    Or,
+
+    Eq,
+    NEq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
 }
 
 // -------------------------------------------
@@ -62,8 +86,8 @@ impl Debug for Module {
 }
 
 impl Expr {
-    fn pretty_print(&self, indent: usize) -> String {
-        let indent = " ".repeat(indent);
+    fn pretty_print(&self, indent_amt: usize) -> String {
+        let indent = " ".repeat(indent_amt);
         match &self.kind {
             ExprKind::Num(num) => format!("{indent}{num}:{:?}", self.ty),
             ExprKind::Flt(num) => format!("{indent}{num}:{:?}", self.ty),
@@ -82,7 +106,19 @@ impl Expr {
                 };
                 format!("{indent}{name}({arg_list}):{:?}", self.ty)
             }
-            ExprKind::BuiltinOp(op) => format!("{indent}@builtin({})", op.pretty_name()),
+            ExprKind::BuiltinOp(op) => format!("{indent}@builtin({op:?})"),
+            ExprKind::Scope(exprs, tail) => {
+                let exprs_list = exprs
+                    .iter()
+                    .map(|e| e.pretty_print(indent_amt + 2))
+                    .collect::<Vec<_>>()
+                    .join(";\n");
+                let tail = match tail {
+                    Some(e) => format!("{}\n", e.pretty_print(indent_amt + 2)),
+                    None => "".to_string(),
+                };
+                format!("{indent}{{\n{exprs_list}\n{tail}}}")
+            }
         }
     }
 }

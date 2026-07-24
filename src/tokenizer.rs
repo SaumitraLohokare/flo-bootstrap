@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Fn,
+    Op,
 
     True,
     False,
@@ -11,6 +12,8 @@ pub enum TokenKind {
 
     LParen,
     RParen,
+    LCurly,
+    RCurly,
 
     Colon,
     Comma,
@@ -97,6 +100,8 @@ impl Tokenizer {
 
                 '(' => tokens.push(self.tokenize_symbol("(", TokenKind::LParen)),
                 ')' => tokens.push(self.tokenize_symbol(")", TokenKind::RParen)),
+                '{' => tokens.push(self.tokenize_symbol("{", TokenKind::LCurly)),
+                '}' => tokens.push(self.tokenize_symbol("}", TokenKind::RCurly)),
 
                 ':' => tokens.push(self.tokenize_symbol(":", TokenKind::Colon)),
                 ',' => tokens.push(self.tokenize_symbol(",", TokenKind::Comma)),
@@ -165,6 +170,7 @@ impl Tokenizer {
 
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
+            "op" => TokenKind::Op,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
 

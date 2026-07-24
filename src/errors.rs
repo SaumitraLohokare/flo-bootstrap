@@ -40,6 +40,11 @@ pub enum FloErr {
         loc: Loc,
     },
 
+    ExpectedOp {
+        found: TokenKind,
+        loc: Loc,
+    },
+
     CallArityMismatch {
         expected: usize,
         got: usize,
@@ -172,6 +177,10 @@ impl FloErr {
                 eprintln!("Ambiguous overload `{name}`");
                 print_src(src, &[found_loc, previous_loc]);
             }
+            ExpectedOp { found, loc } => {
+                eprintln!("Expected an operator but found: `{}`", found.pretty_name());
+                print_src(src, &[loc]);
+            }
         }
     }
 }
@@ -290,6 +299,9 @@ impl TokenKind {
             TokenKind::LessThanEqual => "<=",
             TokenKind::GreaterThanEqual => ">=",
             TokenKind::PipeGreaterThan => "|>",
+            TokenKind::Op => "op",
+            TokenKind::LCurly => "{",
+            TokenKind::RCurly => "}",
         }
     }
 }
