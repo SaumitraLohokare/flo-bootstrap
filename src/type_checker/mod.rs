@@ -70,9 +70,13 @@ impl TypeChecker {
     fn check_func(&self, func: &mut Func) -> FloResult<Func> {
         // 1. Collect & Solve Constraints
 
+        let Type::Fn(_arg_tys, ret_ty) = func.ty.clone() else {
+            unreachable!()
+        };
+
         let mut set = ReplaceSet::new();
         self.solve_func_constraints(func, &mut set)?;
-        self.solve_expr_constraints(&func.body, &mut set)?;
+        self.solve_expr_constraints(&func.body, ret_ty.as_ref(), &mut set)?;
 
         // 2. Resolve calls to a fixpoint (before defaulting)
 
@@ -109,7 +113,14 @@ impl TypeChecker {
         )
     }
 
-    fn solve_expr_constraints(&self, expr: &Expr, set: &mut ReplaceSet) -> FloResult<()> {
+    /// `ret_ty` is the enclosing function's return type, needed to constrain the
+    /// operand of any `return` expression that appears in the body.
+    fn solve_expr_constraints(
+        &self,
+        expr: &Expr,
+        ret_ty: &Type,
+        set: &mut ReplaceSet,
+    ) -> FloResult<()> {
         use ExprKind::*;
         use Type::*;
 
@@ -129,42 +140,100 @@ impl TypeChecker {
             BuiltinOp(_) | Var(_) => {}
             Call(_, arg_exprs, _) => {
                 for arg_expr in arg_exprs {
-                    self.solve_expr_constraints(arg_expr, set)?;
+                    self.solve_expr_constraints(arg_expr, ret_ty, set)?;
                 }
             }
-            Scope(exprs, tail) => {
-                for expr in exprs {
-                    self.solve_expr_constraints(expr, set)?;
+            Scope(stmts, tail) => {
+                for stmt in stmts {
+                    self.solve_expr_constraints(stmt, ret_ty, set)?;
                 }
                 if let Some(tail) = tail {
-                    self.solve_expr_constraints(tail, set)?;
-                    // Only add this constraint if we have a tail
-                    // Otherwise our type is already set to Void
+                    self.solve_expr_constraints(tail, ret_ty, set)?;
+                }
+
+                // A scope diverges if any statement diverges or its tail does.
+                // Statement divergence (a `return` before the tail) makes the
+                // whole scope NoReturn even though the tail is dead code.
+                let diverges = stmts.iter().any(|s| matches!(set.resolve(&s.ty), Never))
+                    || tail
+                        .as_ref()
+                        .is_some_and(|t| matches!(set.resolve(&t.ty), Never));
+
+                if diverges {
+                    self.mark_never(&expr.ty, set, expr.loc)?;
+                } else if let Some(tail) = tail {
                     let constraint = IsEqual(tail.ty.clone(), expr.ty.clone(), expr.loc);
+                    self.solve_constraint(set, constraint)?;
+                } else {
+                    // No tail and no divergence => an empty/`;`-terminated scope
+                    // is void.
+                    let constraint = IsEqual(Void, expr.ty.clone(), expr.loc);
                     self.solve_constraint(set, constraint)?;
                 }
             }
             If(cond, then, otherwise) => {
-                self.solve_expr_constraints(cond, set)?;
-                let then_constr = IsEqual(Type::Bool, cond.ty.clone(), cond.loc);
+                self.solve_expr_constraints(cond, ret_ty, set)?;
+                let cond_constr = IsEqual(Type::Bool, cond.ty.clone(), cond.loc);
+                self.solve_constraint(set, cond_constr)?;
+
+                self.solve_expr_constraints(then, ret_ty, set)?;
+                // The `if`'s own type is the join of its branches. A NoReturn
+                // branch is absorbed: the constraint below is a no-op for it (see
+                // `solve_constraint`), so the `if` takes the other branch's type.
+                let then_constr = IsEqual(expr.ty.clone(), then.ty.clone(), then.loc);
                 self.solve_constraint(set, then_constr)?;
 
-                self.solve_expr_constraints(then, set)?;
                 if let Some(otherwise) = otherwise {
-                    self.solve_expr_constraints(otherwise, set)?;
-                    // If `else` branch exists then the two branches must match type
+                    self.solve_expr_constraints(otherwise, ret_ty, set)?;
                     let branch_constr =
-                        IsEqual(then.ty.clone(), otherwise.ty.clone(), otherwise.loc);
+                        IsEqual(expr.ty.clone(), otherwise.ty.clone(), otherwise.loc);
                     self.solve_constraint(set, branch_constr)?;
+
+                    // If BOTH branches diverge the whole `if` diverges. The two
+                    // constraints above bound nothing (both were no-ops), so pin
+                    // the `if`'s own type to NoReturn explicitly.
+                    if matches!(set.resolve(&then.ty), Never)
+                        && matches!(set.resolve(&otherwise.ty), Never)
+                    {
+                        self.mark_never(&expr.ty, set, expr.loc)?;
+                    }
                 } else {
-                    // If `else` doesn't exist then `then` must be Void
-                    let void_constr = IsEqual(Void, then.ty.clone(), then.loc);
+                    // With no `else`, the `if` is void — control may skip `then`
+                    // entirely, so a diverging `then` does not make it NoReturn.
+                    let void_constr = IsEqual(Void, expr.ty.clone(), expr.loc);
                     self.solve_constraint(set, void_constr)?;
                 }
+            }
+            Return(value) => {
+                match value {
+                    Some(e) => {
+                        self.solve_expr_constraints(e, ret_ty, set)?;
+                        // The returned value must match the function's return type.
+                        let constraint = IsEqual(ret_ty.clone(), e.ty.clone(), e.loc);
+                        self.solve_constraint(set, constraint)?;
+                    }
+                    None => {
+                        // Bare `return` yields void; only valid in a void function.
+                        let constraint = IsEqual(ret_ty.clone(), Void, expr.loc);
+                        self.solve_constraint(set, constraint)?;
+                    }
+                }
+                // The `return` expression's own type is already NoReturn (set by
+                // the parser), so it needs no constraint here.
             }
         }
 
         Ok(())
+    }
+
+    /// Pin a composite expression's own (always fresh) type variable to NoReturn
+    /// when it is determined to diverge. Only the composite's own variable is
+    /// touched, so a diverging branch or statement never poisons its siblings.
+    fn mark_never(&self, ty: &Type, set: &mut ReplaceSet, loc: Loc) -> FloResult<()> {
+        match ty {
+            Type::T(id) => set.bind(*id, Type::Never, loc),
+            _ => Ok(()),
+        }
     }
 
     fn solve_constraint(
@@ -173,6 +242,14 @@ impl TypeChecker {
         IsEqual(t1, t2, loc): IsEqual,
     ) -> FloResult<()> {
         use Type::*;
+
+        // NoReturn satisfies any binding: a constraint touching it is vacuously
+        // solved. Crucially it never binds a variable to NoReturn — divergence is
+        // propagated structurally (via `mark_never`), not through unification, so
+        // a diverging expression cannot poison a neighbour's type variable.
+        if matches!(set.resolve(&t1), Never) || matches!(set.resolve(&t2), Never) {
+            return Ok(());
+        }
 
         match (t1, t2) {
             (T(a), T(b)) => set.unify(a, b, loc)?,
@@ -279,6 +356,13 @@ impl TypeChecker {
             return Ok(());
         }
 
+        if let Return(value) = &mut expr.kind {
+            if let Some(e) = value {
+                self.try_solve_calls(e, set, progress)?;
+            }
+            return Ok(());
+        }
+
         if let Call(name, args, resolved) = &mut expr.kind {
             if resolved.is_none() {
                 let possible = self.possible_overloads(name, args, &expr.ty, expr.loc, set)?;
@@ -345,6 +429,22 @@ impl TypeChecker {
             }
             if let Some(tail) = tail {
                 self.check_calls_resolved(tail, set)?;
+            }
+            return Ok(());
+        }
+
+        if let If(cond, then, otherwise) = &expr.kind {
+            self.check_calls_resolved(cond, set)?;
+            self.check_calls_resolved(then, set)?;
+            if let Some(otherwise) = otherwise {
+                self.check_calls_resolved(otherwise, set)?;
+            }
+            return Ok(());
+        }
+
+        if let Return(value) = &expr.kind {
+            if let Some(e) = value {
+                self.check_calls_resolved(e, set)?;
             }
             return Ok(());
         }
@@ -462,6 +562,13 @@ impl Expr {
                     None => None,
                 };
                 If(cond, then, otherwise)
+            }
+            Return(value) => {
+                let new_value = match value {
+                    Some(e) => Some(Box::new(e.resolve(set)?)),
+                    None => None,
+                };
+                Return(new_value)
             }
 
             Num(n) => Num(*n),

@@ -1,0 +1,20 @@
+T = Temporary
+V = Variable
+C = Constant
+COND = eq, ne, lt, gt, le, ge
+LABEL = .label_name
+STRUCT = Struct name
+UNION = Union name
+
+- set T|V, T|V|C
+- ret T|V|C
+- cmp T|V COND T|V|C T|V|C
+- jmp LABEL [ <args:T> ]
+- jmp_if COND T|V|C T|V|C LABEL
+- LABEL
+- struct.make STRUCT { "field_name" = T|V|C, * }
+- struct.get T|V T|V "field_name"
+- struct.set T|V "field_name" T|V|C
+- union.make UNION { "field_name" = T|V|C }
+- union.get T|V T|V "field_name"
+- union.set T|V "field_name" T|V|C

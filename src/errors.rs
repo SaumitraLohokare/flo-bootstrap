@@ -304,6 +304,7 @@ impl TokenKind {
             TokenKind::RCurly => "}",
             TokenKind::If => "if",
             TokenKind::Else => "else",
+            TokenKind::Return => "return",
         }
     }
 }

@@ -12,6 +12,11 @@ pub enum Type {
 
     Void,
 
+    // NoReturn / bottom type: the type of a `return` expression. Satisfies any
+    // other type and is absorbed by joins so a diverging branch/statement never
+    // forces its neighbours to NoReturn.
+    Never,
+
     Bool,
 
     // {integer}
@@ -40,7 +45,7 @@ impl Type {
             }
             Integer => false,
             Decimal => false,
-            Void | Bool | U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 | F32 | F64 => true,
+            Void | Never | Bool | U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 | F32 | F64 => true,
         }
     }
 
@@ -48,6 +53,8 @@ impl Type {
         use Type::*;
         match (self, other) {
             (T(_), _) => true,
+            // A NoReturn value satisfies any expected type (bottom type).
+            (Never, _) => true,
             (Fn(args_1, ret_1), Fn(args_2, ret_2)) => {
                 let mut satisfies = true;
                 for (arg_1, arg_2) in args_1.iter().zip(args_2) {
@@ -87,6 +94,7 @@ impl Debug for Type {
         match self {
             T(n) => write!(f, "'t{n}"),
             Void => write!(f, "void"),
+            Never => write!(f, "noreturn"),
             Bool => write!(f, "bool"),
             U8 => write!(f, "u8"),
             U16 => write!(f, "u16"),

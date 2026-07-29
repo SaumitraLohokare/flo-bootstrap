@@ -38,6 +38,9 @@ pub enum ExprKind {
 
     // If(cond, then, else)
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
+
+    // Return(value) - always NoReturn typed; `value` is absent for a bare `return`
+    Return(Option<Box<Expr>>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +145,10 @@ impl Expr {
                     otherwise
                 )
             }
+            ExprKind::Return(value) => match value {
+                Some(e) => format!("{indent}return {}:{:?}", e.pretty_print(0), self.ty),
+                None => format!("{indent}return:{:?}", self.ty),
+            },
         }
     }
 }

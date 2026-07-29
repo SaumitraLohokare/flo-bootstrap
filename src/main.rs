@@ -13,12 +13,6 @@ mod util;
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
 // FIXME: Add bitwise shift/not & logical not
 
-// TODO: Return
-//      - [ ] Add return token
-//      - [ ] parse return expr in parse_atom
-//      - [ ] Add new NoReturn Type
-//      - [ ] Add proper type checking for return
-
 // Then: Variables & Globals -> While & Break/Continue -> Defer
 // Then: Pointers -> Arrays & Slices -> Strings
 // Then: Records & Sum Types -> Destructuring -> Match & Semantic Analysis
@@ -28,8 +22,14 @@ mod util;
 fn main() {
     let src = r#"
         fn main() -> i32 = true |> i32;
-        fn cond() -> bool = true;
-        fn i32(b: bool) -> i32 = if b && cond() { 1 } else 0;
+        fn i32(b: bool) -> i32 = if b 1 else 0;
+
+        fn foo() -> i8 = {
+            if false
+                1
+            else
+                2
+        };
     "#
     .to_string();
 

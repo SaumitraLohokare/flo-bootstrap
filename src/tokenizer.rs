@@ -6,6 +6,8 @@ pub enum TokenKind {
     If,
     Else,
 
+    Return,
+
     True,
     False,
 
@@ -176,6 +178,7 @@ impl Tokenizer {
             "op" => TokenKind::Op,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            "return" => TokenKind::Return,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
 

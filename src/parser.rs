@@ -369,6 +369,8 @@ impl Parser {
 
             If => self.parse_if_expr(scope),
 
+            Return => self.parse_return(scope),
+
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
             }),
@@ -398,10 +400,9 @@ impl Parser {
 
         let r_curly = self.expect_get(RCurly)?;
 
-        let ty = match &tail {
-            Some(_) => self.fresh_type(),
-            None => Type::Void,
-        };
+        // Always a fresh var: the type checker decides whether the scope is its
+        // tail's type, `void` (no tail), or `noreturn` (a statement/tail diverges).
+        let ty = self.fresh_type();
         let kind = ExprKind::Scope(exprs, tail.map(|e| Box::new(e)));
         let loc = Loc {
             start: l_curly.loc.start,
@@ -440,6 +441,33 @@ impl Parser {
         let kind = ExprKind::If(cond, then, otherwise);
         let ty = self.fresh_type();
         Ok(Expr { kind, ty, loc })
+    }
+
+    fn parse_return(&mut self, scope: &Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let ret_tok = self.expect_get(Return)?;
+        let start = ret_tok.loc.start;
+
+        // The operand is optional: it is absent when the next token cannot start
+        // an expression (a terminator, `else`, or EOF). Otherwise `return` grabs
+        // the whole remaining expression, so `return a + b` is `return (a + b)`.
+        let value = match self.peek_kind() {
+            Ok(Semicolon | RCurly | RParen | Comma | Else) | Err(_) => None,
+            _ => Some(Box::new(self.parse_expr(-1, scope)?)),
+        };
+
+        let end = match &value {
+            Some(e) => e.loc.end,
+            None => ret_tok.loc.end,
+        };
+
+        // A `return` expression is always NoReturn.
+        Ok(Expr {
+            kind: ExprKind::Return(value),
+            ty: Type::Never,
+            loc: Loc { start, end },
+        })
     }
 
     /// Parses an optional parenthesized, comma-separated argument list.

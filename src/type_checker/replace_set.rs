@@ -73,6 +73,11 @@ impl ReplaceSet {
     fn unify_types(&mut self, t1: Type, t2: Type, loc: Loc) -> FloResult<Type> {
         use Type::*;
         let result = match (t1, t2) {
+            // NoReturn is absorbed by a join: it never overrides a real type and
+            // never binds a variable to NoReturn. Listed first so it wins even
+            // against the type-var arms below.
+            (Never, other) | (other, Never) => other,
+
             (T(a), T(b)) => {
                 self.unify(a, b, loc)?;
                 self.resolve(&T(a))

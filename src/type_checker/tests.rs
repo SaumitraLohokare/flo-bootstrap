@@ -1119,6 +1119,14 @@ fn scope_parts(expr: &Expr) -> (&[Expr], Option<&Expr>) {
     }
 }
 
+/// The optional operand of a return expression.
+fn return_value(expr: &Expr) -> Option<&Expr> {
+    match &expr.kind {
+        ExprKind::Return(value) => value.as_deref(),
+        other => panic!("expected a return expression, got {other:?}"),
+    }
+}
+
 // --------------------------------------------------------------------------
 // Scope expressions
 //
@@ -1292,6 +1300,143 @@ fn unresolved_statement_call_is_an_error() {
     assert_err!(errs, FloErr::UndefinedFunction { .. });
 }
 
+/// The condition, `then` branch and optional `else` branch of an if expression.
+fn if_parts(expr: &Expr) -> (&Expr, &Expr, Option<&Expr>) {
+    match &expr.kind {
+        ExprKind::If(cond, then, otherwise) => (cond, then, otherwise.as_deref()),
+        other => panic!("expected an if expression, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// If expressions
+//
+// `if cond { then } else { else }` is an expression whose type is the shared
+// type of its branches. Without an `else` it is `void` (and the `then` branch
+// must then be `void` too). The condition must be `bool`. Crucially, the `if`
+// expression's own type is tied to its branches, so a narrow return type flows
+// down into branch literals and mismatched branches are rejected.
+// --------------------------------------------------------------------------
+
+#[test]
+fn if_with_matching_branches_resolves() {
+    let module = check_ok("fn main() -> i32 = if true { 1 } else { 2 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    let (cond, then, otherwise) = if_parts(&main.body);
+    assert!(matches!(cond.kind, ExprKind::Bool(true)));
+    assert_eq!(then.ty, Type::I32);
+    assert_eq!(otherwise.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn if_return_type_propagates_into_branch_literals() {
+    // Regression: the `if` expression's type must be linked to its branches, so
+    // the declared i8 return type flows down into *both* branch literals. Before
+    // the fix the branches defaulted to i32 while the `if` was independently i8.
+    let module = check_ok("fn main() -> i8 = if true { 1 } else { 2 };");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(main.body.ty, Type::I8);
+    let (_, then, otherwise) = if_parts(&main.body);
+    assert_eq!(then.ty, Type::I8);
+    assert_eq!(otherwise.unwrap().ty, Type::I8);
+}
+
+#[test]
+fn if_without_else_is_void() {
+    let module = check_ok(
+        "
+        fn main() = if true { nop() };
+        fn nop() = {};
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.body.ty, Type::Void);
+    let (_, then, otherwise) = if_parts(&main.body);
+    assert_eq!(then.ty, Type::Void);
+    assert!(otherwise.is_none());
+}
+
+#[test]
+fn if_branches_resolve_calls() {
+    // Calls in either branch are resolved, and the branch/if types agree.
+    let module = check_ok(
+        "
+        fn main() -> i32 = if true { id(1) } else { id(2) };
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    let (_, then, otherwise) = if_parts(&main.body);
+    // Each branch is a `{ id(..) }` scope; the call is its tail.
+    let then_call = scope_parts(then).1.unwrap();
+    let else_call = scope_parts(otherwise.unwrap()).1.unwrap();
+    assert_eq!(resolved_call_name(then_call), m("id", vec![Type::I32], Type::I32));
+    assert_eq!(resolved_call_name(else_call), m("id", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn if_selects_overload_by_expected_type() {
+    // The i8 expected type flows through the `if` into the branches, picking the
+    // i8 overload of `id` in both.
+    let module = check_ok(
+        "
+        fn main() -> i8 = if true { id(1) } else { id(2) };
+        fn id(a: i8) -> i8 = a;
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    let (_, then, otherwise) = if_parts(&main.body);
+    let then_call = scope_parts(then).1.unwrap();
+    let else_call = scope_parts(otherwise.unwrap()).1.unwrap();
+    assert_eq!(resolved_call_name(then_call), m("id", vec![Type::I8], Type::I8));
+    assert_eq!(resolved_call_name(else_call), m("id", vec![Type::I8], Type::I8));
+}
+
+#[test]
+fn nested_if_resolves() {
+    let module = check_ok("fn main() -> i32 = if true { 1 } else if false { 2 } else { 3 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    // The `else` branch is itself an `if`, also typed i32.
+    let (_, _, otherwise) = if_parts(&main.body);
+    let inner = otherwise.unwrap();
+    assert_eq!(inner.ty, Type::I32);
+    let (_, then, else2) = if_parts(inner);
+    assert_eq!(then.ty, Type::I32);
+    assert_eq!(else2.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn if_condition_must_be_bool() {
+    // `1` is an integer, not a bool.
+    let errs = check_err("fn main() -> i32 = if 1 { 1 } else { 2 };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn if_mismatched_branches_is_an_error() {
+    // One branch is an integer, the other a bool.
+    let errs = check_err("fn main() -> i32 = if true { 1 } else { false };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn if_branch_conflicting_with_return_type_is_an_error() {
+    // Both branches agree (bool), but the declared return type is i32.
+    let errs = check_err("fn main() -> i32 = if true { true } else { false };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn if_without_else_for_non_void_return_is_an_error() {
+    // An else-less `if` is void, which cannot satisfy an i32 return type.
+    let errs = check_err("fn main() -> i32 = if true { 1 };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
 // --------------------------------------------------------------------------
 // User-defined operator overloading
 //
@@ -1441,4 +1586,178 @@ fn mangle_name_format() {
         "foo__i32_u8__i32"
     );
     assert_eq!(mangle_name(&fn_ty(vec![], Type::Void), "a"), "a____void");
+}
+
+// --------------------------------------------------------------------------
+// Return expressions & the NoReturn (bottom) type
+//
+// `return e` is an expression of type `NoReturn`. Its operand is constrained to
+// the enclosing function's return type. `NoReturn` satisfies any other type, and
+// it is absorbed by joins: a diverging `if` branch or scope statement never
+// forces its non-diverging neighbours to `NoReturn`.
+// --------------------------------------------------------------------------
+
+#[test]
+fn return_as_body_is_noreturn() {
+    let module = check_ok("fn main() -> i32 = return 5;");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::Never);
+    let val = return_value(&main.body).expect("return should carry a value");
+    assert_eq!(val.ty, Type::I32);
+    assert!(matches!(val.kind, ExprKind::Num(5)));
+}
+
+#[test]
+fn return_operand_takes_function_return_type() {
+    // The declared i8 return type flows into the return's operand literal.
+    let module = check_ok("fn main() -> i8 = return 5;");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    assert_eq!(return_value(&main.body).unwrap().ty, Type::I8);
+}
+
+#[test]
+fn return_operand_type_mismatch_is_an_error() {
+    // `return true` in an i32 function: the operand cannot match the return type.
+    let errs = check_err("fn main() -> i32 = return true;");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn bare_return_in_void_function_is_ok() {
+    let module = check_ok("fn main() = return;");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.body.ty, Type::Never);
+    assert!(return_value(&main.body).is_none());
+}
+
+#[test]
+fn bare_return_in_non_void_function_is_an_error() {
+    // A value-returning function cannot `return` without a value.
+    let errs = check_err("fn main() -> i32 = return;");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn return_operand_call_is_resolved() {
+    // Calls nested inside a return operand must still be resolved by the
+    // call-resolution passes.
+    let module = check_ok(
+        "
+        fn main() -> i32 = return id(0);
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let val = return_value(&main.body).unwrap();
+    assert_eq!(resolved_call_name(val), m("id", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn return_in_operand_position_resolves() {
+    // `return` can appear anywhere an expression can. As an operand of `+` it is
+    // `NoReturn`, which satisfies the parameter; the call still resolves.
+    let module = check_ok("fn main() -> i32 = 1 + return 0;");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("+", vec![Type::I32, Type::I32], Type::I32)
+    );
+    let args = call_args(&main.body);
+    assert_eq!(args[0].ty, Type::I32);
+    assert_eq!(args[1].ty, Type::Never);
+}
+
+#[test]
+fn diverging_branch_does_not_poison_the_other() {
+    // One branch diverges; the OTHER branch keeps its real type and drives the
+    // `if`'s type. This is the core non-poisoning property.
+    let module = check_ok(
+        "
+        fn main() -> i32 = cond(true);
+        fn cond(b: bool) -> i32 = if b { return 0 } else { 1 };
+        ",
+    );
+    let cond = func_sig(&module, "cond", vec![Type::Bool], Type::I32);
+    assert_eq!(cond.body.ty, Type::I32);
+    let (_, then, otherwise) = if_parts(&cond.body);
+    assert_eq!(then.ty, Type::Never);
+    assert_eq!(otherwise.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn both_branches_diverging_makes_if_noreturn() {
+    // When both branches diverge the whole `if` diverges; it still satisfies the
+    // declared i32 return type.
+    let module = check_ok(
+        "
+        fn main() -> i32 = cond(true);
+        fn cond(b: bool) -> i32 = if b { return 0 } else { return 1 };
+        ",
+    );
+    let cond = func_sig(&module, "cond", vec![Type::Bool], Type::I32);
+    let (_, then, otherwise) = if_parts(&cond.body);
+    assert_eq!(then.ty, Type::Never);
+    assert_eq!(otherwise.unwrap().ty, Type::Never);
+}
+
+#[test]
+fn return_in_statement_position_marks_scope_noreturn() {
+    // A `return` statement makes the whole scope NoReturn; the trailing `5` is
+    // dead code but is still fully typed.
+    let module = check_ok("fn main() -> i32 = { return 0; 5 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0].ty, Type::Never);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn scope_with_only_a_return_is_valid_for_any_return_type() {
+    // `{ return 0; }` has no tail but diverges, so it satisfies i32 (it would be
+    // `void` and fail without the divergence rule).
+    let module = check_ok("fn main() -> i32 = { return 0; };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0].ty, Type::Never);
+    assert!(tail.is_none());
+}
+
+#[test]
+fn if_without_else_returning_does_not_diverge_the_scope() {
+    // `if b { return 0 }` is void (control may skip it), so the scope falls
+    // through to `5` and is i32 — a return in one arm does not poison the scope.
+    let module = check_ok(
+        "
+        fn main() -> i32 = cond(true);
+        fn cond(b: bool) -> i32 = { if b { return 0 }; 5 };
+        ",
+    );
+    let cond = func_sig(&module, "cond", vec![Type::Bool], Type::I32);
+    assert_eq!(cond.body.ty, Type::I32);
+    let (stmts, tail) = scope_parts(&cond.body);
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0].ty, Type::Void);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn calls_in_if_branches_resolve() {
+    // Regression guard: the call-resolution passes must recurse into both `if`
+    // branches (relevant now that a branch may hold a diverging expression).
+    let module = check_ok(
+        "
+        fn main() -> i32 = cond(true);
+        fn cond(b: bool) -> i32 = if b id(0) else id(1);
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let cond = func_sig(&module, "cond", vec![Type::Bool], Type::I32);
+    let (_, then, otherwise) = if_parts(&cond.body);
+    assert_eq!(resolved_call_name(then), m("id", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(otherwise.unwrap()),
+        m("id", vec![Type::I32], Type::I32)
+    );
 }
