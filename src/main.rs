@@ -13,22 +13,31 @@ mod util;
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
 // FIXME: Add bitwise shift/not & logical not
 
-// Then: Variables & Globals -> While & Break/Continue -> Defer
+// TODO: Variables
+//      - [ ] Add let/mut token
+//      - [ ] parse variable declaration
+//      - [ ] Need to maintain somewhere that a certain variable is mutable or not
+//      - [ ] Immutable variable cannot appear on lhs of assign (is_l_value())
+//      - [ ] I might leave it as a declaration expression in the AST (Will help with type checking)
+//            because we can store the expected type.
+//      - [ ] Also need to add the assign expr (Or it could just be a binary op too)
+//      - [ ] let & mut expressions return bool, if they were able to assign or not.
+//            This way we get if let and while let for free
+
+// Then: Globals -> While & Break/Continue -> Defer
 // Then: Pointers -> Arrays & Slices -> Strings
-// Then: Records & Sum Types -> Destructuring -> Match & Semantic Analysis
+// Then: Generics -> Sum Types -> Destructuring -> Switch
 // Then: Modules & Project Structure
 // Then: C Transpiling -> External Funcs -> Compiler Directives (@windows/@linux/@macos/@extern/@link)
 
 fn main() {
     let src = r#"
-        fn main() -> i32 = true |> i32;
-        fn i32(b: bool) -> i32 = if b 1 else 0;
+        fn main() -> i32 = let_ex(2);
 
-        fn foo() -> i8 = {
-            if false
-                1
-            else
-                2
+        fn let_ex(n: i32) -> i32 = {
+            let sqr_n = n * n;
+            let sqr_n: i32 = sqr_n;
+            sqr_n
         };
     "#
     .to_string();

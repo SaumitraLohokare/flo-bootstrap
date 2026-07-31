@@ -149,7 +149,7 @@ type Struct = {
     b: i32,
 };
 
-type Enum 
+type Enum
     = A
     | B;
 
@@ -299,7 +299,7 @@ fn Vec() = Vec {
     cap: 0,
 };
 
--- 
+--
 
 type Vec<T> = {
     ptr: *mut T,
@@ -307,7 +307,7 @@ type Vec<T> = {
     cap: u64,
 };
 
-fn Vec<T>() -> _ = Vec<T> {
+fn Vec<T>() -> Vec<T> = Vec {
     ptr: nil,
     len: 0,
     cap: 0,
@@ -324,3 +324,38 @@ fn foo() -> bool = {
     let a: u8 = 0;
     let b: i32 = a;
 }
+
+---
+
+type Foo = { a: i32, b: i32 };
+-- is the same as
+type Foo = Foo { a: i32, b: i32 };
+
+fn Foo(a: i32 = 0, b: i32 = 0) -> Foo = Foo { a, b };
+--                                      ^ is `Foo { a: i32, b: i32 } | ..`
+--                                ^ this binds it to type `Foo`
+
+-- And in the lowering phase we can add a special case
+-- for sum types with only one arm. So that it acts as a struct
+-- under the hood.
+
+---
+
+-- No fields sum type:
+type Color = Red | Green | Blue;
+fn Red() -> Color = Red;
+fn Green() -> Color = Green;
+fn Blue() -> Color = Blue;
+
+-- This is ok syntax. We just check if there exists a variable with
+-- the same name first. If not then check for constructors namespace.
+-- And it'll workout fine.
+
+---
+
+type Vec<T> = Vec { data: *mut T, len: u64, cap: u64 };
+
+fn Vec<T>() -> Vec<T> = Vec<T>::Vec { data: nil, len: 0, cap: 0 };
+--                      ^ this is the full way to make a type
+
+-- It is also ok, because we first check for module, then for a type
