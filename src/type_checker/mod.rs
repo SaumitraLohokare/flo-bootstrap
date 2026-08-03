@@ -247,6 +247,51 @@ impl TypeChecker {
                 // The `return` expression's own type is already NoReturn (set by
                 // the parser), so it needs no constraint here.
             }
+            Let(_, var_ty, init) => {
+                if let Some(init) = init {
+                    self.collect_expr_constraints(init, ret_ty, out);
+
+                    if diverges(init) {
+                        // `let x = return 1;` — nothing ever flows into `x`, so
+                        // pin it rather than leaving it unresolvable (the
+                        // equality below would be a no-op against NoReturn).
+                        out.push(Constraint::Diverges(var_ty.clone(), init.loc));
+                    } else {
+                        out.push(Constraint::IsEqual(
+                            var_ty.clone(),
+                            init.ty.clone(),
+                            init.loc,
+                        ));
+                    }
+                }
+
+                // `let x;` pushes nothing at all: the variable keeps its fresh
+                // type var for a later assignment to bind. If nothing ever does,
+                // `resolve` reports it at the declaration.
+                //
+                // The declaration's own type is `void` (set by the parser), so it
+                // needs no constraint either.
+            }
+            Assign(target, value) => {
+                self.collect_expr_constraints(target, ret_ty, out);
+                self.collect_expr_constraints(value, ret_ty, out);
+
+                if diverges(value) {
+                    out.push(Constraint::Diverges(expr.ty.clone(), expr.loc));
+                } else {
+                    out.push(Constraint::IsEqual(
+                        target.ty.clone(),
+                        value.ty.clone(),
+                        expr.loc,
+                    ));
+                    // An assignment yields the value it stored, like C.
+                    out.push(Constraint::IsEqual(
+                        expr.ty.clone(),
+                        target.ty.clone(),
+                        expr.loc,
+                    ));
+                }
+            }
         }
     }
 
@@ -489,6 +534,8 @@ fn diverges(expr: &Expr) -> bool {
         Scope(stmts, tail) => stmts.iter().any(diverges) || tail.as_deref().is_some_and(diverges),
         // Both branches must diverge; with no `else` control can skip `then`.
         If(_, then, Some(otherwise)) => diverges(then) && diverges(otherwise),
+        Let(_, _, init) => init.as_deref().is_some_and(diverges),
+        Assign(target, value) => diverges(target) || diverges(value),
         _ => false,
     }
 }
@@ -595,6 +642,28 @@ impl Expr {
                 };
                 Return(new_value)
             }
+            Let(id, var_ty, init) => {
+                // The declaration is `void`, so the check at the top of this
+                // function says nothing about the variable's own type. An
+                // unresolved one is reported here, at the declaration.
+                let var_ty = set.resolve(var_ty);
+                if !var_ty.is_known() {
+                    Err(FloErr::UnresolvedType {
+                        ty: var_ty.clone(),
+                        loc,
+                    })?
+                }
+
+                let new_init = match init {
+                    Some(e) => Some(Box::new(e.resolve(set, res)?)),
+                    None => None,
+                };
+                Let(*id, var_ty, new_init)
+            }
+            Assign(target, value) => Assign(
+                Box::new(target.resolve(set, res)?),
+                Box::new(value.resolve(set, res)?),
+            ),
 
             Num(n) => Num(*n),
             Flt(n) => Flt(*n),

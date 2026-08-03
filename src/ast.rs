@@ -41,6 +41,16 @@ pub enum ExprKind {
 
     // Return(value) - always NoReturn typed; `value` is absent for a bare `return`
     Return(Option<Box<Expr>>),
+
+    // Let(var_id, var_ty, init) - always void typed. `var_ty` is the variable's
+    // own type: the annotation if it had one, else a fresh type var shared with
+    // every `Var` that reads it. `init` is absent for `let x;`, whose type is
+    // then pinned by whatever assigns to it first.
+    Let(usize, Type, Option<Box<Expr>>),
+
+    // Assign(target, value) - yields the value of `value`, like C. `target` must
+    // be an l-value (see `Expr::is_lvalue`).
+    Assign(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +159,19 @@ impl Expr {
                 Some(e) => format!("{indent}return {}:{:?}", e.pretty_print(0), self.ty),
                 None => format!("{indent}return:{:?}", self.ty),
             },
+            ExprKind::Let(id, var_ty, init) => {
+                let init = match init {
+                    Some(e) => format!(" = {}", e.pretty_print(0)),
+                    None => "".to_string(),
+                };
+                format!("{indent}let var_{id}:{var_ty:?}{init}")
+            }
+            ExprKind::Assign(target, value) => format!(
+                "{indent}{} = {}:{:?}",
+                target.pretty_print(0),
+                value.pretty_print(0),
+                self.ty
+            ),
         }
     }
 }

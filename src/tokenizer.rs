@@ -3,6 +3,8 @@ pub enum TokenKind {
     Fn,
     Op,
 
+    Let,
+
     If,
     Else,
 
@@ -176,6 +178,7 @@ impl Tokenizer {
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
             "op" => TokenKind::Op,
+            "let" => TokenKind::Let,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "return" => TokenKind::Return,

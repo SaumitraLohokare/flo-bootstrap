@@ -46,6 +46,16 @@ fn check_err(src: &str) -> Vec<FloErr> {
     }
 }
 
+/// Expect the source to fail during *parsing* and return the error. Used for the
+/// checks the parser makes on its own, before any types exist.
+fn parse_err(src: &str) -> FloErr {
+    let tokens = Tokenizer::new(src).tokenize();
+    match Parser::new(tokens).parse() {
+        Ok(module) => panic!("expected parsing to fail, but it succeeded:\n{module:?}"),
+        Err(err) => err,
+    }
+}
+
 fn fn_ty(args: Vec<Type>, ret: Type) -> Type {
     Type::Fn(args, Box::new(ret))
 }
@@ -866,6 +876,83 @@ fn division_is_left_associative() {
     let args = call_args(&main.body);
     assert_eq!(resolved_call_name(&args[0]), op("/", Type::I32, Type::I32));
     assert!(matches!(args[1].kind, ExprKind::Num(2)));
+}
+
+// --------------------------------------------------------------------------
+// Parenthesized grouping
+//
+// `( expr )` is a primary expression that exists only to override precedence.
+// It produces no AST node of its own: the inner expression is returned as-is,
+// with its source span widened to include the parentheses.
+// --------------------------------------------------------------------------
+
+#[test]
+fn parens_override_precedence_on_the_left() {
+    // `(1 + 2) * 3`: without the parens `*` would bind tighter and nest under
+    // the `+` instead.
+    let module = check_ok("fn main() -> i32 = (1 + 2) * 3;");
+    let (root, nested) = op_and_nested(&module, 0);
+    assert_eq!(root, op("*", Type::I32, Type::I32));
+    assert_eq!(nested, op("+", Type::I32, Type::I32));
+}
+
+#[test]
+fn parens_override_precedence_on_the_right() {
+    // `2 * (3 + 4)`: the `+` nests under the right operand of `*`, which is
+    // where precedence alone would never put it.
+    let module = check_ok("fn main() -> i32 = 2 * (3 + 4);");
+    let (root, nested) = op_and_nested(&module, 1);
+    assert_eq!(root, op("*", Type::I32, Type::I32));
+    assert_eq!(nested, op("+", Type::I32, Type::I32));
+}
+
+#[test]
+fn parens_group_against_left_associativity() {
+    // `16 / (4 / 2)` == 8, the parse `/` would never produce on its own.
+    let module = check_ok("fn main() -> i32 = 16 / (4 / 2);");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let args = call_args(&main.body);
+    assert!(matches!(args[0].kind, ExprKind::Num(16)));
+    assert_eq!(resolved_call_name(&args[1]), op("/", Type::I32, Type::I32));
+}
+
+#[test]
+fn parens_wrap_no_node_of_their_own() {
+    // Redundant parens are transparent: the body is the literal itself, not a
+    // wrapper around it.
+    let module = check_ok("fn main() -> i32 = ((5));");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert!(matches!(main.body.kind, ExprKind::Num(5)));
+    assert_eq!(main.body.ty, Type::I32);
+}
+
+#[test]
+fn parenthesized_scope_and_if_still_work() {
+    // Composite expressions can be parenthesized too.
+    let module = check_ok("fn main() -> i32 = (if true { 1 } else { 2 }) + ({ 3 });");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let args = call_args(&main.body);
+    assert_eq!(args[0].ty, Type::I32);
+    assert!(matches!(args[0].kind, ExprKind::If(..)));
+    assert!(matches!(args[1].kind, ExprKind::Scope(..)));
+}
+
+#[test]
+fn empty_parens_are_an_error() {
+    let err = parse_err("fn main() -> i32 = ();");
+    assert!(
+        matches!(err, FloErr::UnexpectedToken { .. }),
+        "expected an unexpected-token error, got: {err:?}"
+    );
+}
+
+#[test]
+fn unclosed_parens_are_an_error() {
+    let err = parse_err("fn main() -> i32 = (1 + 2;");
+    assert!(
+        matches!(err, FloErr::ExpectedTokenNotFound { .. }),
+        "expected a missing-token error, got: {err:?}"
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -1759,5 +1846,378 @@ fn calls_in_if_branches_resolve() {
     assert_eq!(
         resolved_call_name(otherwise.unwrap()),
         m("id", vec![Type::I32], Type::I32)
+    );
+}
+
+/// The variable id, variable type and optional initializer of a declaration.
+fn let_parts(expr: &Expr) -> (usize, &Type, Option<&Expr>) {
+    match &expr.kind {
+        ExprKind::Let(id, ty, init) => (*id, ty, init.as_deref()),
+        other => panic!("expected a let expression, got {other:?}"),
+    }
+}
+
+/// The target and value of an assignment.
+fn assign_parts(expr: &Expr) -> (&Expr, &Expr) {
+    match &expr.kind {
+        ExprKind::Assign(target, value) => (target, value),
+        other => panic!("expected an assign expression, got {other:?}"),
+    }
+}
+
+/// The variable id a `Var` expression reads.
+fn var_id(expr: &Expr) -> usize {
+    match &expr.kind {
+        ExprKind::Var(id) => *id,
+        other => panic!("expected a variable, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// Variable declarations
+//
+// `let x [: T] [= init]` is an expression of type `void` that introduces `x`
+// into the enclosing scope. The variable's own type is the annotation if it has
+// one, otherwise a fresh type var shared with every `Var` that reads it — which
+// is what lets inference flow both from an initializer and (for `let x;`) from a
+// later assignment. Re-declaring a name shadows it: a new id, with the old one
+// still readable from the initializer.
+// --------------------------------------------------------------------------
+
+#[test]
+fn let_infers_its_type_from_the_initializer() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = f(2);
+        fn f(n: i32) -> i32 = { let a = n; a };
+        ",
+    );
+    let f = func_sig(&module, "f", vec![Type::I32], Type::I32);
+    let (stmts, tail) = scope_parts(&f.body);
+    let (id, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(var_ty, &Type::I32);
+    assert_eq!(init.unwrap().ty, Type::I32);
+    // The declaration itself yields no value.
+    assert_eq!(stmts[0].ty, Type::Void);
+    // ... and the tail reads that same variable.
+    assert_eq!(var_id(tail.unwrap()), id);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn let_initializer_literal_defaults_to_i32() {
+    let module = check_ok("fn main() -> i32 = { let a = 0; a };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(var_ty, &Type::I32);
+    assert_eq!(init.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn let_annotation_narrows_the_initializer_literal() {
+    // The annotation flows *into* the literal rather than the other way round,
+    // so `1` never defaults to i32.
+    let module = check_ok("fn main() -> i8 = { let a: i8 = 1; a };");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    let (stmts, tail) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(var_ty, &Type::I8);
+    assert_eq!(init.unwrap().ty, Type::I8);
+    assert_eq!(tail.unwrap().ty, Type::I8);
+}
+
+#[test]
+fn let_annotation_selects_an_overload() {
+    let module = check_ok(
+        "
+        fn main() -> u8 = { let a: u8 = id(1); a };
+        fn id(a: i32) -> i32 = a;
+        fn id(a: u8) -> u8 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::U8);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, _, init) = let_parts(&stmts[0]);
+    assert_eq!(
+        resolved_call_name(init.unwrap()),
+        m("id", vec![Type::U8], Type::U8)
+    );
+}
+
+#[test]
+fn let_annotation_conflicting_with_initializer_is_an_error() {
+    let errs = check_err("fn main() -> i8 = { let a: i8 = true; a };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn redeclaring_a_name_shadows_it() {
+    // Each `let` gets its own id, and the second initializer still reads the
+    // first binding — the new name is only in scope *after* the declaration.
+    let module = check_ok("fn main() -> i32 = { let a = 1; let a = a + 1; a };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    let (first, _, _) = let_parts(&stmts[0]);
+    let (second, _, second_init) = let_parts(&stmts[1]);
+    assert_ne!(first, second);
+    assert_eq!(var_id(&call_args(second_init.unwrap())[0]), first);
+    // The tail reads the newer binding.
+    assert_eq!(var_id(tail.unwrap()), second);
+}
+
+#[test]
+fn shadowing_can_change_the_type() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = f(1);
+        fn f(n: i32) -> i32 = { let a = true; let a = n; a };
+        ",
+    );
+    let f = func_sig(&module, "f", vec![Type::I32], Type::I32);
+    let (stmts, tail) = scope_parts(&f.body);
+    assert_eq!(let_parts(&stmts[0]).1, &Type::Bool);
+    assert_eq!(let_parts(&stmts[1]).1, &Type::I32);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn variable_does_not_escape_its_scope() {
+    let err = parse_err("fn main() -> i32 = { { let a = 1; }; a };");
+    assert!(
+        matches!(err, FloErr::UndefinedIdentifier { .. }),
+        "expected an undefined identifier error, got: {err:?}"
+    );
+}
+
+#[test]
+fn let_in_expression_position_is_void() {
+    // A declaration is an ordinary expression, so it may be a function body.
+    let module = check_ok("fn main() = let a = 1;");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.body.ty, Type::Void);
+    assert_eq!(let_parts(&main.body).1, &Type::I32);
+}
+
+#[test]
+fn let_initialized_by_a_diverging_expression_is_accepted() {
+    // `let a = return 0;` never binds `a` to anything, so its type is pinned to
+    // NoReturn instead of being left unresolvable. The `return` also makes the
+    // whole scope diverge, which is what satisfies the i32 return type.
+    let module = check_ok("fn main() -> i32 = { let a = return 0; };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, _) = scope_parts(&main.body);
+    assert_eq!(let_parts(&stmts[0]).1, &Type::Never);
+    assert_eq!(stmts[0].ty, Type::Void);
+}
+
+// --------------------------------------------------------------------------
+// Declarations without an initializer
+// --------------------------------------------------------------------------
+
+#[test]
+fn let_without_initializer_infers_from_a_later_assignment() {
+    let module = check_ok("fn main() -> i32 = { let a; a = 1; a };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    let (id, var_ty, init) = let_parts(&stmts[0]);
+    assert!(init.is_none());
+    assert_eq!(var_ty, &Type::I32);
+    assert_eq!(var_id(tail.unwrap()), id);
+}
+
+#[test]
+fn let_without_initializer_takes_its_annotation() {
+    let module = check_ok("fn main() -> i8 = { let a: i8; a = 1; a };");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    let (stmts, _) = scope_parts(&main.body);
+    assert_eq!(let_parts(&stmts[0]).1, &Type::I8);
+    // The assigned literal is narrowed to the annotated type.
+    assert_eq!(assign_parts(&stmts[1]).1.ty, Type::I8);
+}
+
+#[test]
+fn never_assigned_let_cannot_be_inferred() {
+    // KNOWN LIMITATION: this reports "unresolved type" rather than something like
+    // "unused variable". It surfaces at the declaration, which is the right place.
+    let errs = check_err("fn main() = { let a; };");
+    assert_err!(errs, FloErr::UnresolvedType { .. });
+}
+
+// --------------------------------------------------------------------------
+// Assignment
+//
+// `target = value` stores into an l-value and, like C, yields the value it
+// stored. It is the lowest-precedence operator and the only right-associative
+// one. Only the parser decides what may be assigned to (`Expr::is_lvalue`), so
+// those errors come out before type checking.
+// --------------------------------------------------------------------------
+
+#[test]
+fn assign_yields_the_value_it_stored() {
+    // The assignment is the scope's tail, so the scope — and the function — take
+    // its type. If it were void this would not type check.
+    let module = check_ok("fn main() -> i32 = { let a = 0; a = 1 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    let assign = tail.unwrap();
+    assert_eq!(assign.ty, Type::I32);
+    let (target, value) = assign_parts(assign);
+    assert_eq!(target.ty, Type::I32);
+    assert_eq!(value.ty, Type::I32);
+}
+
+#[test]
+fn assigned_value_takes_the_variables_type() {
+    // The i8 variable narrows the assigned literal, which would otherwise
+    // default to i32.
+    let module = check_ok("fn main() -> i8 = { let a: i8 = 0; a = 1 };");
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    let (_, tail) = scope_parts(&main.body);
+    let (target, value) = assign_parts(tail.unwrap());
+    assert_eq!(target.ty, Type::I8);
+    assert_eq!(value.ty, Type::I8);
+    assert_eq!(tail.unwrap().ty, Type::I8);
+}
+
+#[test]
+fn assign_binds_looser_than_every_other_operator() {
+    // `a = 1 + 2` is `a = (1 + 2)`, not `(a = 1) + 2`.
+    let module = check_ok("fn main() -> i32 = { let a = 0; a = 1 + 2 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    let (_, value) = assign_parts(tail.unwrap());
+    assert_eq!(
+        resolved_call_name(value),
+        m("+", vec![Type::I32, Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn assign_is_right_associative() {
+    // `a = b = 1` is `a = (b = 1)`: the inner assignment is the outer one's
+    // value, which only works because assignment yields what it stored.
+    let module = check_ok("fn main() -> i32 = { let a = 0; let b = 0; a = b = 1 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    let a = let_parts(&stmts[0]).0;
+    let b = let_parts(&stmts[1]).0;
+
+    let (outer_target, outer_value) = assign_parts(tail.unwrap());
+    assert_eq!(var_id(outer_target), a);
+    let (inner_target, inner_value) = assign_parts(outer_value);
+    assert_eq!(var_id(inner_target), b);
+    assert!(matches!(inner_value.kind, ExprKind::Num(1)));
+}
+
+#[test]
+fn assign_in_operand_position_resolves() {
+    // Assignment is an ordinary expression, so it can be passed as an argument —
+    // the parameter type is then what the assigned value has to satisfy.
+    let module = check_ok(
+        "
+        fn main() -> i8 = { let a: i8 = 0; id(a = 1) };
+        fn id(x: i8) -> i8 = x;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    let (_, tail) = scope_parts(&main.body);
+    assert_eq!(
+        resolved_call_name(tail.unwrap()),
+        m("id", vec![Type::I8], Type::I8)
+    );
+    let arg = &call_args(tail.unwrap())[0];
+    assert_eq!(arg.ty, Type::I8);
+    assert_eq!(assign_parts(arg).1.ty, Type::I8);
+}
+
+#[test]
+fn parenthesized_assign_is_an_operand() {
+    // `(a = 1) + 2` only type checks because the assignment yields an i32.
+    let module = check_ok("fn main() -> i32 = { let a = 0; (a = 1) + 2 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    assert_eq!(
+        resolved_call_name(tail.unwrap()),
+        m("+", vec![Type::I32, Type::I32], Type::I32)
+    );
+    let args = call_args(tail.unwrap());
+    assert_eq!(args[0].ty, Type::I32);
+    assert_eq!(assign_parts(&args[0]).1.ty, Type::I32);
+}
+
+#[test]
+fn parenthesized_variable_is_still_assignable() {
+    // Parens produce no node, so the assignment target is still a plain `Var`.
+    let module = check_ok("fn main() -> i32 = { let a = 0; (a) = 1 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    let (target, _) = assign_parts(tail.unwrap());
+    assert_eq!(var_id(target), let_parts(&stmts[0]).0);
+}
+
+#[test]
+fn assign_resolves_calls_on_both_sides() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = { let a = 0; a = id(1) };
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    let (_, value) = assign_parts(tail.unwrap());
+    assert_eq!(resolved_call_name(value), m("id", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn assign_type_mismatch_is_an_error() {
+    let errs = check_err("fn main() = { let a: i32 = 0; a = true; };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn assigning_a_diverging_value_is_accepted() {
+    // `a = return 0` never stores anything, so the assignment is NoReturn rather
+    // than forcing `a` to it.
+    let module = check_ok("fn main() -> i32 = { let a = 0; a = return 0; a };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts[1].ty, Type::Never);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn assigning_to_a_literal_is_an_error() {
+    let err = parse_err("fn main() -> i32 = { 1 = 2 };");
+    assert!(
+        matches!(err, FloErr::NotAssignable { .. }),
+        "expected a not-assignable error, got: {err:?}"
+    );
+}
+
+#[test]
+fn assigning_to_an_operator_result_is_an_error() {
+    // A consequence of `=` binding loosest: `a + 1 = 2` parses as `(a + 1) = 2`,
+    // whose target is not an l-value.
+    let err = parse_err("fn main() -> i32 = { let a = 0; a + 1 = 2 };");
+    assert!(
+        matches!(err, FloErr::NotAssignable { .. }),
+        "expected a not-assignable error, got: {err:?}"
+    );
+}
+
+#[test]
+fn assigning_to_a_call_result_is_an_error() {
+    let err = parse_err(
+        "
+        fn main() -> i32 = { id(1) = 2 };
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    assert!(
+        matches!(err, FloErr::NotAssignable { .. }),
+        "expected a not-assignable error, got: {err:?}"
     );
 }

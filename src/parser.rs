@@ -8,38 +8,33 @@ use crate::{
     util::Iota,
 };
 
+/// The names visible at a point in the source, mapping each to its variable id.
+/// Only the mapping is scoped — a variable's type lives in [`Parser::var_types`],
+/// keyed by the id, because ids are unique for the whole parse.
 #[derive(Debug, Clone)]
 struct Scope {
     vars: HashMap<String, usize>,
-    var_types: HashMap<usize, Type>,
 }
 
 impl Scope {
     fn new() -> Self {
         Self {
             vars: HashMap::new(),
-            var_types: HashMap::new(),
         }
     }
 
     fn duplicate(&self) -> Self {
         Self {
             vars: self.vars.clone(),
-            var_types: self.var_types.clone(),
         }
     }
 
-    fn add_var(&mut self, name: String, id: usize, ty: Type) {
+    fn add_var(&mut self, name: String, id: usize) {
         self.vars.insert(name, id);
-        self.var_types.insert(id, ty);
     }
 
     fn get_var(&self, name: &String) -> Option<usize> {
         self.vars.get(name).copied()
-    }
-
-    fn get_var_type(&self, id: usize) -> Type {
-        self.var_types[&id].clone()
     }
 }
 
@@ -47,7 +42,9 @@ pub struct Parser {
     tokens: Vec<Token>,
     idx: usize,
 
-    var_iota: Iota,
+    /// Every variable's type, indexed by variable id. Also hands out the ids: a
+    /// declaration pushes its type and takes the new index.
+    var_types: Vec<Type>,
     type_iota: Iota,
 
     funcs: HashMap<String, Vec<Func>>,
@@ -58,7 +55,7 @@ impl Parser {
         Self {
             tokens,
             idx: 0,
-            var_iota: Iota::new(),
+            var_types: Vec::new(),
             type_iota: Iota::new(),
             funcs: HashMap::new(),
         }
@@ -159,7 +156,7 @@ impl Parser {
 
         self.expect(Equal)?;
 
-        let body = self.parse_expr(-1, &scope)?;
+        let body = self.parse_expr(-1, &mut scope)?;
 
         self.expect(Semicolon)?;
 
@@ -204,7 +201,7 @@ impl Parser {
         result
     }
 
-    fn parse_expr(&mut self, precedence: i32, scope: &Scope) -> FloResult<Expr> {
+    fn parse_expr(&mut self, precedence: i32, scope: &mut Scope) -> FloResult<Expr> {
         use ExprKind::*;
         use TokenKind::*;
         let mut lhs = self.parse_unary(scope)?;
@@ -221,15 +218,36 @@ impl Parser {
 
                 self.skip();
 
-                let rhs = self.parse_expr(op_precedence + 1, scope)?;
+                // `=` is the only right-associative operator: recursing at its
+                // own precedence (rather than one above) makes `a = b = c` group
+                // as `a = (b = c)`.
+                let rhs_precedence = if op == Equal {
+                    op_precedence
+                } else {
+                    op_precedence + 1
+                };
+
+                let rhs = self.parse_expr(rhs_precedence, scope)?;
                 let loc = Loc {
                     start: lhs.loc.start,
                     end: rhs.loc.end,
                 };
-                lhs = Expr {
-                    kind: Call(format!("{}", op.pretty_name()), vec![lhs, rhs], None),
-                    ty: self.fresh_type(),
-                    loc,
+
+                lhs = if op == Equal {
+                    if !lhs.is_lvalue() {
+                        return Err(FloErr::NotAssignable { loc: lhs.loc });
+                    }
+                    Expr {
+                        kind: Assign(Box::new(lhs), Box::new(rhs)),
+                        ty: self.fresh_type(),
+                        loc,
+                    }
+                } else {
+                    Expr {
+                        kind: Call(format!("{}", op.pretty_name()), vec![lhs, rhs], None),
+                        ty: self.fresh_type(),
+                        loc,
+                    }
                 };
             } else if op == PipeGreaterThan {
                 self.skip();
@@ -260,7 +278,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_unary(&mut self, scope: &Scope) -> FloResult<Expr> {
+    fn parse_unary(&mut self, scope: &mut Scope) -> FloResult<Expr> {
         use ExprKind::*;
 
         let token = self.peek()?;
@@ -283,7 +301,7 @@ impl Parser {
         }
     }
 
-    fn parse_atom(&mut self, scope: &Scope) -> FloResult<Expr> {
+    fn parse_atom(&mut self, scope: &mut Scope) -> FloResult<Expr> {
         use TokenKind::*;
 
         let token = self.peek()?;
@@ -358,11 +376,26 @@ impl Parser {
 
                         Ok(Expr {
                             kind: ExprKind::Var(var_id),
-                            ty: scope.get_var_type(var_id),
+                            ty: self.var_types[var_id].clone(),
                             loc: name_loc,
                         })
                     }
                 }
+            }
+
+            LParen => {
+                let l_paren = self.expect_get(LParen)?;
+                let mut expr = self.parse_expr(-1, scope)?;
+                let r_paren = self.expect_get(RParen)?;
+
+                // Grouping is purely syntactic, so it gets no node (and no type
+                // var) of its own — only the inner expression's span is widened
+                // to cover the parentheses, so errors underline what was written.
+                expr.loc = Loc {
+                    start: l_paren.loc.start,
+                    end: r_paren.loc.end,
+                };
+                Ok(expr)
             }
 
             LCurly => self.parse_scope(scope),
@@ -370,6 +403,8 @@ impl Parser {
             If => self.parse_if_expr(scope),
 
             Return => self.parse_return(scope),
+
+            Let => self.parse_decl(scope),
 
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
@@ -382,12 +417,12 @@ impl Parser {
         let l_curly = self.expect_get(LCurly)?;
 
         // We don't want variables created inside to affect outside
-        let scope = scope.duplicate();
+        let mut scope = scope.duplicate();
 
         let mut exprs = Vec::new();
         let mut tail = None;
         while self.peek_kind()? != RCurly {
-            tail = Some(self.parse_expr(-1, &scope)?);
+            tail = Some(self.parse_expr(-1, &mut scope)?);
 
             if self.expect(Semicolon).is_err() {
                 break;
@@ -418,19 +453,19 @@ impl Parser {
         let if_tok = self.expect_get(If)?;
         let start = if_tok.loc.start;
 
-        // Let/Var is also going to be an expression? thats why we need t duplicate it here as well
-        let scope = &scope.duplicate();
-        let cond = Box::new(self.parse_expr(-1, scope)?);
+        // Variables made in the condition should only be visible inside the then
+        // branch. Such as using the `is` expr
+        let cond_scope = &mut scope.duplicate();
+        let cond = Box::new(self.parse_expr(-1, cond_scope)?);
 
         // Same here
-        let scope = &scope.duplicate();
-        let then = Box::new(self.parse_expr(-1, scope)?);
+        let then = Box::new(self.parse_expr(-1, cond_scope)?);
         let mut end = then.loc.end;
 
         // Same here
         let otherwise = if self.expect(Else).is_ok() {
-            let scope = &scope.duplicate();
-            let otherwise = self.parse_expr(-1, scope)?;
+            let else_scope = &mut scope.duplicate();
+            let otherwise = self.parse_expr(-1, else_scope)?;
             end = otherwise.loc.end;
             Some(Box::new(otherwise))
         } else {
@@ -443,7 +478,7 @@ impl Parser {
         Ok(Expr { kind, ty, loc })
     }
 
-    fn parse_return(&mut self, scope: &Scope) -> FloResult<Expr> {
+    fn parse_return(&mut self, scope: &mut Scope) -> FloResult<Expr> {
         use TokenKind::*;
 
         let ret_tok = self.expect_get(Return)?;
@@ -470,9 +505,55 @@ impl Parser {
         })
     }
 
+    /// Parses `let name [: Type] [= init]`. A declaration is an ordinary
+    /// expression of type `void`, so it may appear anywhere an expression can —
+    /// it just introduces its name into the enclosing scope as a side effect.
+    fn parse_decl(&mut self, scope: &mut Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let let_tok = self.expect_get(Let)?;
+        let start = let_tok.loc.start;
+
+        let name_token = self.expect_get(Ident)?;
+        let TokenValue::String(name) = name_token.value else {
+            unreachable!()
+        };
+        let name_loc = name_token.loc;
+
+        // Without an annotation the variable gets a fresh type var, left for the
+        // initializer (or a later assignment) to pin down.
+        let ty = if self.expect(Colon).is_ok() {
+            self.parse_type()?.0
+        } else {
+            self.fresh_type()
+        };
+
+        // The initializer is parsed against the scope as it stands *before* the
+        // new name is added, so `let a = a;` reads the outer `a` and shadowing
+        // works.
+        let init = if self.expect(Equal).is_ok() {
+            Some(Box::new(self.parse_expr(-1, scope)?))
+        } else {
+            None
+        };
+
+        let end = match &init {
+            Some(init) => init.loc.end,
+            None => name_loc.end,
+        };
+
+        let id = self.fresh_var(name, ty.clone(), scope);
+
+        Ok(Expr {
+            kind: ExprKind::Let(id, ty, init),
+            ty: Type::Void,
+            loc: Loc { start, end },
+        })
+    }
+
     /// Parses an optional parenthesized, comma-separated argument list.
     /// parsing `::<T>` will go in here later.
-    fn parse_call_args(&mut self, scope: &Scope) -> FloResult<Option<(Vec<Expr>, usize)>> {
+    fn parse_call_args(&mut self, scope: &mut Scope) -> FloResult<Option<(Vec<Expr>, usize)>> {
         use TokenKind::*;
 
         if !matches!(self.peek_kind(), Ok(LParen)) {
@@ -579,10 +660,19 @@ impl Parser {
                 loc: loc,
             })
         } else {
-            let id = self.var_iota.next();
-            scope.add_var(name, id, ty);
+            self.fresh_var(name, ty, scope);
             Ok(())
         }
+    }
+
+    /// Registers a new variable and returns its id. Unlike an argument, a `let`
+    /// may reuse a name that is already in scope — that is shadowing, and the
+    /// old id simply stops being reachable by name.
+    fn fresh_var(&mut self, name: String, ty: Type, scope: &mut Scope) -> usize {
+        let id = self.var_types.len();
+        self.var_types.push(ty);
+        scope.add_var(name, id);
+        id
     }
 
     fn fresh_type(&mut self) -> Type {
@@ -814,6 +904,15 @@ fn builtin_op(op: Op, args: Vec<Type>, ret: Type) -> Func {
     }
 }
 
+impl Expr {
+    /// Whether this expression denotes a storage location, and so may appear on
+    /// the left of an `=`. Pointer derefs, indexing and field access join this
+    /// list when they land.
+    fn is_lvalue(&self) -> bool {
+        matches!(self.kind, ExprKind::Var(_))
+    }
+}
+
 impl TokenKind {
     fn is_unary_op(&self) -> bool {
         use TokenKind::*;
@@ -824,6 +923,7 @@ impl TokenKind {
     fn is_binary_op(&self) -> bool {
         use TokenKind::*;
         matches!(self,
+            Equal |
             Plus | Minus | Star | Slash | Percent | Amp | Pipe | Cap | AmpAmp | PipePipe |
             EqualEqual | BangEqual | LessThan | GreaterThan | LessThanEqual | GreaterThanEqual
         )
@@ -833,15 +933,16 @@ impl TokenKind {
         use TokenKind::*;
 
         match self {
-            PipePipe => 0,
-            AmpAmp => 1,
-            Pipe => 2,
-            Cap => 3,
-            Amp => 4,
-            EqualEqual | BangEqual => 5,
-            LessThan | LessThanEqual | GreaterThan | GreaterThanEqual => 6,
-            Minus | Plus => 7,
-            Star | Slash | Percent => 8,
+            Equal => 0,
+            PipePipe => 1,
+            AmpAmp => 2,
+            Pipe => 3,
+            Cap => 4,
+            Amp => 5,
+            EqualEqual | BangEqual => 6,
+            LessThan | LessThanEqual | GreaterThan | GreaterThanEqual => 7,
+            Minus | Plus => 8,
+            Star | Slash | Percent => 9,
             _ => unreachable!("Called TokenKind::precedence(`{self:?}`)"),
         }
     }

@@ -83,6 +83,10 @@ pub enum FloErr {
         possible_tys: Vec<Type>,
         loc: Loc,
     },
+
+    NotAssignable {
+        loc: Loc,
+    },
 }
 
 impl FloErr {
@@ -179,6 +183,10 @@ impl FloErr {
             }
             ExpectedOp { found, loc } => {
                 eprintln!("Expected an operator but found: `{}`", found.pretty_name());
+                print_src(src, &[loc]);
+            }
+            NotAssignable { loc } => {
+                eprintln!("Cannot assign to this expression");
                 print_src(src, &[loc]);
             }
         }
@@ -305,6 +313,7 @@ impl TokenKind {
             TokenKind::If => "if",
             TokenKind::Else => "else",
             TokenKind::Return => "return",
+            TokenKind::Let => "let",
         }
     }
 }

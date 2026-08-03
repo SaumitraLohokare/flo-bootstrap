@@ -58,7 +58,7 @@ while false {
 -- Variables
 {
     let a = 10;
-    var b = {
+    let mut b = {
         let a: i32 = 2;
         a
     };
@@ -72,7 +72,7 @@ while false {
 -- Defer
 {
     let a = 2;
-    var b = 1;
+    let mut b = 1;
     defer b = b * a;
     b = b + 3;
 }
@@ -81,7 +81,7 @@ while false {
 
 -- Pointers
 {
-    var a = 10;
+    let mut a = 10;
     let p = ^a;
     p^ = 3;
     a
@@ -251,7 +251,7 @@ macro println! `(es:[]expr, ...)` = {
 
 ---
 
-for { let iter = list |> iter; var it = iter |> next }; it |> is_some; { it = iter |> next } {
+for { let iter = list |> iter; let mut it = iter |> next }; it |> is_some; { it = iter |> next } {
     let Some(x) = it else unreachable();
 
     -- Continue using x
@@ -359,3 +359,41 @@ fn Vec<T>() -> Vec<T> = Vec<T>::Vec { data: nil, len: 0, cap: 0 };
 --                      ^ this is the full way to make a type
 
 -- It is also ok, because we first check for module, then for a type
+
+---
+
+`is` expression
+
+-- <expr> is <destructure> => returns bool & also creates new variables
+--                            in the scope of the is expr
+
+-- 1.
+type Result = Ok | Err;
+
+if result is Ok {
+} else {
+}
+
+-- 2.
+type Option<T> = Some { T } | None;
+
+if option is Some { value } {
+    -- value is defined here
+} else {
+    -- value not defined here
+}
+
+-- 3.
+fn or_abort(res: bool) -> void
+    = if !res abort("PANIC");
+
+option is Some { val } |> or_abort;
+-- val is defined in this entire scope now
+
+-- NOTE: We might need to give a compiler warning
+-- if the boolean value isn't used
+
+-- 4.
+if option is Some { value } && value |> is_even {
+    -- Use short circuiting properly with `is`
+}
