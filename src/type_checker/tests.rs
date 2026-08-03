@@ -2221,3 +2221,443 @@ fn assigning_to_a_call_result_is_an_error() {
         "expected a not-assignable error, got: {err:?}"
     );
 }
+
+/// The condition and body of a while expression.
+fn while_parts(expr: &Expr) -> (&Expr, &Expr) {
+    match &expr.kind {
+        ExprKind::While(cond, body) => (cond, body),
+        other => panic!("expected a while expression, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// While loops
+//
+// `while cond body` is an expression of type `void` — always, whatever the body
+// contains. The condition must be `bool` and the body must be `void`, since its
+// value is discarded (the same rule an else-less `if` follows). A loop never
+// diverges: the condition may be false on the first check, so control always
+// reaches whatever follows it.
+// --------------------------------------------------------------------------
+
+#[test]
+fn while_is_void() {
+    let module = check_ok("fn main() = while true {};");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.ty, fn_ty(vec![], Type::Void));
+    assert_eq!(main.body.ty, Type::Void);
+    let (cond, body) = while_parts(&main.body);
+    assert!(matches!(cond.kind, ExprKind::Bool(true)));
+    assert_eq!(cond.ty, Type::Bool);
+    assert_eq!(body.ty, Type::Void);
+}
+
+#[test]
+fn while_condition_must_be_bool() {
+    let errs = check_err("fn main() = while 1 {};");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn while_condition_resolves_calls() {
+    let module = check_ok(
+        "
+        fn main() = while cmp(1) {};
+        fn cmp(a: i32) -> bool = true;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (cond, _) = while_parts(&main.body);
+    assert_eq!(resolved_call_name(cond), m("cmp", vec![Type::I32], Type::Bool));
+}
+
+#[test]
+fn while_condition_selects_an_overload_by_bool_result() {
+    // The condition must be bool, which is enough to pick the bool overload.
+    let module = check_ok(
+        "
+        fn main() = while pick(1) {};
+        fn pick(a: i32) -> bool = true;
+        fn pick(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (cond, _) = while_parts(&main.body);
+    assert_eq!(
+        resolved_call_name(cond),
+        m("pick", vec![Type::I32], Type::Bool)
+    );
+}
+
+#[test]
+fn while_body_must_be_void() {
+    // The body's value is discarded, so a body that yields an i32 is rejected.
+    let errs = check_err("fn main() = while true { 1 };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn while_body_with_trailing_semicolon_is_void() {
+    // The same body is fine once the `;` drops the tail.
+    let module = check_ok("fn main() = while true { 1; };");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, body) = while_parts(&main.body);
+    assert_eq!(body.ty, Type::Void);
+    let (stmts, tail) = scope_parts(body);
+    assert_eq!(stmts[0].ty, Type::I32);
+    assert!(tail.is_none());
+}
+
+#[test]
+fn while_body_need_not_be_a_scope() {
+    // The body is an ordinary expression, like the branches of an `if`.
+    let module = check_ok(
+        "
+        fn main() = while true nop();
+        fn nop() = {};
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, body) = while_parts(&main.body);
+    assert_eq!(resolved_call_name(body), m("nop", vec![], Type::Void));
+    assert_eq!(body.ty, Type::Void);
+}
+
+#[test]
+fn while_body_resolves_calls() {
+    let module = check_ok(
+        "
+        fn main() = while true { id(1); };
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, body) = while_parts(&main.body);
+    let (stmts, _) = scope_parts(body);
+    assert_eq!(resolved_call_name(&stmts[0]), m("id", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn while_for_non_void_return_is_an_error() {
+    // A loop yields nothing, so it cannot be the body of an i32 function.
+    let errs = check_err("fn main() -> i32 = while true {};");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn while_sees_enclosing_variables() {
+    let module = check_ok(
+        "
+        fn main() = count(3);
+        fn count(n: i32) = {
+            let i = 0;
+            while i < n {
+                i = i + 1;
+            };
+        };
+        ",
+    );
+    let count = func_sig(&module, "count", vec![Type::I32], Type::Void);
+    let (stmts, _) = scope_parts(&count.body);
+    let i = let_parts(&stmts[0]).0;
+    let (cond, body) = while_parts(&stmts[1]);
+    // The condition reads both the local and the parameter.
+    assert_eq!(
+        resolved_call_name(cond),
+        m("<", vec![Type::I32, Type::I32], Type::Bool)
+    );
+    assert_eq!(var_id(&call_args(cond)[0]), i);
+    // ... and the body assigns to that same local.
+    let (assign_target, _) = assign_parts(&scope_parts(body).0[0]);
+    assert_eq!(var_id(assign_target), i);
+}
+
+#[test]
+fn while_does_not_diverge_the_enclosing_scope() {
+    // Even a body that always breaks leaves the loop itself `void`, so the scope
+    // falls through to `5` and is i32 rather than NoReturn.
+    let module = check_ok("fn main() -> i32 = { while true { break; }; 5 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(main.body.ty, Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts[0].ty, Type::Void);
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn nested_while_loops_resolve() {
+    let module = check_ok("fn main() = while true { while false { break; }; };");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, outer_body) = while_parts(&main.body);
+    let inner = &scope_parts(outer_body).0[0];
+    assert_eq!(inner.ty, Type::Void);
+    let (_, inner_body) = while_parts(inner);
+    assert_eq!(inner_body.ty, Type::Never);
+}
+
+#[test]
+fn return_inside_a_loop_body_is_allowed() {
+    // `return` still leaves the whole function, and it constrains its operand to
+    // the enclosing function's return type from inside the loop.
+    let module = check_ok(
+        "
+        fn main() -> i8 = { while true { return 1; }; 5 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I8);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, body) = while_parts(&stmts[0]);
+    let ret = &scope_parts(body).0[0];
+    assert_eq!(return_value(ret).unwrap().ty, Type::I8);
+}
+
+// --------------------------------------------------------------------------
+// Break & continue
+//
+// Both are `NoReturn`, exactly like `return`, and neither carries a value yet.
+// A body that always jumps therefore diverges — which is accepted by the
+// "body must be void" rule, since NoReturn satisfies any type. Whether they sit
+// inside a loop is checked by the *parser*, so those errors come out before any
+// types exist.
+// --------------------------------------------------------------------------
+
+#[test]
+fn break_and_continue_are_noreturn() {
+    let module = check_ok("fn main() = while true { break; continue; };");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, body) = while_parts(&main.body);
+    let (stmts, tail) = scope_parts(body);
+    assert!(matches!(stmts[0].kind, ExprKind::Break));
+    assert_eq!(stmts[0].ty, Type::Never);
+    assert!(matches!(stmts[1].kind, ExprKind::Continue));
+    assert_eq!(stmts[1].ty, Type::Never);
+    assert!(tail.is_none());
+    // The jumps make the body itself diverge, which still satisfies the loop.
+    assert_eq!(body.ty, Type::Never);
+    assert_eq!(main.body.ty, Type::Void);
+}
+
+#[test]
+fn break_may_be_the_body_tail() {
+    // Without a `;` the `break` is the body's tail expression; it is NoReturn,
+    // which satisfies the void-body rule.
+    let module = check_ok("fn main() = while true { break };");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, body) = while_parts(&main.body);
+    let (_, tail) = scope_parts(body);
+    assert!(matches!(tail.unwrap().kind, ExprKind::Break));
+    assert_eq!(tail.unwrap().ty, Type::Never);
+}
+
+#[test]
+fn break_may_be_the_whole_body() {
+    let module = check_ok("fn main() = while true break;");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (_, body) = while_parts(&main.body);
+    assert!(matches!(body.kind, ExprKind::Break));
+    assert_eq!(body.ty, Type::Never);
+}
+
+#[test]
+fn break_inside_an_if_inside_a_loop_is_ok() {
+    // The else-less `if` is void (control may skip the jump), so the body stays
+    // void rather than diverging.
+    let module = check_ok(
+        "
+        fn main() = cond(true);
+        fn cond(b: bool) = while b { if b { break; }; };
+        ",
+    );
+    let cond = func_sig(&module, "cond", vec![Type::Bool], Type::Void);
+    let (_, body) = while_parts(&cond.body);
+    let if_stmt = &scope_parts(body).0[0];
+    assert_eq!(if_stmt.ty, Type::Void);
+    let (_, then, _) = if_parts(if_stmt);
+    assert_eq!(then.ty, Type::Never);
+    assert_eq!(body.ty, Type::Void);
+}
+
+#[test]
+fn continue_in_a_diverging_if_makes_the_body_diverge() {
+    // With both branches jumping, the `if` — and so the body — is NoReturn.
+    let module = check_ok(
+        "
+        fn main() = cond(true);
+        fn cond(b: bool) = while b { if b { continue } else { break } };
+        ",
+    );
+    let cond = func_sig(&module, "cond", vec![Type::Bool], Type::Void);
+    let (_, body) = while_parts(&cond.body);
+    assert_eq!(body.ty, Type::Never);
+    assert_eq!(cond.body.ty, Type::Void);
+}
+
+#[test]
+fn break_outside_a_loop_is_an_error() {
+    let err = parse_err("fn main() = break;");
+    assert!(
+        matches!(err, FloErr::BreakOutsideLoop { .. }),
+        "expected a break-outside-loop error, got: {err:?}"
+    );
+}
+
+#[test]
+fn continue_outside_a_loop_is_an_error() {
+    let err = parse_err("fn main() = { continue; };");
+    assert!(
+        matches!(err, FloErr::ContinueOutsideLoop { .. }),
+        "expected a continue-outside-loop error, got: {err:?}"
+    );
+}
+
+#[test]
+fn break_after_a_loop_is_an_error() {
+    // The loop only covers its own body: past the closing brace `break` is out
+    // of a loop again.
+    let err = parse_err("fn main() = { while true { break; }; break; };");
+    assert!(
+        matches!(err, FloErr::BreakOutsideLoop { .. }),
+        "expected a break-outside-loop error, got: {err:?}"
+    );
+}
+
+#[test]
+fn break_in_the_loop_condition_is_an_error() {
+    // The condition is evaluated before the body runs, so it is not "inside" the
+    // loop for the purposes of `break`/`continue`.
+    let err = parse_err("fn main() = while break {};");
+    assert!(
+        matches!(err, FloErr::BreakOutsideLoop { .. }),
+        "expected a break-outside-loop error, got: {err:?}"
+    );
+}
+
+#[test]
+fn break_with_a_value_is_a_parse_error() {
+    // `break` takes no operand yet, so the `1` is left dangling.
+    let err = parse_err("fn main() = while true { break 1; };");
+    assert!(
+        matches!(err, FloErr::ExpectedTokenNotFound { .. }),
+        "expected a missing-token error, got: {err:?}"
+    );
+}
+
+/// The body of a defer expression.
+fn defer_body(expr: &Expr) -> &Expr {
+    match &expr.kind {
+        ExprKind::Defer(body) => body,
+        other => panic!("expected a defer expression, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// Defer
+//
+// `defer <body>` is an expression of type `void`. The body is checked like any
+// other expression, but nothing constrains its type: wherever it ends up
+// running its value is discarded. What the checker does *not* do is move it —
+// that is the `lower` pass, which runs afterwards and has its own tests.
+// --------------------------------------------------------------------------
+
+#[test]
+fn defer_is_void() {
+    let module = check_ok("fn main() = { defer 1; };");
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(main.body.ty, Type::Void);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts[0].ty, Type::Void);
+    assert!(tail.is_none());
+}
+
+#[test]
+fn deferred_value_is_discarded() {
+    // `inc` yields an i32; deferring the call is fine, the value goes nowhere.
+    let module = check_ok(
+        "
+        fn main() = { defer inc(1); };
+        fn inc(a: i32) -> i32 = a;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let body = defer_body(&stmts[0]);
+    assert_eq!(
+        resolved_call_name(body),
+        m("inc", vec![Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn deferred_body_is_still_checked() {
+    let errs = check_err("fn main() = { defer nope(); };");
+    assert_err!(errs, FloErr::UndefinedFunction { .. });
+}
+
+#[test]
+fn deferred_body_resolves_overloads() {
+    let module = check_ok(
+        "
+        fn main() = { let a = 0; defer a = a + 1; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let ExprKind::Assign(_, value) = &defer_body(&stmts[1]).kind else {
+        unreachable!("expected the deferred assignment")
+    };
+    assert_eq!(
+        resolved_call_name(value),
+        m("+", vec![Type::I32, Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn defer_does_not_make_its_scope_take_the_body_type() {
+    // The scope's type still comes from its tail, not from the deferred body.
+    let module = check_ok("fn main() -> bool = { defer 1; true };");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(main.body.ty, Type::Bool);
+}
+
+#[test]
+fn a_deferred_return_diverges_its_scope() {
+    // The body runs on every path out of the scope, so the scope cannot be left
+    // normally — the same answer its lowered form would get.
+    let module = check_ok("fn main() -> i32 = { defer return 1; };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, _) = scope_parts(&main.body);
+    assert_eq!(stmts[0].ty, Type::Void);
+    assert_eq!(return_value(defer_body(&stmts[0])).unwrap().ty, Type::I32);
+}
+
+#[test]
+fn a_deferred_return_type_must_match() {
+    let errs = check_err("fn main() -> i32 = { defer return true; };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn defer_sees_only_what_was_in_scope_where_it_was_written() {
+    // The body is parsed against the scope at the `defer`, not at the point it
+    // will run, so a variable declared below it is not visible.
+    let err = parse_err("fn main() = { defer id(a); let a = 1; };");
+    assert!(
+        matches!(err, FloErr::UndefinedIdentifier { .. }),
+        "expected an undefined-identifier error, got: {err:?}"
+    );
+}
+
+#[test]
+fn defer_in_a_loop_body_may_break() {
+    // `defer` does not change what counts as being inside the loop.
+    check_ok("fn main() = { while true { defer break; }; };");
+}
+
+#[test]
+fn defer_outside_a_loop_may_not_break() {
+    let err = parse_err("fn main() = { defer break; };");
+    assert!(
+        matches!(err, FloErr::BreakOutsideLoop { .. }),
+        "expected a break-outside-loop error, got: {err:?}"
+    );
+}

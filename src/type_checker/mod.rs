@@ -91,7 +91,10 @@ impl TypeChecker {
         }
 
         if errs.is_empty() {
-            Ok(Module { funcs: new_funcs })
+            Ok(Module {
+                funcs: new_funcs,
+                var_count: module.var_count,
+            })
         } else {
             Err(errs)
         }
@@ -232,6 +235,25 @@ impl TypeChecker {
                     out.push(Constraint::IsEqual(Void, expr.ty.clone(), expr.loc));
                 }
             }
+            While(cond, body) => {
+                self.collect_expr_constraints(cond, ret_ty, out);
+                out.push(Constraint::IsEqual(Type::Bool, cond.ty.clone(), cond.loc));
+
+                self.collect_expr_constraints(body, ret_ty, out);
+                // The body's value is discarded, so it has to be void — the same
+                // rule an else-less `if` follows. A body that diverges (`break`,
+                // `continue`, `return`) is NoReturn, which this constraint accepts.
+                out.push(Constraint::IsEqual(Void, body.ty.clone(), body.loc));
+
+                // The loop's own type is already void (set by the parser), and it
+                // never diverges: the condition may be false on the first check,
+                // so control can always reach the expression after it.
+            }
+            Break | Continue => {
+                // Both are NoReturn (set by the parser) and carry no operand, so
+                // there is nothing to constrain. Which loop they belong to was
+                // already checked while parsing.
+            }
             Return(value) => {
                 match value {
                     Some(e) => {
@@ -291,6 +313,15 @@ impl TypeChecker {
                         expr.loc,
                     ));
                 }
+            }
+            Defer(body) => {
+                // The body still has to check on its own, but nothing constrains
+                // its type: wherever it ends up running its value is discarded,
+                // exactly as a statement's is.
+                self.collect_expr_constraints(body, ret_ty, out);
+
+                // The `defer` itself is `void` (set by the parser), so it needs
+                // no constraint either.
             }
         }
     }
@@ -525,17 +556,26 @@ fn prune(
 /// which is emitted for exactly the expressions this returns true for, so this
 /// gives the same answer the old solver-consulting check did — without needing
 /// the solver to have run first.
-fn diverges(expr: &Expr) -> bool {
+pub fn diverges(expr: &Expr) -> bool {
     use ExprKind::*;
 
     match &expr.kind {
-        // The parser types `return` as NoReturn directly.
-        Return(_) => true,
+        // The parser types `return`, `break` and `continue` as NoReturn directly.
+        Return(_) | Break | Continue => true,
         Scope(stmts, tail) => stmts.iter().any(diverges) || tail.as_deref().is_some_and(diverges),
         // Both branches must diverge; with no `else` control can skip `then`.
         If(_, then, Some(otherwise)) => diverges(then) && diverges(otherwise),
+        // A loop never diverges, however its body is written: the condition may
+        // be false on the first check, so control always reaches what follows.
+        // Spotting that `while true` cannot exit would need real flow analysis.
+        While(..) => false,
         Let(_, _, init) => init.as_deref().is_some_and(diverges),
         Assign(target, value) => diverges(target) || diverges(value),
+        // A deferred body runs on every path out of its scope, so a scope
+        // holding a diverging `defer` cannot be left normally either. Saying so
+        // here keeps the type the checker gives a scope equal to the type its
+        // lowered form would get.
+        Defer(body) => diverges(body),
         _ => false,
     }
 }
@@ -635,6 +675,10 @@ impl Expr {
                 };
                 If(cond, then, otherwise)
             }
+            While(cond, body) => While(
+                Box::new(cond.resolve(set, res)?),
+                Box::new(body.resolve(set, res)?),
+            ),
             Return(value) => {
                 let new_value = match value {
                     Some(e) => Some(Box::new(e.resolve(set, res)?)),
@@ -664,12 +708,15 @@ impl Expr {
                 Box::new(target.resolve(set, res)?),
                 Box::new(value.resolve(set, res)?),
             ),
+            Defer(body) => Defer(Box::new(body.resolve(set, res)?)),
 
             Num(n) => Num(*n),
             Flt(n) => Flt(*n),
             Bool(n) => Bool(*n),
             Var(v) => Var(*v),
             BuiltinOp(op) => BuiltinOp(*op),
+            Break => Break,
+            Continue => Continue,
         };
 
         Ok(Expr { kind, ty, loc })

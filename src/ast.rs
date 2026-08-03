@@ -5,6 +5,10 @@ use crate::{tokenizer::Loc, types::Type};
 #[derive(Clone)]
 pub struct Module {
     pub funcs: HashMap<String, Vec<Func>>,
+
+    /// How many variable ids the parser handed out. Lowering mints its own
+    /// temporaries from here on, so they cannot collide with a source variable.
+    pub var_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -39,8 +43,18 @@ pub enum ExprKind {
     // If(cond, then, else)
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
 
+    // While(cond, body) - always void typed. The body's value is discarded, so
+    // it must be void too; a `while` never diverges, because the condition may
+    // be false on the first check.
+    While(Box<Expr>, Box<Expr>),
+
     // Return(value) - always NoReturn typed; `value` is absent for a bare `return`
     Return(Option<Box<Expr>>),
+
+    // Break / Continue - always NoReturn typed, like `Return`. Neither carries a
+    // value yet. The parser rejects them outside a loop body.
+    Break,
+    Continue,
 
     // Let(var_id, var_ty, init) - always void typed. `var_ty` is the variable's
     // own type: the annotation if it had one, else a fresh type var shared with
@@ -51,6 +65,13 @@ pub enum ExprKind {
     // Assign(target, value) - yields the value of `value`, like C. `target` must
     // be an l-value (see `Expr::is_lvalue`).
     Assign(Box<Expr>, Box<Expr>),
+
+    // Defer(body) - always void typed. `body` does NOT run here: it runs when
+    // control leaves the nearest enclosing scope, by whichever path. The node
+    // stays where it was written because that position decides which exits it
+    // is live at; `lower` is what actually moves the body, after which no
+    // `Defer` survives.
+    Defer(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +176,14 @@ impl Expr {
                     otherwise
                 )
             }
+            ExprKind::While(cond, body) => format!(
+                "{indent}while:{:?} {} {}",
+                self.ty,
+                cond.pretty_print(indent_amt),
+                body.pretty_print(indent_amt),
+            ),
+            ExprKind::Break => format!("{indent}break:{:?}", self.ty),
+            ExprKind::Continue => format!("{indent}continue:{:?}", self.ty),
             ExprKind::Return(value) => match value {
                 Some(e) => format!("{indent}return {}:{:?}", e.pretty_print(0), self.ty),
                 None => format!("{indent}return:{:?}", self.ty),
@@ -172,6 +201,7 @@ impl Expr {
                 value.pretty_print(0),
                 self.ty
             ),
+            ExprKind::Defer(body) => format!("{indent}defer {}", body.pretty_print(0)),
         }
     }
 }

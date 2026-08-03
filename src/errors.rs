@@ -87,6 +87,14 @@ pub enum FloErr {
     NotAssignable {
         loc: Loc,
     },
+
+    BreakOutsideLoop {
+        loc: Loc,
+    },
+
+    ContinueOutsideLoop {
+        loc: Loc,
+    },
 }
 
 impl FloErr {
@@ -187,6 +195,14 @@ impl FloErr {
             }
             NotAssignable { loc } => {
                 eprintln!("Cannot assign to this expression");
+                print_src(src, &[loc]);
+            }
+            BreakOutsideLoop { loc } => {
+                eprintln!("`break` outside of a loop");
+                print_src(src, &[loc]);
+            }
+            ContinueOutsideLoop { loc } => {
+                eprintln!("`continue` outside of a loop");
                 print_src(src, &[loc]);
             }
         }
@@ -312,7 +328,11 @@ impl TokenKind {
             TokenKind::RCurly => "}",
             TokenKind::If => "if",
             TokenKind::Else => "else",
+            TokenKind::While => "while",
+            TokenKind::Break => "break",
+            TokenKind::Continue => "continue",
             TokenKind::Return => "return",
+            TokenKind::Defer => "defer",
             TokenKind::Let => "let",
         }
     }

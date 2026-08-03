@@ -47,6 +47,10 @@ pub struct Parser {
     var_types: Vec<Type>,
     type_iota: Iota,
 
+    /// How many `while` bodies enclose the expression being parsed. `break` and
+    /// `continue` are only legal when this is non-zero.
+    loop_depth: usize,
+
     funcs: HashMap<String, Vec<Func>>,
 }
 
@@ -57,6 +61,7 @@ impl Parser {
             idx: 0,
             var_types: Vec::new(),
             type_iota: Iota::new(),
+            loop_depth: 0,
             funcs: HashMap::new(),
         }
     }
@@ -81,7 +86,10 @@ impl Parser {
 
         match self.funcs.entry("main".to_string()).or_default().len() {
             0 => Err(FloErr::MainFunctionNotFound),
-            1 => Ok(Module { funcs: self.funcs }),
+            1 => Ok(Module {
+                funcs: self.funcs,
+                var_count: self.var_types.len(),
+            }),
             _ => Err(FloErr::MultipleMainFunction),
         }
     }
@@ -402,9 +410,15 @@ impl Parser {
 
             If => self.parse_if_expr(scope),
 
+            While => self.parse_while_expr(scope),
+
+            Break | Continue => self.parse_loop_jump(),
+
             Return => self.parse_return(scope),
 
             Let => self.parse_decl(scope),
+
+            Defer => self.parse_defer(scope),
 
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
@@ -478,6 +492,68 @@ impl Parser {
         Ok(Expr { kind, ty, loc })
     }
 
+    /// Parses `while <cond> <body>`. A loop yields no value, so — like a `let` —
+    /// its type is `void` outright rather than a fresh type var: there is nothing
+    /// for the checker to infer, and it never diverges (the condition may be
+    /// false on the very first check).
+    fn parse_while_expr(&mut self, scope: &Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let while_tok = self.expect_get(While)?;
+        let start = while_tok.loc.start;
+
+        // As with `if`, variables introduced by the condition (via a future `is`
+        // expr) are visible in the body but not after the loop.
+        let cond_scope = &mut scope.duplicate();
+        let cond = Box::new(self.parse_expr(-1, cond_scope)?);
+
+        // Only the body counts as being "inside" the loop: the condition is
+        // evaluated before each iteration, so a `break` there has nothing to
+        // jump out of yet.
+        self.loop_depth += 1;
+        let body = self.parse_expr(-1, cond_scope);
+        self.loop_depth -= 1;
+        let body = Box::new(body?);
+
+        let loc = Loc {
+            start,
+            end: body.loc.end,
+        };
+        Ok(Expr {
+            kind: ExprKind::While(cond, body),
+            ty: Type::Void,
+            loc,
+        })
+    }
+
+    /// Parses a bare `break` or `continue`. Both are NoReturn, like `return`, and
+    /// neither takes an operand yet.
+    fn parse_loop_jump(&mut self) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let tok = self.peek()?.clone();
+        self.skip();
+
+        if self.loop_depth == 0 {
+            return Err(match tok.kind {
+                Break => FloErr::BreakOutsideLoop { loc: tok.loc },
+                _ => FloErr::ContinueOutsideLoop { loc: tok.loc },
+            });
+        }
+
+        let kind = if tok.kind == Break {
+            ExprKind::Break
+        } else {
+            ExprKind::Continue
+        };
+
+        Ok(Expr {
+            kind,
+            ty: Type::Never,
+            loc: tok.loc,
+        })
+    }
+
     fn parse_return(&mut self, scope: &mut Scope) -> FloResult<Expr> {
         use TokenKind::*;
 
@@ -546,6 +622,30 @@ impl Parser {
 
         Ok(Expr {
             kind: ExprKind::Let(id, ty, init),
+            ty: Type::Void,
+            loc: Loc { start, end },
+        })
+    }
+
+    /// Parses `defer <expr>`. Like a `let`, the statement itself is `void` and so
+    /// may sit anywhere an expression can — it just registers its body to run
+    /// when control leaves the nearest enclosing scope. `defer` takes the whole
+    /// remaining expression, so `defer f() + g()` defers `f() + g()`.
+    ///
+    /// The body is parsed against the scope as it stands here, not as it stands
+    /// where the body will end up running, so it can only name variables that
+    /// were already visible at the `defer`.
+    fn parse_defer(&mut self, scope: &mut Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let defer_tok = self.expect_get(Defer)?;
+        let start = defer_tok.loc.start;
+
+        let body = self.parse_expr(-1, scope)?;
+        let end = body.loc.end;
+
+        Ok(Expr {
+            kind: ExprKind::Defer(Box::new(body)),
             ty: Type::Void,
             loc: Loc { start, end },
         })

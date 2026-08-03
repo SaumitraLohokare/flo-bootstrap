@@ -8,7 +8,13 @@ pub enum TokenKind {
     If,
     Else,
 
+    While,
+    Break,
+    Continue,
+
     Return,
+
+    Defer,
 
     True,
     False,
@@ -181,7 +187,11 @@ impl Tokenizer {
             "let" => TokenKind::Let,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            "while" => TokenKind::While,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
             "return" => TokenKind::Return,
+            "defer" => TokenKind::Defer,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
 
