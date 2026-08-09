@@ -3,6 +3,10 @@ pub enum TokenKind {
     Fn,
     Op,
 
+    TypeKw,
+
+    Use,
+
     Let,
 
     If,
@@ -13,8 +17,6 @@ pub enum TokenKind {
     Continue,
 
     Return,
-
-    Defer,
 
     True,
     False,
@@ -29,7 +31,9 @@ pub enum TokenKind {
     RCurly,
 
     Colon,
+    ColonColon,
     Comma,
+    Dot,
     Arrow,
 
     PipeGreaterThan,
@@ -116,8 +120,14 @@ impl Tokenizer {
                 '{' => tokens.push(self.tokenize_symbol("{", TokenKind::LCurly)),
                 '}' => tokens.push(self.tokenize_symbol("}", TokenKind::RCurly)),
 
+                ':' if self.peek_n(1) == Some(':') => {
+                    tokens.push(self.tokenize_symbol("::", TokenKind::ColonColon))
+                }
                 ':' => tokens.push(self.tokenize_symbol(":", TokenKind::Colon)),
                 ',' => tokens.push(self.tokenize_symbol(",", TokenKind::Comma)),
+                // A `.` that starts a number was already eaten by
+                // `tokenize_number`, so anything reaching here is field access.
+                '.' => tokens.push(self.tokenize_symbol(".", TokenKind::Dot)),
 
                 '=' if self.peek_n(1) == Some('=') => {
                     tokens.push(self.tokenize_symbol("==", TokenKind::EqualEqual))
@@ -184,6 +194,8 @@ impl Tokenizer {
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
             "op" => TokenKind::Op,
+            "type" => TokenKind::TypeKw,
+            "use" => TokenKind::Use,
             "let" => TokenKind::Let,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
@@ -191,7 +203,6 @@ impl Tokenizer {
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
             "return" => TokenKind::Return,
-            "defer" => TokenKind::Defer,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
 

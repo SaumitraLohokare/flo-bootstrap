@@ -1,14 +1,21 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use crate::{
-    ast::{Expr, ExprKind, Func, Module},
+    ast::{Expr, ExprKind, FieldInit, Func, Module, Statement, StmtKind},
     errors::{FloErr, FloResult},
     tokenizer::Loc,
     type_checker::replace_set::ReplaceSet,
-    types::Type,
+    types::{Type, TypeCase, TypeTable},
+    util::Iota,
 };
 
+mod decls;
 mod replace_set;
+
+pub use decls::check_type_decls;
 
 #[cfg(test)]
 mod tests;
@@ -29,78 +36,261 @@ enum Constraint {
 
     /// A call whose overload has not been pinned down yet.
     Call(CallConstraint),
+
+    /// A field access whose receiver type is not known yet.
+    Field(FieldConstraint),
+}
+
+/// `recv.field`, waiting for `recv` to become something with fields.
+#[derive(Debug)]
+struct FieldConstraint {
+    /// Raw type-var id of the access expression, the same way a call is
+    /// identified. `T(key)` is the field's type.
+    key: usize,
+    recv: Type,
+    field: String,
+    loc: Loc,
+    /// Whether the field's type has been bound yet. The constraint is kept
+    /// either way: an open receiver can gain cases after this resolved, and the
+    /// final check has to see the receiver as it ended up.
+    bound: bool,
 }
 
 #[derive(Debug)]
 struct CallConstraint {
     /// Raw type-var id of the call expression. Every `Call` gets a fresh type
-    /// var from the parser and nothing clones an `Expr` before type checking,
-    /// so this uniquely identifies the call site: it is the key the chosen
-    /// overload is recorded under, and `T(key)` is the call's return type.
+    /// var from the parser, and a generic body is only ever copied *whole* into
+    /// a separately-solved instantiation, so within one solve this uniquely
+    /// identifies the call site: it is the key the chosen overload is recorded
+    /// under, and `T(key)` is the call's return type.
     key: usize,
     name: String,
     args: Vec<(Type, Loc)>,
+    /// Type arguments written explicitly with a turbofish. Empty otherwise.
+    type_args: Vec<Type>,
     loc: Loc,
-    /// Indices into `func_types[name]` that are still compatible. `None` until
-    /// the first solver round so that an undefined function is reported while
-    /// solving rather than while collecting — that keeps a type mismatch
-    /// anywhere in the function winning over an undefined call, as before.
-    cands: Option<Vec<usize>>,
+    /// The overloads that are still compatible. `None` until the first solver
+    /// round so that an undefined function is reported while solving rather
+    /// than while collecting — that keeps a type mismatch anywhere in the
+    /// function winning over an undefined call, as before.
+    cands: Option<Vec<Candidate>>,
 }
 
+/// One overload still in the running at a call site.
+#[derive(Debug, Clone)]
+struct Candidate {
+    /// Which overload of the name this is: an index into `schemes[name]`.
+    idx: usize,
+    /// The scheme's signature with its type parameters replaced — by the
+    /// turbofish arguments if there were any, otherwise by fresh variables for
+    /// the solver to pin down. Identical to the scheme's signature when the
+    /// overload isn't generic.
+    sig: Type,
+    /// What each type parameter was replaced with, in declaration order. Empty
+    /// when the overload isn't generic.
+    type_args: Vec<Type>,
+}
+
+/// A function signature, plus the type parameters quantified over it. A
+/// non-generic function is just a scheme with no parameters.
+#[derive(Debug, Clone)]
+struct Scheme {
+    ty: Type,
+    /// Name and type variable id of each parameter, in declaration order. The
+    /// name is only ever used to say which one couldn't be inferred.
+    type_params: Vec<(String, usize)>,
+}
+
+impl Scheme {
+    fn is_generic(&self) -> bool {
+        !self.type_params.is_empty()
+    }
+}
+
+/// One function still to be type checked: an overload of `name`, at
+/// `type_args` if it is generic.
+#[derive(Debug, Clone)]
+struct WorkItem {
+    name: String,
+    /// Index into `schemes[name]` / `module.funcs[name]`.
+    idx: usize,
+    type_args: Vec<Type>,
+    /// The call site that asked for this instantiation, for error context.
+    /// Absent for the non-generic functions the queue is seeded with.
+    requested_at: Option<Loc>,
+}
+
+/// The overload a call site committed to.
+///
+/// The mangled name is *not* stored: at commit time a generic's type arguments
+/// may still be unbound, so the name is built in [`Expr::resolve`], once the
+/// solver has settled and `sig` resolves to something concrete.
+#[derive(Debug, Clone)]
+struct Resolution {
+    name: String,
+    /// Index into `schemes[name]`, so an instantiation can name the exact
+    /// overload it came from even when two of them share a signature.
+    idx: usize,
+    /// The instantiated signature, still in terms of solver variables.
+    sig: Type,
+    /// The chosen type arguments, in declaration order. Empty for a
+    /// non-generic overload.
+    type_args: Vec<Type>,
+    loc: Loc,
+}
+
+/// How many distinct instantiations of one generic function are allowed before
+/// we assume it is instantiating itself without a base case. Nothing legitimate
+/// comes close; this only exists so the queue cannot spin forever.
+const MONOMORPHIZATION_LIMIT: usize = 256;
+
 pub struct TypeChecker {
-    func_types: HashMap<String, Vec<Type>>,
+    schemes: HashMap<String, Vec<Scheme>>,
+    /// Every declared type. Shared with the solver, which needs it to unify an
+    /// open literal type with the declaration it belongs to.
+    types: Rc<TypeTable>,
+    /// Hands out type variables for instantiating generics, seeded past every
+    /// id the parser used so the two cannot collide.
+    fresh: Iota,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
         Self {
-            func_types: HashMap::new(),
+            schemes: HashMap::new(),
+            types: Rc::new(TypeTable::new()),
+            fresh: Iota::new(),
         }
     }
 
+    /// Type check every function that the program can actually reach.
+    ///
+    /// Non-generic functions are all checked. A generic one never is, as
+    /// written — it has no single type, so there is nothing to check. It is
+    /// checked once per instantiation instead, after its type parameters have
+    /// been substituted away, which is why checking is a worklist rather than a
+    /// loop: checking one function can discover instantiations that need
+    /// checking themselves.
     pub fn check(mut self, module: Module) -> Result<Module, Vec<FloErr>> {
+        self.fresh = Iota::seeded(module.type_var_count);
+        self.types = Rc::new(module.types.clone());
+
+        // Nothing below can say anything sensible about a type that does not
+        // exist or has no size, so these come first and on their own.
+        let errs = check_type_decls(&module);
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+
         for (name, funcs) in &module.funcs {
-            self.func_types.insert(
-                name.clone(),
-                funcs.iter().map(|f| f.ty.clone()).collect::<Vec<_>>(),
-            );
+            let schemes = funcs
+                .iter()
+                .map(|f| Scheme {
+                    ty: f.ty.clone(),
+                    type_params: f.type_params.clone(),
+                })
+                .collect();
+            self.schemes.insert(name.clone(), schemes);
+        }
+
+        // Seed with every non-generic function. Generic ones enter the queue
+        // only when something calls them.
+        let mut queue: Vec<WorkItem> = Vec::new();
+        for (name, funcs) in &module.funcs {
+            for (idx, func) in funcs.iter().enumerate() {
+                if func.type_params.is_empty() {
+                    queue.push(WorkItem {
+                        name: name.clone(),
+                        idx,
+                        type_args: Vec::new(),
+                        requested_at: None,
+                    });
+                }
+            }
         }
 
         let mut errs = Vec::new();
         let mut new_funcs: HashMap<String, Vec<Func>> = HashMap::new();
-        for (name, funcs) in &module.funcs {
-            for func in funcs {
-                match self.check_func(func) {
-                    Ok(func) => {
-                        let mangled_name = mangle_name(&func.ty, name);
-                        if !new_funcs.contains_key(&mangled_name) {
-                            new_funcs.entry(mangled_name).or_default().push(func);
-                        } else {
-                            let previous_loc = new_funcs.get(&mangled_name).unwrap()[0].loc;
-                            errs.push(FloErr::AmbiguousOverload {
-                                name: name.clone(),
-                                found_loc: func.loc,
-                                previous_loc,
-                            });
-                        }
-                    }
-                    Err(err) => errs.push(err),
+        // Keyed by the exact source function and instantiation, not by the
+        // mangled name: two overloads may legitimately share a signature (see
+        // `overload_error`), and both still have to be checked.
+        let mut done: HashSet<(String, usize, Vec<Type>)> = HashSet::new();
+        let mut instantiations: HashMap<String, usize> = HashMap::new();
+
+        while let Some(item) = queue.pop() {
+            let key = (item.name.clone(), item.idx, item.type_args.clone());
+            if !done.insert(key) {
+                continue;
+            }
+
+            let generic = &module.funcs[&item.name][item.idx];
+
+            if !item.type_args.is_empty() {
+                let count = instantiations.entry(item.name.clone()).or_insert(0);
+                *count += 1;
+                if *count > MONOMORPHIZATION_LIMIT {
+                    errs.push(FloErr::MonomorphizationLimit {
+                        name: item.name.clone(),
+                        limit: MONOMORPHIZATION_LIMIT,
+                        loc: item.requested_at.unwrap_or(generic.loc),
+                    });
+                    break;
                 }
             }
+
+            let subst = generic
+                .type_params
+                .iter()
+                .map(|(_, id)| *id)
+                .zip(item.type_args.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            let func = generic.instantiate(&subst);
+
+            let mut requested = Vec::new();
+            match self.check_func(&func, &mut requested) {
+                // Two functions may share a mangled name: declaring the same
+                // signature twice is not an error in itself, it just makes
+                // every call to it undecidable. That is reported at the call
+                // site, by `overload_error`.
+                Ok(func) => new_funcs
+                    .entry(mangle_name(&func.ty, &item.name))
+                    .or_default()
+                    .push(func),
+                Err(err) => errs.push(match item.requested_at {
+                    Some(call_loc) => FloErr::InGenericInstantiation {
+                        name: item.name.clone(),
+                        type_args: item.type_args.clone(),
+                        call_loc,
+                        cause: Box::new(err),
+                    },
+                    None => err,
+                }),
+            }
+
+            queue.extend(requested);
         }
 
         if errs.is_empty() {
             Ok(Module {
                 funcs: new_funcs,
+                types: module.types,
+                uses: module.uses,
                 var_count: module.var_count,
+                type_var_count: self.fresh.count(),
             })
         } else {
             Err(errs)
         }
     }
 
-    fn check_func(&self, func: &Func) -> FloResult<Func> {
+    /// Check one concrete function, appending any generic instantiations its
+    /// calls asked for to `requested`.
+    fn check_func(&mut self, func: &Func, requested: &mut Vec<WorkItem>) -> FloResult<Func> {
+        debug_assert!(
+            func.type_params.is_empty(),
+            "check_func on an uninstantiated generic"
+        );
+
         // 1. Collect every constraint in a single AST pass.
 
         let mut constraints = Vec::new();
@@ -110,16 +300,17 @@ impl TypeChecker {
 
         let (mut set, resolutions) = self.solve(constraints)?;
 
-        // 3. Rebuild the func with concrete types and resolved call names.
+        // 3. Rebuild the func with concrete types and resolved call names,
+        //    noting which generics that pinned down along the way.
 
-        func.resolve(&mut set, &resolutions)
+        func.resolve(&mut set, &resolutions, requested, &self.schemes)
     }
 
     // ----------------------------------------------------------------------
     // Collection
     // ----------------------------------------------------------------------
 
-    fn collect_func_constraints(&self, func: &Func, out: &mut Vec<Constraint>) {
+    fn collect_func_constraints(&mut self, func: &Func, out: &mut Vec<Constraint>) {
         // Constraints for argument types are not added, because they're already
         // concrete types
         let Type::Fn(_arg_tys, ret_ty) = &func.ty else {
@@ -142,7 +333,7 @@ impl TypeChecker {
     /// list can be solved in order in one pass: by the time a parent's
     /// constraint is reached, a diverging child has already been pinned to
     /// `NoReturn` and the parent's constraint correctly becomes a no-op.
-    fn collect_expr_constraints(&self, expr: &Expr, ret_ty: &Type, out: &mut Vec<Constraint>) {
+    fn collect_expr_constraints(&mut self, expr: &Expr, ret_ty: &Type, out: &mut Vec<Constraint>) {
         use ExprKind::*;
         use Type::*;
 
@@ -153,7 +344,7 @@ impl TypeChecker {
                 out.push(Constraint::IsEqual(Type::Bool, expr.ty.clone(), expr.loc))
             }
             BuiltinOp(_) | Var(_) => {}
-            Call(name, arg_exprs, _) => {
+            Call(name, type_args, arg_exprs, _) => {
                 for arg_expr in arg_exprs {
                     self.collect_expr_constraints(arg_expr, ret_ty, out);
                 }
@@ -172,13 +363,14 @@ impl TypeChecker {
                         .iter()
                         .map(|arg| (arg.ty.clone(), arg.loc))
                         .collect(),
+                    type_args: type_args.clone(),
                     loc: expr.loc,
                     cands: None,
                 }));
             }
             Scope(stmts, tail) => {
                 for stmt in stmts {
-                    self.collect_expr_constraints(stmt, ret_ty, out);
+                    self.collect_stmt_constraints(stmt, ret_ty, out);
                 }
                 if let Some(tail) = tail {
                     self.collect_expr_constraints(tail, ret_ty, out);
@@ -269,30 +461,75 @@ impl TypeChecker {
                 // The `return` expression's own type is already NoReturn (set by
                 // the parser), so it needs no constraint here.
             }
-            Let(_, var_ty, init) => {
-                if let Some(init) = init {
-                    self.collect_expr_constraints(init, ret_ty, out);
-
-                    if diverges(init) {
-                        // `let x = return 1;` — nothing ever flows into `x`, so
-                        // pin it rather than leaving it unresolvable (the
-                        // equality below would be a no-op against NoReturn).
-                        out.push(Constraint::Diverges(var_ty.clone(), init.loc));
-                    } else {
-                        out.push(Constraint::IsEqual(
-                            var_ty.clone(),
-                            init.ty.clone(),
-                            init.loc,
-                        ));
-                    }
+            CaseLit(qualifier, case, fields) => {
+                for field in fields {
+                    self.collect_expr_constraints(&field.value, ret_ty, out);
                 }
 
-                // `let x;` pushes nothing at all: the variable keeps its fresh
-                // type var for a later assignment to bind. If nothing ever does,
-                // `resolve` reports it at the declaration.
-                //
-                // The declaration's own type is `void` (set by the parser), so it
-                // needs no constraint either.
+                if diverges(expr) {
+                    // A field's value diverging means the literal is never
+                    // built, so there is no type to pin it to.
+                    out.push(Constraint::Diverges(expr.ty.clone(), expr.loc));
+                    return;
+                }
+
+                // The literal names a case, not a type. All it says is that
+                // whatever this is, it has *this* case with *these* fields —
+                // which type that makes it is left to unification.
+                let known = TypeCase::new(
+                    case.clone(),
+                    fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.value.ty.clone()))
+                        .collect(),
+                );
+                out.push(Constraint::IsEqual(
+                    expr.ty.clone(),
+                    Type::SomeType(vec![known]),
+                    expr.loc,
+                ));
+
+                // A qualifier says outright which type it is, so it is just one
+                // more equality — and the check above is what validates it.
+                if let Some((name, args)) = qualifier {
+                    // No turbofish does not mean "no type arguments": in
+                    // `Option::Some { val: 0 }` the argument is simply left to
+                    // inference, so it gets a fresh variable per parameter of
+                    // the declaration. An undeclared name has no parameters to
+                    // count and is reported by the declaration check.
+                    let args = if args.is_empty() {
+                        let arity = self.types.get(name).map_or(0, |d| d.type_params.len());
+                        (0..arity).map(|_| Type::T(self.fresh.next())).collect()
+                    } else {
+                        args.clone()
+                    };
+
+                    out.push(Constraint::IsEqual(
+                        expr.ty.clone(),
+                        Type::User(name.clone(), args),
+                        expr.loc,
+                    ));
+                }
+            }
+            Field(recv, name) => {
+                self.collect_expr_constraints(recv, ret_ty, out);
+
+                if diverges(recv) {
+                    out.push(Constraint::Diverges(expr.ty.clone(), expr.loc));
+                    return;
+                }
+
+                let Type::T(key) = expr.ty else {
+                    unreachable!("field access without a fresh type var")
+                };
+
+                out.push(Constraint::Field(FieldConstraint {
+                    key,
+                    recv: recv.ty.clone(),
+                    field: name.clone(),
+                    loc: expr.loc,
+                    bound: false,
+                }));
             }
             Assign(target, value) => {
                 self.collect_expr_constraints(target, ret_ty, out);
@@ -314,14 +551,45 @@ impl TypeChecker {
                     ));
                 }
             }
-            Defer(body) => {
-                // The body still has to check on its own, but nothing constrains
-                // its type: wherever it ends up running its value is discarded,
-                // exactly as a statement's is.
-                self.collect_expr_constraints(body, ret_ty, out);
+        }
+    }
 
-                // The `defer` itself is `void` (set by the parser), so it needs
-                // no constraint either.
+    fn collect_stmt_constraints(
+        &mut self,
+        stmt: &Statement,
+        ret_ty: &Type,
+        out: &mut Vec<Constraint>,
+    ) {
+        match &stmt.kind {
+            // A statement's value is discarded, so unlike a tail it constrains
+            // nothing: whatever it evaluates to is fine.
+            StmtKind::Expr(e) => self.collect_expr_constraints(e, ret_ty, out),
+
+            // Purely a name binding, resolved while parsing. Nothing to check
+            // here; that the type has the case is checked with the declarations.
+            StmtKind::Use(..) => {}
+
+            StmtKind::Let(_, var_ty, init) => {
+                if let Some(init) = init {
+                    self.collect_expr_constraints(init, ret_ty, out);
+
+                    if diverges(init) {
+                        // `let x = return 1;` — nothing ever flows into `x`, so
+                        // pin it rather than leaving it unresolvable (the
+                        // equality below would be a no-op against NoReturn).
+                        out.push(Constraint::Diverges(var_ty.clone(), init.loc));
+                    } else {
+                        out.push(Constraint::IsEqual(
+                            var_ty.clone(),
+                            init.ty.clone(),
+                            init.loc,
+                        ));
+                    }
+                }
+
+                // `let x;` pushes nothing at all: the variable keeps its fresh
+                // type var for a later assignment to bind. If nothing ever does,
+                // `resolve` reports it at the declaration.
             }
         }
     }
@@ -340,12 +608,13 @@ impl TypeChecker {
     /// no-op. Only calls need iterating, because committing one binds type
     /// variables that can narrow another call's overload set.
     fn solve(
-        &self,
+        &mut self,
         constraints: Vec<Constraint>,
-    ) -> FloResult<(ReplaceSet, HashMap<usize, String>)> {
-        let mut set = ReplaceSet::new();
+    ) -> FloResult<(ReplaceSet, HashMap<usize, Resolution>)> {
+        let mut set = ReplaceSet::new(Rc::clone(&self.types));
         let mut resolutions = HashMap::new();
         let mut pending: Vec<CallConstraint> = Vec::new();
+        let mut fields: Vec<FieldConstraint> = Vec::new();
 
         for constraint in constraints {
             match constraint {
@@ -359,18 +628,26 @@ impl TypeChecker {
                     );
                     pending.push(call);
                 }
+                Constraint::Field(field) => fields.push(field),
             }
         }
 
-        // Resolve calls to a fixpoint (before defaulting)
-        self.resolve_calls(&mut pending, &mut set, &mut resolutions)?;
+        // Resolve calls and field accesses to a fixpoint (before defaulting)
+        self.reduce(&mut pending, &mut fields, &mut set, &mut resolutions)?;
 
         // Default types ({integer} => i32)
         set.default_types();
 
-        // Resolve calls to a fixpoint again (defaulting may have unblocked
-        // calls that were ambiguous before)
-        self.resolve_calls(&mut pending, &mut set, &mut resolutions)?;
+        // Again: defaulting may have unblocked calls that were ambiguous before
+        self.reduce(&mut pending, &mut fields, &mut set, &mut resolutions)?;
+
+        // Every literal type that never met a declared type is now as narrow as
+        // it will ever be, so close each one into the anonymous type of exactly
+        // the cases it has.
+        set.close_some_types();
+
+        // And again: an access whose receiver was open is now on a real type.
+        self.reduce(&mut pending, &mut fields, &mut set, &mut resolutions)?;
 
         // Any call still pending is now a genuine error. The list is in
         // post-order, so the first one is the innermost.
@@ -378,19 +655,29 @@ impl TypeChecker {
             Err(self.overload_error(call, &mut set))?
         }
 
+        // Field accesses are checked against the receiver as it finally is, not
+        // as it was when the field's type got bound: an open receiver can gain a
+        // case after an access resolved against it, which would make that access
+        // a read of a sum type.
+        for field in &fields {
+            self.check_field(field, &mut set)?;
+        }
+
         Ok((set, resolutions))
     }
 
-    /// Repeatedly attempt to commit every pending call until a full round
-    /// commits nothing new. Committing one call binds type variables, which can
-    /// unblock its parent (via the argument types) or its children (via the
-    /// return type), so no single order works — we iterate until the worklist
-    /// stops shrinking.
-    fn resolve_calls(
-        &self,
+    /// Repeatedly attempt to commit every pending call and field access until a
+    /// full round commits nothing new. Committing one binds type variables,
+    /// which can unblock a call's parent (via the argument types) or its
+    /// children (via the return type), and can give a field access the receiver
+    /// it was waiting on — so no single order works, and we iterate until the
+    /// worklist stops shrinking.
+    fn reduce(
+        &mut self,
         pending: &mut Vec<CallConstraint>,
+        fields: &mut Vec<FieldConstraint>,
         set: &mut ReplaceSet,
-        resolutions: &mut HashMap<usize, String>,
+        resolutions: &mut HashMap<usize, Resolution>,
     ) -> FloResult<()> {
         loop {
             let mut progress = false;
@@ -398,8 +685,8 @@ impl TypeChecker {
 
             for mut call in std::mem::take(pending) {
                 match self.try_resolve_call(&mut call, set)? {
-                    Some(mangled) => {
-                        resolutions.insert(call.key, mangled);
+                    Some(resolution) => {
+                        resolutions.insert(call.key, resolution);
                         progress = true;
                     }
                     None => unresolved.push(call),
@@ -407,9 +694,39 @@ impl TypeChecker {
             }
             *pending = unresolved;
 
+            for field in fields.iter_mut() {
+                if field.bound {
+                    continue;
+                }
+                // An error here would be premature: the receiver may still be
+                // an open type that has not met its declaration yet. The final
+                // pass in `solve` is what reports.
+                if let Ok(Some(ty)) = lookup_field(field, set, &self.types) {
+                    self.solve_constraint(set, ty, Type::T(field.key), field.loc)?;
+                    field.bound = true;
+                    progress = true;
+                }
+            }
+
             if !progress {
                 return Ok(());
             }
+        }
+    }
+
+    /// Report whatever is wrong with a field access, now that everything is as
+    /// resolved as it is going to get.
+    fn check_field(&self, field: &FieldConstraint, set: &mut ReplaceSet) -> FloResult<()> {
+        match lookup_field(field, set, &self.types) {
+            Err(err) => Err(err),
+            // The receiver never became anything with fields. Its own
+            // `UnresolvedType` would be reported at the receiver, which says
+            // less than naming the access that needed it.
+            Ok(None) => Err(FloErr::UnresolvedType {
+                ty: set.resolve(&field.recv),
+                loc: field.loc,
+            }),
+            Ok(Some(_)) => Ok(()),
         }
     }
 
@@ -418,48 +735,114 @@ impl TypeChecker {
     /// round (a neighbouring call may resolve and narrow it down). This never
     /// reports an overload error — that happens once the fixpoint has settled.
     fn try_resolve_call(
-        &self,
+        &mut self,
         call: &mut CallConstraint,
         set: &mut ReplaceSet,
-    ) -> FloResult<Option<String>> {
-        let overloads =
-            self.func_types
-                .get(&call.name)
-                .ok_or_else(|| FloErr::UndefinedFunction {
-                    name: call.name.clone(),
-                    loc: call.loc,
-                })?;
+    ) -> FloResult<Option<Resolution>> {
+        if !self.schemes.contains_key(&call.name) {
+            return Err(FloErr::UndefinedFunction {
+                name: call.name.clone(),
+                loc: call.loc,
+            });
+        }
+
+        // Candidates are instantiated once, on the first round, and reused: a
+        // generic's fresh variables have to be the *same* ones each round, or
+        // everything the solver learned about them last round is thrown away and
+        // the fixpoint never converges.
+        if call.cands.is_none() {
+            call.cands = Some(self.instantiate_candidates(call));
+        }
+        let cands = call.cands.as_mut().unwrap();
 
         // Pruning is monotone: `satisfies_type` only ever goes true -> false as
         // bindings accumulate, so a candidate dropped here can never become
         // viable again and the set only has to be filtered against what changed.
-        let cands = call
-            .cands
-            .get_or_insert_with(|| (0..overloads.len()).collect());
-        prune(cands, overloads, &call.args, &Type::T(call.key), set);
+        let types = Rc::clone(&self.types);
+        prune(cands, &call.args, &Type::T(call.key), set, &types);
 
         // Only commit when EXACTLY one overload survives.
-        let [idx] = cands[..] else {
+        let [cand] = &cands[..] else {
             return Ok(None);
         };
+        let cand = cand.clone();
 
-        let fn_ty = &overloads[idx];
-        let Type::Fn(params, ret) = fn_ty else {
+        let Type::Fn(params, ret) = &cand.sig else {
             unreachable!()
         };
 
         // Feeding the chosen signature back in as ordinary equality constraints
         // is all the pinning that's needed: binding a variable already bound to
-        // {integer} joins the two and yields the concrete param type.
+        // {integer} joins the two and yields the concrete param type. For a
+        // generic, this is also what binds its type parameters.
         for ((arg_ty, arg_loc), param) in call.args.iter().zip(params) {
-            assert!(param.is_known());
             self.solve_constraint(set, param.clone(), arg_ty.clone(), *arg_loc)?;
         }
 
-        assert!(ret.is_known());
         self.solve_constraint(set, *ret.clone(), Type::T(call.key), call.loc)?;
 
-        Ok(Some(mangle_name(fn_ty, &call.name)))
+        // Mangling is deliberately *not* done here. A generic's type arguments
+        // may still be unbound at this point and only get pinned by a later
+        // round, so the name is built in `Expr::resolve`, once everything has
+        // settled.
+        Ok(Some(Resolution {
+            name: call.name.clone(),
+            idx: cand.idx,
+            sig: cand.sig,
+            type_args: cand.type_args,
+            loc: call.loc,
+        }))
+    }
+
+    /// Build the initial candidate set for a call: every overload of the name,
+    /// with its type parameters replaced.
+    ///
+    /// An overload whose parameter count doesn't match an explicit turbofish is
+    /// dropped outright — including every non-generic one, since a turbofish
+    /// can only ever have been meant for a generic.
+    fn instantiate_candidates(&mut self, call: &CallConstraint) -> Vec<Candidate> {
+        let schemes = &self.schemes[&call.name];
+
+        let mut out = Vec::with_capacity(schemes.len());
+        for (idx, scheme) in schemes.iter().enumerate() {
+            if !call.type_args.is_empty() && call.type_args.len() != scheme.type_params.len() {
+                continue;
+            }
+
+            if !scheme.is_generic() {
+                out.push(Candidate {
+                    idx,
+                    sig: scheme.ty.clone(),
+                    type_args: Vec::new(),
+                });
+                continue;
+            }
+
+            let type_args = if call.type_args.is_empty() {
+                scheme
+                    .type_params
+                    .iter()
+                    .map(|_| Type::T(self.fresh.next()))
+                    .collect::<Vec<_>>()
+            } else {
+                call.type_args.clone()
+            };
+
+            let subst = scheme
+                .type_params
+                .iter()
+                .map(|(_, id)| *id)
+                .zip(type_args.iter().cloned())
+                .collect::<HashMap<_, _>>();
+
+            out.push(Candidate {
+                idx,
+                sig: scheme.ty.substitute(&subst),
+                type_args,
+            });
+        }
+
+        out
     }
 
     /// Turn a call that survived the fixpoint unresolved into an error.
@@ -475,10 +858,9 @@ impl TypeChecker {
                 loc: call.loc,
             }
         } else {
-            let overloads = &self.func_types[&call.name];
             let possible_tys = cands
                 .iter()
-                .map(|&i| set.resolve(&overloads[i]))
+                .map(|c| set.resolve(&c.sig))
                 .collect::<Vec<Type>>();
             FloErr::MultiplePossibleOverloads {
                 name: call.name.clone(),
@@ -523,14 +905,14 @@ impl TypeChecker {
 
 /// Drop every overload that the current bindings rule out.
 fn prune(
-    cands: &mut Vec<usize>,
-    overloads: &[Type],
+    cands: &mut Vec<Candidate>,
     args: &[(Type, Loc)],
     ret_ty: &Type,
     set: &mut ReplaceSet,
+    types: &TypeTable,
 ) {
-    cands.retain(|&i| {
-        let Type::Fn(params, ret) = &overloads[i] else {
+    cands.retain(|cand| {
+        let Type::Fn(params, ret) = &cand.sig else {
             unreachable!()
         };
 
@@ -542,11 +924,77 @@ fn prune(
         let mut should_keep = true;
         // Ensure all arg types satisfy
         for ((arg_ty, _), param) in args.iter().zip(params) {
-            should_keep &= set.resolve(arg_ty).satisfies_type(param);
+            should_keep &= set.resolve(arg_ty).satisfies_type(param, types);
         }
         // Ensure return type satisfies
-        should_keep & set.resolve(ret_ty).satisfies_type(ret)
+        should_keep & set.resolve(ret_ty).satisfies_type(ret, types)
     });
+}
+
+/// The type of `field.field` on its receiver, or `None` while the receiver is
+/// still unknown. An error means the access itself cannot work — but during the
+/// fixpoint the receiver may only be *temporarily* wrong, so callers there
+/// treat an error as "not yet" and let [`TypeChecker::check_field`] report.
+fn lookup_field(
+    field: &FieldConstraint,
+    set: &mut ReplaceSet,
+    types: &TypeTable,
+) -> FloResult<Option<Type>> {
+    use Type::*;
+
+    let recv = set.resolve(&field.recv);
+
+    let sum_type_err = || FloErr::FieldAccessOnSumType {
+        ty: recv.clone(),
+        field: field.field.clone(),
+        loc: field.loc,
+    };
+
+    let case = match &recv {
+        // Nothing to look the field up in yet.
+        T(_) => return Ok(None),
+        // The receiver never yields a value, so neither does the access.
+        Never => return Ok(Some(Never)),
+
+        User(name, args) => {
+            let Some(decl) = types.get(name) else {
+                // Undeclared; reported by the declaration check.
+                return Ok(None);
+            };
+            let [only] = &decl.cases[..] else {
+                return Err(sum_type_err());
+            };
+            decl.case_at(&only.name, args)
+                .expect("a declaration's own case")
+        }
+
+        // A literal type is read the same way, so `let v = Foo { n: 0 }; v.n`
+        // needs no annotation. It is checked again once the type is closed, in
+        // case it gained a case in the meantime.
+        SomeType(cases) | Anon(cases) => {
+            let [only] = &cases[..] else {
+                return Err(sum_type_err());
+            };
+            only.clone()
+        }
+
+        _ => {
+            return Err(FloErr::NotAStruct {
+                ty: recv.clone(),
+                field: field.field.clone(),
+                loc: field.loc,
+            });
+        }
+    };
+
+    match case.field(&field.field) {
+        Some(ty) => Ok(Some(ty.clone())),
+        None => Err(FloErr::UnknownField {
+            ty: recv,
+            field: field.field.clone(),
+            loc: field.loc,
+        }),
+    }
 }
 
 /// Whether an expression diverges (never yields a value), determined purely
@@ -556,27 +1004,38 @@ fn prune(
 /// which is emitted for exactly the expressions this returns true for, so this
 /// gives the same answer the old solver-consulting check did — without needing
 /// the solver to have run first.
-pub fn diverges(expr: &Expr) -> bool {
+fn diverges(expr: &Expr) -> bool {
     use ExprKind::*;
 
     match &expr.kind {
         // The parser types `return`, `break` and `continue` as NoReturn directly.
         Return(_) | Break | Continue => true,
-        Scope(stmts, tail) => stmts.iter().any(diverges) || tail.as_deref().is_some_and(diverges),
+        Scope(stmts, tail) => {
+            stmts.iter().any(stmt_diverges) || tail.as_deref().is_some_and(diverges)
+        }
         // Both branches must diverge; with no `else` control can skip `then`.
         If(_, then, Some(otherwise)) => diverges(then) && diverges(otherwise),
         // A loop never diverges, however its body is written: the condition may
         // be false on the first check, so control always reaches what follows.
         // Spotting that `while true` cannot exit would need real flow analysis.
         While(..) => false,
-        Let(_, _, init) => init.as_deref().is_some_and(diverges),
         Assign(target, value) => diverges(target) || diverges(value),
-        // A deferred body runs on every path out of its scope, so a scope
-        // holding a diverging `defer` cannot be left normally either. Saying so
-        // here keeps the type the checker gives a scope equal to the type its
-        // lowered form would get.
-        Defer(body) => diverges(body),
+        // A literal whose field value diverges is never built, and a field of a
+        // receiver that diverges is never read.
+        CaseLit(_, _, fields) => fields.iter().any(|f| diverges(&f.value)),
+        Field(recv, _) => diverges(recv),
         _ => false,
+    }
+}
+
+/// Whether control leaves the program (or the function) part-way through this
+/// statement, so that nothing after it in the scope can run.
+fn stmt_diverges(stmt: &Statement) -> bool {
+    match &stmt.kind {
+        StmtKind::Expr(e) => diverges(e),
+        StmtKind::Let(_, _, init) => init.as_ref().is_some_and(diverges),
+        // Nothing to evaluate.
+        StmtKind::Use(..) => false,
     }
 }
 
@@ -604,23 +1063,78 @@ fn mangle_name(fn_ty: &Type, name: &str) -> String {
     format!("{name}__{arg_list}__{ret:?}")
 }
 
+/// What the final rebuild pass needs beyond the solver state: the overload each
+/// call committed to, the schemes those overloads came from, and somewhere to
+/// note the generic instantiations it discovers.
+struct ResolveCtx<'a> {
+    schemes: &'a HashMap<String, Vec<Scheme>>,
+    res: &'a HashMap<usize, Resolution>,
+    requested: &'a mut Vec<WorkItem>,
+}
+
 impl Func {
-    fn resolve(&self, set: &mut ReplaceSet, res: &HashMap<usize, String>) -> FloResult<Self> {
+    fn resolve(
+        &self,
+        set: &mut ReplaceSet,
+        res: &HashMap<usize, Resolution>,
+        requested: &mut Vec<WorkItem>,
+        schemes: &HashMap<String, Vec<Scheme>>,
+    ) -> FloResult<Self> {
         let ty = set.resolve(&self.ty);
-        if ty.is_known() {
-            Ok(Func {
-                body: self.body.resolve(set, res)?,
-                ty,
-                loc: self.loc.clone(),
-            })
-        } else {
-            Err(FloErr::UnresolvedType { ty, loc: self.loc })
+        if !ty.is_known() {
+            return Err(FloErr::UnresolvedType { ty, loc: self.loc });
         }
+
+        let mut ctx = ResolveCtx {
+            schemes,
+            res,
+            requested,
+        };
+
+        Ok(Func {
+            body: self.body.resolve(set, &mut ctx)?,
+            ty,
+            loc: self.loc,
+            // An instantiated function is not generic; that is the whole point.
+            type_params: Vec::new(),
+        })
+    }
+}
+
+impl Statement {
+    fn resolve(&self, set: &mut ReplaceSet, ctx: &mut ResolveCtx) -> FloResult<Self> {
+        let kind = match &self.kind {
+            StmtKind::Expr(e) => StmtKind::Expr(e.resolve(set, ctx)?),
+            StmtKind::Use(ty, case) => StmtKind::Use(ty.clone(), case.clone()),
+            StmtKind::Let(id, var_ty, init) => {
+                // A statement has no type of its own, so nothing else would ever
+                // look at the variable's. An unresolved one is reported here, at
+                // the declaration.
+                let var_ty = set.resolve(var_ty);
+                if !var_ty.is_known() {
+                    Err(FloErr::UnresolvedType {
+                        ty: var_ty.clone(),
+                        loc: self.loc,
+                    })?
+                }
+
+                let new_init = match init {
+                    Some(e) => Some(e.resolve(set, ctx)?),
+                    None => None,
+                };
+                StmtKind::Let(*id, var_ty, new_init)
+            }
+        };
+
+        Ok(Statement {
+            kind,
+            loc: self.loc,
+        })
     }
 }
 
 impl Expr {
-    fn resolve(&self, set: &mut ReplaceSet, res: &HashMap<usize, String>) -> FloResult<Self> {
+    fn resolve(&self, set: &mut ReplaceSet, ctx: &mut ResolveCtx) -> FloResult<Self> {
         use ExprKind::*;
 
         let ty = set.resolve(&self.ty);
@@ -634,10 +1148,10 @@ impl Expr {
         }
 
         let kind = match &self.kind {
-            Call(name, args, _) => {
+            Call(name, _, args, _) => {
                 let mut new_args = Vec::new();
                 for arg in args {
-                    new_args.push(arg.resolve(set, res)?);
+                    new_args.push(arg.resolve(set, ctx)?);
                 }
 
                 // NOTE: `self.ty`, not the resolved `ty` above — the call site's
@@ -646,69 +1160,94 @@ impl Expr {
                 let Type::T(key) = self.ty else {
                     unreachable!("call expression without a fresh type var")
                 };
-                let resolved = res.get(&key).cloned();
-                assert!(
-                    resolved.is_some(),
-                    "Unresolved call {name} (args: {args:?})"
-                );
+                let resolution = ctx
+                    .res
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("Unresolved call {name} (args: {args:?})"))
+                    .clone();
 
-                Call(name.clone(), new_args, resolved)
+                // Now that the solver has settled, the chosen signature is
+                // concrete and can be named.
+                let sig = set.resolve(&resolution.sig);
+                let mangled = mangle_name(&sig, &resolution.name);
+
+                // A generic overload needs its instantiation checked, which is
+                // only possible once its type arguments are actually known.
+                let mut type_args = Vec::with_capacity(resolution.type_args.len());
+                for (i, arg) in resolution.type_args.iter().enumerate() {
+                    let arg = set.resolve(arg);
+                    if !arg.is_known() {
+                        let param = &ctx.schemes[&resolution.name][resolution.idx].type_params[i];
+                        return Err(FloErr::CannotInferTypeParam {
+                            name: param.0.clone(),
+                            loc: resolution.loc,
+                        });
+                    }
+                    type_args.push(arg);
+                }
+
+                if !type_args.is_empty() {
+                    ctx.requested.push(WorkItem {
+                        name: resolution.name.clone(),
+                        idx: resolution.idx,
+                        type_args,
+                        requested_at: Some(resolution.loc),
+                    });
+                }
+
+                Call(name.clone(), Vec::new(), new_args, Some(mangled))
             }
-            Scope(exprs, tail) => {
-                let mut new_exprs = Vec::new();
-                for expr in exprs {
-                    new_exprs.push(expr.resolve(set, res)?);
+            Scope(stmts, tail) => {
+                let mut new_stmts = Vec::new();
+                for stmt in stmts {
+                    new_stmts.push(stmt.resolve(set, ctx)?);
                 }
 
                 let new_tail = match tail {
-                    Some(e) => Some(Box::new(e.resolve(set, res)?)),
+                    Some(e) => Some(Box::new(e.resolve(set, ctx)?)),
                     None => None,
                 };
-                Scope(new_exprs, new_tail)
+                Scope(new_stmts, new_tail)
             }
             If(cond, then, otherwise) => {
-                let cond = Box::new(cond.resolve(set, res)?);
-                let then = Box::new(then.resolve(set, res)?);
+                let cond = Box::new(cond.resolve(set, ctx)?);
+                let then = Box::new(then.resolve(set, ctx)?);
                 let otherwise = match otherwise {
-                    Some(e) => Some(Box::new(e.resolve(set, res)?)),
+                    Some(e) => Some(Box::new(e.resolve(set, ctx)?)),
                     None => None,
                 };
                 If(cond, then, otherwise)
             }
             While(cond, body) => While(
-                Box::new(cond.resolve(set, res)?),
-                Box::new(body.resolve(set, res)?),
+                Box::new(cond.resolve(set, ctx)?),
+                Box::new(body.resolve(set, ctx)?),
             ),
             Return(value) => {
                 let new_value = match value {
-                    Some(e) => Some(Box::new(e.resolve(set, res)?)),
+                    Some(e) => Some(Box::new(e.resolve(set, ctx)?)),
                     None => None,
                 };
                 Return(new_value)
             }
-            Let(id, var_ty, init) => {
-                // The declaration is `void`, so the check at the top of this
-                // function says nothing about the variable's own type. An
-                // unresolved one is reported here, at the declaration.
-                let var_ty = set.resolve(var_ty);
-                if !var_ty.is_known() {
-                    Err(FloErr::UnresolvedType {
-                        ty: var_ty.clone(),
-                        loc,
-                    })?
+            Assign(target, value) => Assign(
+                Box::new(target.resolve(set, ctx)?),
+                Box::new(value.resolve(set, ctx)?),
+            ),
+            CaseLit(_, case, fields) => {
+                let mut new_fields = Vec::with_capacity(fields.len());
+                for field in fields {
+                    new_fields.push(FieldInit {
+                        name: field.name.clone(),
+                        value: field.value.resolve(set, ctx)?,
+                        loc: field.loc,
+                    });
                 }
 
-                let new_init = match init {
-                    Some(e) => Some(Box::new(e.resolve(set, res)?)),
-                    None => None,
-                };
-                Let(*id, var_ty, new_init)
+                // The qualifier has done its job: `ty` now says which type this
+                // is, the same as it does for an unqualified literal.
+                CaseLit(None, case.clone(), new_fields)
             }
-            Assign(target, value) => Assign(
-                Box::new(target.resolve(set, res)?),
-                Box::new(value.resolve(set, res)?),
-            ),
-            Defer(body) => Defer(Box::new(body.resolve(set, res)?)),
+            Field(recv, name) => Field(Box::new(recv.resolve(set, ctx)?), name.clone()),
 
             Num(n) => Num(*n),
             Flt(n) => Flt(*n),

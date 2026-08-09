@@ -11,11 +11,11 @@
 //! these tests — only a genuine change in *resolution* behavior can.
 
 use super::{TypeChecker, mangle_name};
-use crate::ast::{Expr, ExprKind, Func, Module};
+use crate::ast::{Expr, ExprKind, FieldInit, Func, Module, Statement, StmtKind};
 use crate::errors::FloErr;
-use crate::parser::Parser;
-use crate::tokenizer::Tokenizer;
-use crate::types::Type;
+use crate::parser::{Parser, check_entry_point};
+use crate::tokenizer::{TokenKind, Tokenizer};
+use crate::types::{Type, TypeCase};
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -56,6 +56,15 @@ fn parse_err(src: &str) -> FloErr {
     }
 }
 
+/// Parse `src` and run the whole-program entry-point check on the result.
+fn entry_check(src: &str) -> Result<(), FloErr> {
+    let tokens = Tokenizer::new(src).tokenize();
+    let module = Parser::new(tokens)
+        .parse()
+        .expect("test source should parse without errors");
+    check_entry_point(&module)
+}
+
 fn fn_ty(args: Vec<Type>, ret: Type) -> Type {
     Type::Fn(args, Box::new(ret))
 }
@@ -86,8 +95,8 @@ fn func<'a>(module: &'a Module, mangled: &str) -> &'a Func {
 /// The resolved (mangled) callee name of a call expression.
 fn resolved_call_name(expr: &Expr) -> &str {
     match &expr.kind {
-        ExprKind::Call(_, _, Some(name)) => name.as_str(),
-        ExprKind::Call(orig, _, None) => panic!("call `{orig}` was left unresolved"),
+        ExprKind::Call(_, _, _, Some(name)) => name.as_str(),
+        ExprKind::Call(orig, _, _, None) => panic!("call `{orig}` was left unresolved"),
         other => panic!("expected a call expression, got {other:?}"),
     }
 }
@@ -95,7 +104,7 @@ fn resolved_call_name(expr: &Expr) -> &str {
 /// The argument expressions of a call.
 fn call_args(expr: &Expr) -> &[Expr] {
     match &expr.kind {
-        ExprKind::Call(_, args, _) => args,
+        ExprKind::Call(_, _, args, _) => args,
         other => panic!("expected a call expression, got {other:?}"),
     }
 }
@@ -108,6 +117,14 @@ macro_rules! assert_err {
             errs.iter().any(|e| matches!(e, $pat)),
             "expected an error matching `{}`, got: {errs:?}",
             stringify!($pat),
+        );
+    }};
+    ($errs:expr, $pat:pat if $guard:expr) => {{
+        let errs = &$errs;
+        assert!(
+            errs.iter().any(|e| matches!(e, $pat if $guard)),
+            "expected an error matching `{}`, got: {errs:?}",
+            stringify!($pat if $guard),
         );
     }};
 }
@@ -1039,7 +1056,10 @@ fn double_unary_minus_nests() {
         m("-", vec![Type::I32], Type::I32)
     );
     let inner = &call_args(&main.body)[0];
-    assert_eq!(resolved_call_name(inner), m("-", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(inner),
+        m("-", vec![Type::I32], Type::I32)
+    );
     assert!(matches!(call_args(inner)[0].kind, ExprKind::Num(5)));
 }
 
@@ -1143,9 +1163,15 @@ fn chained_pipes_nest_left_to_right() {
     );
     let main = func_sig(&module, "main", vec![], Type::I32);
     let outer = &main.body;
-    assert_eq!(resolved_call_name(outer), m("inc", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(outer),
+        m("inc", vec![Type::I32], Type::I32)
+    );
     let inner = &call_args(outer)[0];
-    assert_eq!(resolved_call_name(inner), m("inc", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(inner),
+        m("inc", vec![Type::I32], Type::I32)
+    );
     assert!(matches!(call_args(inner)[0].kind, ExprKind::Num(1)));
 }
 
@@ -1198,11 +1224,20 @@ fn pipe_argument_type_incompatible_is_an_error() {
     assert_err!(errs, FloErr::NoPossibleOverloads { .. });
 }
 
-/// The scope's statement expressions and its optional tail expression.
-fn scope_parts(expr: &Expr) -> (&[Expr], Option<&Expr>) {
+/// The scope's statements and its optional tail expression.
+fn scope_parts(expr: &Expr) -> (&[Statement], Option<&Expr>) {
     match &expr.kind {
-        ExprKind::Scope(exprs, tail) => (exprs, tail.as_deref()),
+        ExprKind::Scope(stmts, tail) => (stmts, tail.as_deref()),
         other => panic!("expected a scope expression, got {other:?}"),
+    }
+}
+
+/// The expression of a statement that is one, for the many tests that only care
+/// about expressions in statement position.
+fn stmt_expr(stmt: &Statement) -> &Expr {
+    match &stmt.kind {
+        StmtKind::Expr(e) => e,
+        other => panic!("expected an expression statement, got {other:?}"),
     }
 }
 
@@ -1283,6 +1318,77 @@ fn scope_with_trailing_semicolon_is_void() {
 }
 
 #[test]
+fn block_statements_need_no_separating_semicolon() {
+    // A scope, an `if` and a `while` each carry an implicit `;` when something
+    // follows them, so three blocks in a row parse as three statements.
+    let module = check_ok(
+        "
+        fn main() = {
+            { nop() }
+            if true { nop() }
+            while false { nop() }
+            nop()
+        };
+        fn nop() = {};
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts.len(), 3);
+    assert!(matches!(stmt_expr(&stmts[0]).kind, ExprKind::Scope(..)));
+    assert!(matches!(stmt_expr(&stmts[1]).kind, ExprKind::If(..)));
+    assert!(matches!(stmt_expr(&stmts[2]).kind, ExprKind::While(..)));
+    assert_eq!(
+        resolved_call_name(tail.unwrap()),
+        m("nop", vec![], Type::Void)
+    );
+}
+
+#[test]
+fn an_explicit_semicolon_after_a_block_is_still_allowed() {
+    let module = check_ok(
+        "
+        fn main() = {
+            if true { nop() };
+            nop()
+        };
+        fn nop() = {};
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmt_expr(&stmts[0]).kind, ExprKind::If(..)));
+    assert!(tail.is_some());
+}
+
+#[test]
+fn a_trailing_block_is_still_the_scope_tail() {
+    // The implicit `;` only applies when something follows: written last, an
+    // `if` is the tail and the scope takes its value.
+    let module = check_ok("fn main() -> i32 = { if true { 1 } else { 2 } };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(stmts.is_empty());
+    assert_eq!(tail.unwrap().ty, Type::I32);
+}
+
+#[test]
+fn a_non_block_statement_still_needs_its_semicolon() {
+    let err = parse_err("fn main() = { nop() nop() };");
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::RCurly,
+                ..
+            }
+        ),
+        "expected a missing-`}}` error, got: {err:?}"
+    );
+}
+
+#[test]
 fn statement_position_calls_are_resolved() {
     // Regression: calls that sit in statement position (before the tail) must be
     // resolved by the call-resolution passes, not just the tail. Previously the
@@ -1301,8 +1407,8 @@ fn statement_position_calls_are_resolved() {
     let (stmts, tail) = scope_parts(&main.body);
 
     assert_eq!(stmts.len(), 1);
-    assert_eq!(resolved_call_name(&stmts[0]), m("nop", vec![], Type::Void));
-    assert_eq!(stmts[0].ty, Type::Void);
+    assert_eq!(resolved_call_name(stmt_expr(&stmts[0])), m("nop", vec![], Type::Void));
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Void);
 
     assert_eq!(
         resolved_call_name(tail.unwrap()),
@@ -1326,8 +1432,15 @@ fn scope_resolves_statements_and_tail_calls_together() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, tail) = scope_parts(&main.body);
     assert_eq!(stmts.len(), 2);
-    for call in stmts.iter().chain(std::iter::once(tail.unwrap())) {
-        assert_eq!(resolved_call_name(call), m("id", vec![Type::I32], Type::I32));
+    for call in stmts
+        .iter()
+        .map(stmt_expr)
+        .chain(std::iter::once(tail.unwrap()))
+    {
+        assert_eq!(
+            resolved_call_name(call),
+            m("id", vec![Type::I32], Type::I32)
+        );
     }
     assert_eq!(tail.unwrap().ty, Type::I32);
 }
@@ -1459,8 +1572,55 @@ fn if_branches_resolve_calls() {
     // Each branch is a `{ id(..) }` scope; the call is its tail.
     let then_call = scope_parts(then).1.unwrap();
     let else_call = scope_parts(otherwise.unwrap()).1.unwrap();
-    assert_eq!(resolved_call_name(then_call), m("id", vec![Type::I32], Type::I32));
-    assert_eq!(resolved_call_name(else_call), m("id", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(then_call),
+        m("id", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(
+        resolved_call_name(else_call),
+        m("id", vec![Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn if_branch_must_be_a_scope() {
+    let err = parse_err("fn main() -> i32 = if true 1 else 2;");
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::LCurly,
+                ..
+            }
+        ),
+        "expected a missing-`{{` error, got: {err:?}"
+    );
+}
+
+#[test]
+fn else_branch_must_be_a_scope_or_an_if() {
+    let err = parse_err("fn main() -> i32 = if true { 1 } else 2;");
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::LCurly,
+                ..
+            }
+        ),
+        "expected a missing-`{{` error, got: {err:?}"
+    );
+}
+
+#[test]
+fn else_if_chains_parse() {
+    // `else if` is the one non-scope else: another `if`, nested as the else.
+    let module = check_ok("fn main() -> i32 = if true { 1 } else if false { 2 } else { 3 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, _, otherwise) = if_parts(&main.body);
+    let inner = otherwise.expect("expected an else branch");
+    assert!(matches!(inner.kind, ExprKind::If(..)));
+    assert_eq!(inner.ty, Type::I32);
 }
 
 #[test]
@@ -1478,8 +1638,14 @@ fn if_selects_overload_by_expected_type() {
     let (_, then, otherwise) = if_parts(&main.body);
     let then_call = scope_parts(then).1.unwrap();
     let else_call = scope_parts(otherwise.unwrap()).1.unwrap();
-    assert_eq!(resolved_call_name(then_call), m("id", vec![Type::I8], Type::I8));
-    assert_eq!(resolved_call_name(else_call), m("id", vec![Type::I8], Type::I8));
+    assert_eq!(
+        resolved_call_name(then_call),
+        m("id", vec![Type::I8], Type::I8)
+    );
+    assert_eq!(
+        resolved_call_name(else_call),
+        m("id", vec![Type::I8], Type::I8)
+    );
 }
 
 #[test]
@@ -1642,16 +1808,27 @@ fn user_operator_overload_body_type_mismatch_is_an_error() {
 }
 
 #[test]
-fn user_operator_overload_duplicating_a_builtin_is_ambiguous() {
-    // This mangles identically to the built-in `+__i32_i32__i32`, producing two
-    // functions with the same signature.
-    let errs = check_err(
+fn user_operator_overload_duplicating_a_builtin_is_not_an_error_on_its_own() {
+    // This mangles identically to the built-in `+__i32_i32__i32`, giving two
+    // functions with the same signature. Declaring them is fine; it is only
+    // *calling* one that has no answer.
+    check_ok(
         "
         op +(a: i32, b: i32) -> i32 = a;
         fn main() -> i32 = 0;
         ",
     );
-    assert_err!(errs, FloErr::AmbiguousOverload { .. });
+}
+
+#[test]
+fn calling_a_duplicated_overload_is_ambiguous() {
+    let errs = check_err(
+        "
+        op +(a: i32, b: i32) -> i32 = a;
+        fn main() -> i32 = 1 + 2;
+        ",
+    );
+    assert_err!(errs, FloErr::MultiplePossibleOverloads { .. });
 }
 
 // --------------------------------------------------------------------------
@@ -1663,7 +1840,10 @@ fn user_operator_overload_duplicating_a_builtin_is_ambiguous() {
 
 #[test]
 fn mangle_name_format() {
-    assert_eq!(mangle_name(&fn_ty(vec![], Type::I32), "main"), "main____i32");
+    assert_eq!(
+        mangle_name(&fn_ty(vec![], Type::I32), "main"),
+        "main____i32"
+    );
     assert_eq!(
         mangle_name(&fn_ty(vec![Type::I32], Type::I32), "id"),
         "id__i32__i32"
@@ -1795,7 +1975,7 @@ fn return_in_statement_position_marks_scope_noreturn() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, tail) = scope_parts(&main.body);
     assert_eq!(stmts.len(), 1);
-    assert_eq!(stmts[0].ty, Type::Never);
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Never);
     assert_eq!(tail.unwrap().ty, Type::I32);
 }
 
@@ -1807,7 +1987,7 @@ fn scope_with_only_a_return_is_valid_for_any_return_type() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, tail) = scope_parts(&main.body);
     assert_eq!(stmts.len(), 1);
-    assert_eq!(stmts[0].ty, Type::Never);
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Never);
     assert!(tail.is_none());
 }
 
@@ -1825,7 +2005,7 @@ fn if_without_else_returning_does_not_diverge_the_scope() {
     assert_eq!(cond.body.ty, Type::I32);
     let (stmts, tail) = scope_parts(&cond.body);
     assert_eq!(stmts.len(), 1);
-    assert_eq!(stmts[0].ty, Type::Void);
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Void);
     assert_eq!(tail.unwrap().ty, Type::I32);
 }
 
@@ -1836,24 +2016,31 @@ fn calls_in_if_branches_resolve() {
     let module = check_ok(
         "
         fn main() -> i32 = cond(true);
-        fn cond(b: bool) -> i32 = if b id(0) else id(1);
+        fn cond(b: bool) -> i32 = if b { id(0) } else { id(1) };
         fn id(a: i32) -> i32 = a;
         ",
     );
     let cond = func_sig(&module, "cond", vec![Type::Bool], Type::I32);
     let (_, then, otherwise) = if_parts(&cond.body);
-    assert_eq!(resolved_call_name(then), m("id", vec![Type::I32], Type::I32));
+    let then_tail = scope_parts(then).1.expect("then branch should have a tail");
+    let else_tail = scope_parts(otherwise.unwrap())
+        .1
+        .expect("else branch should have a tail");
     assert_eq!(
-        resolved_call_name(otherwise.unwrap()),
+        resolved_call_name(then_tail),
+        m("id", vec![Type::I32], Type::I32)
+    );
+    assert_eq!(
+        resolved_call_name(else_tail),
         m("id", vec![Type::I32], Type::I32)
     );
 }
 
 /// The variable id, variable type and optional initializer of a declaration.
-fn let_parts(expr: &Expr) -> (usize, &Type, Option<&Expr>) {
-    match &expr.kind {
-        ExprKind::Let(id, ty, init) => (*id, ty, init.as_deref()),
-        other => panic!("expected a let expression, got {other:?}"),
+fn let_parts(stmt: &Statement) -> (usize, &Type, Option<&Expr>) {
+    match &stmt.kind {
+        StmtKind::Let(id, ty, init) => (*id, ty, init.as_ref()),
+        other => panic!("expected a let statement, got {other:?}"),
     }
 }
 
@@ -1897,8 +2084,6 @@ fn let_infers_its_type_from_the_initializer() {
     let (id, var_ty, init) = let_parts(&stmts[0]);
     assert_eq!(var_ty, &Type::I32);
     assert_eq!(init.unwrap().ty, Type::I32);
-    // The declaration itself yields no value.
-    assert_eq!(stmts[0].ty, Type::Void);
     // ... and the tail reads that same variable.
     assert_eq!(var_id(tail.unwrap()), id);
     assert_eq!(tail.unwrap().ty, Type::I32);
@@ -1983,20 +2168,50 @@ fn shadowing_can_change_the_type() {
 
 #[test]
 fn variable_does_not_escape_its_scope() {
+    // Out of scope, so `a` is no longer a variable — and with no `use` bringing
+    // in a case by that name, there is nothing else it could be.
     let err = parse_err("fn main() -> i32 = { { let a = 1; }; a };");
     assert!(
-        matches!(err, FloErr::UndefinedIdentifier { .. }),
-        "expected an undefined identifier error, got: {err:?}"
+        matches!(err, FloErr::UnknownIdentifier { ref name, .. } if name == "a"),
+        "expected an unknown-identifier error, got: {err:?}"
     );
 }
 
 #[test]
-fn let_in_expression_position_is_void() {
-    // A declaration is an ordinary expression, so it may be a function body.
-    let module = check_ok("fn main() = let a = 1;");
-    let main = func_sig(&module, "main", vec![], Type::Void);
-    assert_eq!(main.body.ty, Type::Void);
-    assert_eq!(let_parts(&main.body).1, &Type::I32);
+fn a_let_cannot_be_a_scope_tail() {
+    // A declaration is a statement, so it always ends in a `;` — it can never be
+    // the thing a scope yields.
+    let err = parse_err("fn main() = { let a = 1 };");
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::Semicolon,
+                ..
+            }
+        ),
+        "expected a missing-`;` error, got: {err:?}"
+    );
+}
+
+#[test]
+fn let_as_a_function_body_is_an_error() {
+    // A declaration is a statement, not an expression, so it needs a scope to
+    // live in.
+    let err = parse_err("fn main() = let a = 1;");
+    assert!(
+        matches!(err, FloErr::LetOutsideStatementPosition { .. }),
+        "expected a let-outside-statement-position error, got: {err:?}"
+    );
+}
+
+#[test]
+fn let_in_operand_position_is_an_error() {
+    let err = parse_err("fn main() -> i32 = { 1 + (let a = 2) };");
+    assert!(
+        matches!(err, FloErr::LetOutsideStatementPosition { .. }),
+        "expected a let-outside-statement-position error, got: {err:?}"
+    );
 }
 
 #[test]
@@ -2008,7 +2223,6 @@ fn let_initialized_by_a_diverging_expression_is_accepted() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, _) = scope_parts(&main.body);
     assert_eq!(let_parts(&stmts[0]).1, &Type::Never);
-    assert_eq!(stmts[0].ty, Type::Void);
 }
 
 // --------------------------------------------------------------------------
@@ -2033,7 +2247,7 @@ fn let_without_initializer_takes_its_annotation() {
     let (stmts, _) = scope_parts(&main.body);
     assert_eq!(let_parts(&stmts[0]).1, &Type::I8);
     // The assigned literal is narrowed to the annotated type.
-    assert_eq!(assign_parts(&stmts[1]).1.ty, Type::I8);
+    assert_eq!(assign_parts(stmt_expr(&stmts[1])).1.ty, Type::I8);
 }
 
 #[test]
@@ -2168,7 +2382,10 @@ fn assign_resolves_calls_on_both_sides() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (_, tail) = scope_parts(&main.body);
     let (_, value) = assign_parts(tail.unwrap());
-    assert_eq!(resolved_call_name(value), m("id", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(value),
+        m("id", vec![Type::I32], Type::I32)
+    );
 }
 
 #[test]
@@ -2184,7 +2401,7 @@ fn assigning_a_diverging_value_is_accepted() {
     let module = check_ok("fn main() -> i32 = { let a = 0; a = return 0; a };");
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, tail) = scope_parts(&main.body);
-    assert_eq!(stmts[1].ty, Type::Never);
+    assert_eq!(stmt_expr(&stmts[1]).ty, Type::Never);
     assert_eq!(tail.unwrap().ty, Type::I32);
 }
 
@@ -2268,7 +2485,10 @@ fn while_condition_resolves_calls() {
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (cond, _) = while_parts(&main.body);
-    assert_eq!(resolved_call_name(cond), m("cmp", vec![Type::I32], Type::Bool));
+    assert_eq!(
+        resolved_call_name(cond),
+        m("cmp", vec![Type::I32], Type::Bool)
+    );
 }
 
 #[test]
@@ -2304,23 +2524,28 @@ fn while_body_with_trailing_semicolon_is_void() {
     let (_, body) = while_parts(&main.body);
     assert_eq!(body.ty, Type::Void);
     let (stmts, tail) = scope_parts(body);
-    assert_eq!(stmts[0].ty, Type::I32);
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::I32);
     assert!(tail.is_none());
 }
 
 #[test]
-fn while_body_need_not_be_a_scope() {
-    // The body is an ordinary expression, like the branches of an `if`.
-    let module = check_ok(
+fn while_body_must_be_a_scope() {
+    let err = parse_err(
         "
         fn main() = while true nop();
         fn nop() = {};
         ",
     );
-    let main = func_sig(&module, "main", vec![], Type::Void);
-    let (_, body) = while_parts(&main.body);
-    assert_eq!(resolved_call_name(body), m("nop", vec![], Type::Void));
-    assert_eq!(body.ty, Type::Void);
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::LCurly,
+                ..
+            }
+        ),
+        "expected a missing-`{{` error, got: {err:?}"
+    );
 }
 
 #[test]
@@ -2334,7 +2559,10 @@ fn while_body_resolves_calls() {
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (_, body) = while_parts(&main.body);
     let (stmts, _) = scope_parts(body);
-    assert_eq!(resolved_call_name(&stmts[0]), m("id", vec![Type::I32], Type::I32));
+    assert_eq!(
+        resolved_call_name(stmt_expr(&stmts[0])),
+        m("id", vec![Type::I32], Type::I32)
+    );
 }
 
 #[test]
@@ -2360,7 +2588,7 @@ fn while_sees_enclosing_variables() {
     let count = func_sig(&module, "count", vec![Type::I32], Type::Void);
     let (stmts, _) = scope_parts(&count.body);
     let i = let_parts(&stmts[0]).0;
-    let (cond, body) = while_parts(&stmts[1]);
+    let (cond, body) = while_parts(stmt_expr(&stmts[1]));
     // The condition reads both the local and the parameter.
     assert_eq!(
         resolved_call_name(cond),
@@ -2368,7 +2596,7 @@ fn while_sees_enclosing_variables() {
     );
     assert_eq!(var_id(&call_args(cond)[0]), i);
     // ... and the body assigns to that same local.
-    let (assign_target, _) = assign_parts(&scope_parts(body).0[0]);
+    let (assign_target, _) = assign_parts(stmt_expr(&scope_parts(body).0[0]));
     assert_eq!(var_id(assign_target), i);
 }
 
@@ -2380,7 +2608,7 @@ fn while_does_not_diverge_the_enclosing_scope() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     assert_eq!(main.body.ty, Type::I32);
     let (stmts, tail) = scope_parts(&main.body);
-    assert_eq!(stmts[0].ty, Type::Void);
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Void);
     assert_eq!(tail.unwrap().ty, Type::I32);
 }
 
@@ -2389,7 +2617,7 @@ fn nested_while_loops_resolve() {
     let module = check_ok("fn main() = while true { while false { break; }; };");
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (_, outer_body) = while_parts(&main.body);
-    let inner = &scope_parts(outer_body).0[0];
+    let inner = stmt_expr(&scope_parts(outer_body).0[0]);
     assert_eq!(inner.ty, Type::Void);
     let (_, inner_body) = while_parts(inner);
     assert_eq!(inner_body.ty, Type::Never);
@@ -2406,8 +2634,8 @@ fn return_inside_a_loop_body_is_allowed() {
     );
     let main = func_sig(&module, "main", vec![], Type::I8);
     let (stmts, _) = scope_parts(&main.body);
-    let (_, body) = while_parts(&stmts[0]);
-    let ret = &scope_parts(body).0[0];
+    let (_, body) = while_parts(stmt_expr(&stmts[0]));
+    let ret = stmt_expr(&scope_parts(body).0[0]);
     assert_eq!(return_value(ret).unwrap().ty, Type::I8);
 }
 
@@ -2427,10 +2655,10 @@ fn break_and_continue_are_noreturn() {
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (_, body) = while_parts(&main.body);
     let (stmts, tail) = scope_parts(body);
-    assert!(matches!(stmts[0].kind, ExprKind::Break));
-    assert_eq!(stmts[0].ty, Type::Never);
-    assert!(matches!(stmts[1].kind, ExprKind::Continue));
-    assert_eq!(stmts[1].ty, Type::Never);
+    assert!(matches!(stmt_expr(&stmts[0]).kind, ExprKind::Break));
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Never);
+    assert!(matches!(stmt_expr(&stmts[1]).kind, ExprKind::Continue));
+    assert_eq!(stmt_expr(&stmts[1]).ty, Type::Never);
     assert!(tail.is_none());
     // The jumps make the body itself diverge, which still satisfies the loop.
     assert_eq!(body.ty, Type::Never);
@@ -2450,12 +2678,14 @@ fn break_may_be_the_body_tail() {
 }
 
 #[test]
-fn break_may_be_the_whole_body() {
-    let module = check_ok("fn main() = while true break;");
+fn break_may_be_the_only_statement() {
+    let module = check_ok("fn main() = while true { break; };");
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (_, body) = while_parts(&main.body);
-    assert!(matches!(body.kind, ExprKind::Break));
-    assert_eq!(body.ty, Type::Never);
+    let (stmts, tail) = scope_parts(body);
+    assert!(matches!(stmt_expr(&stmts[0]).kind, ExprKind::Break));
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Never);
+    assert!(tail.is_none());
 }
 
 #[test]
@@ -2470,7 +2700,7 @@ fn break_inside_an_if_inside_a_loop_is_ok() {
     );
     let cond = func_sig(&module, "cond", vec![Type::Bool], Type::Void);
     let (_, body) = while_parts(&cond.body);
-    let if_stmt = &scope_parts(body).0[0];
+    let if_stmt = stmt_expr(&scope_parts(body).0[0]);
     assert_eq!(if_stmt.ty, Type::Void);
     let (_, then, _) = if_parts(if_stmt);
     assert_eq!(then.ty, Type::Never);
@@ -2542,122 +2772,1581 @@ fn break_with_a_value_is_a_parse_error() {
     );
 }
 
-/// The body of a defer expression.
-fn defer_body(expr: &Expr) -> &Expr {
+// --------------------------------------------------------------------------
+// Entry point
+//
+// Having a `main`, and it looking like an entry point, is a property of a whole
+// program rather than of one parse — so it is checked separately, by
+// `check_entry_point`, and only the driver runs it. The rest of the tests in
+// this file use `main` freely as a vehicle and never go through it.
+// --------------------------------------------------------------------------
+
+#[test]
+fn void_main_is_a_valid_entry_point() {
+    assert!(entry_check("fn main() = {};").is_ok());
+}
+
+#[test]
+fn i32_main_is_a_valid_entry_point() {
+    assert!(entry_check("fn main() -> i32 = 0;").is_ok());
+}
+
+#[test]
+fn a_program_without_main_is_an_error() {
+    let err = entry_check("fn other() = {};").unwrap_err();
+    assert!(
+        matches!(err, FloErr::MainFunctionNotFound),
+        "expected a missing-main error, got: {err:?}"
+    );
+}
+
+#[test]
+fn main_may_not_be_overloaded() {
+    let err = entry_check(
+        "
+        fn main() = {};
+        fn main(a: i32) = {};
+        ",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, FloErr::MultipleMainFunction),
+        "expected a multiple-main error, got: {err:?}"
+    );
+}
+
+#[test]
+fn main_returning_something_other_than_void_or_i32_is_an_error() {
+    let err = entry_check("fn main() -> bool = true;").unwrap_err();
+    assert!(
+        matches!(err, FloErr::InvalidMainSignature { .. }),
+        "expected an invalid-main-signature error, got: {err:?}"
+    );
+}
+
+#[test]
+fn main_taking_arbitrary_arguments_is_an_error() {
+    // The only argument form the spec allows is `[]string`, which needs slices
+    // to exist first; until then `main` takes nothing at all.
+    let err = entry_check("fn main(a: i32) = {};").unwrap_err();
+    assert!(
+        matches!(err, FloErr::InvalidMainSignature { .. }),
+        "expected an invalid-main-signature error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_parenthesized_block_is_an_operand_not_a_statement() {
+    // The implicit `;` is for statements that *begin* with a block. Wrapping one
+    // in parens makes it an ordinary operand again, so this is one subtraction.
+    let module = check_ok("fn main() -> i32 = { ({ 3 }) - 1 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(stmts.is_empty());
+    assert_eq!(
+        resolved_call_name(tail.unwrap()),
+        m("-", vec![Type::I32, Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn a_block_folded_into_a_binary_operator_is_not_a_statement() {
+    // The `- 1` binds to the `if`, so the statement is a call rather than an
+    // `if`, and it needs its `;` like any other.
+    let module = check_ok("fn main() -> i32 = { if true { 3 } else { 4 } - 1 };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(stmts.is_empty());
+    assert_eq!(
+        resolved_call_name(tail.unwrap()),
+        m("-", vec![Type::I32, Type::I32], Type::I32)
+    );
+}
+
+// --------------------------------------------------------------------------
+// Generic functions
+//
+// A generic function has no single type, so it is never checked as written. It
+// is checked once per instantiation, after its type parameters have been
+// substituted away -- which is why a mistake inside one is only reported when
+// something asks for an instantiation that exposes it.
+// --------------------------------------------------------------------------
+
+#[test]
+fn a_generic_is_instantiated_at_its_call_site() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = id(1);
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    // The instantiation is named as though it had been written out by hand.
+    let id = func_sig(&module, "id", vec![Type::I32], Type::I32);
+    assert_eq!(id.body.ty, Type::I32);
+    assert!(id.type_params.is_empty());
+
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("id", vec![Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn an_uninstantiated_generic_is_not_emitted() {
+    // Nothing calls `unused`, so there is no instantiation of it to check and
+    // nothing to emit.
+    let module = check_ok(
+        "
+        fn main() = {};
+        fn unused<T>(a: T) -> T = a;
+        ",
+    );
+    assert!(
+        !module.funcs.keys().any(|k| k.starts_with("unused")),
+        "expected no `unused` instantiation, got: {:?}",
+        module.funcs.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn one_generic_instantiates_at_several_types() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = {
+            take_u8(id(1));
+            take_bool(id(true));
+            id(2)
+        };
+        fn id<T>(a: T) -> T = a;
+        fn take_u8(a: u8) = {};
+        fn take_bool(a: bool) = {};
+        ",
+    );
+    func_sig(&module, "id", vec![Type::U8], Type::U8);
+    func_sig(&module, "id", vec![Type::Bool], Type::Bool);
+    func_sig(&module, "id", vec![Type::I32], Type::I32);
+}
+
+#[test]
+fn the_same_instantiation_is_only_checked_once() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = id(1) + id(2);
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    let insts = module.funcs[&m("id", vec![Type::I32], Type::I32)].len();
+    assert_eq!(insts, 1, "expected one `id<i32>`, got {insts}");
+}
+
+#[test]
+fn a_generic_may_have_several_type_params() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = first(1, true);
+        fn first<A, B>(a: A, b: B) -> A = a;
+        ",
+    );
+    func_sig(&module, "first", vec![Type::I32, Type::Bool], Type::I32);
+}
+
+#[test]
+fn a_generic_type_param_is_inferred_from_the_return_type() {
+    let module = check_ok(
+        "
+        fn main() -> u8 = zero();
+        fn zero<T>() -> T = 0;
+        ",
+    );
+    func_sig(&module, "zero", vec![], Type::U8);
+}
+
+#[test]
+fn a_generic_may_call_another_generic() {
+    // `outer<bool>` is only discovered by checking `main`, and `inner<bool>`
+    // only by checking `outer<bool>` -- so the worklist has to keep going.
+    let module = check_ok(
+        "
+        fn main() -> bool = outer(true);
+        fn outer<T>(a: T) -> T = inner(a);
+        fn inner<T>(a: T) -> T = a;
+        ",
+    );
+    func_sig(&module, "outer", vec![Type::Bool], Type::Bool);
+    func_sig(&module, "inner", vec![Type::Bool], Type::Bool);
+}
+
+#[test]
+fn a_generic_can_be_recursive() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = countdown(3);
+        fn countdown<T>(a: T) -> T = if a == 0 { a } else { countdown(a - 1) };
+        ",
+    );
+    func_sig(&module, "countdown", vec![Type::I32], Type::I32);
+}
+
+#[test]
+fn a_generic_coexists_with_a_concrete_overload() {
+    // The concrete i8 overload and the generic both fit an i8 call, so that one
+    // is ambiguous, but a u8 call has only the generic to pick.
+    let module = check_ok(
+        "
+        fn main() -> u8 = id(1);
+        fn id(a: i8) -> i8 = a;
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    func_sig(&module, "id", vec![Type::U8], Type::U8);
+}
+
+#[test]
+fn a_generic_pipes_like_any_other_function() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = 1 |> id;
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    func_sig(&module, "id", vec![Type::I32], Type::I32);
+}
+
+#[test]
+fn a_generic_body_is_checked_per_instantiation() {
+    // `a + b` is fine for i32 and meaningless for bool, and only the bool
+    // instantiation says so.
+    check_ok(
+        "
+        fn main() -> i32 = add(1, 2);
+        fn add<T>(a: T, b: T) -> T = a + b;
+        ",
+    );
+
+    let errs = check_err(
+        "
+        fn main() -> bool = add(true, false);
+        fn add<T>(a: T, b: T) -> T = a + b;
+        ",
+    );
+    assert_err!(errs, FloErr::InGenericInstantiation { .. });
+}
+
+#[test]
+fn an_instantiation_error_names_the_generic_and_its_arguments() {
+    let errs = check_err(
+        "
+        fn main() -> bool = add(true, false);
+        fn add<T>(a: T, b: T) -> T = a + b;
+        ",
+    );
+    let Some(FloErr::InGenericInstantiation {
+        name,
+        type_args,
+        cause,
+        ..
+    }) = errs.first()
+    else {
+        panic!("expected an instantiation error, got: {errs:?}");
+    };
+    assert_eq!(name, "add");
+    assert_eq!(type_args, &vec![Type::Bool]);
+    // The cause is the real mistake, reported inside `add`.
+    assert!(
+        matches!(**cause, FloErr::NoPossibleOverloads { .. }),
+        "expected the cause to be an overload failure, got: {cause:?}"
+    );
+}
+
+#[test]
+fn an_uninferable_type_param_is_an_error() {
+    let errs = check_err(
+        "
+        fn main() = ignore();
+        fn ignore<T>() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::CannotInferTypeParam { .. });
+}
+
+// --------------------------------------------------------------------------
+// Turbofish
+// --------------------------------------------------------------------------
+
+#[test]
+fn a_turbofish_picks_the_instantiation() {
+    let module = check_ok(
+        "
+        fn main() = { id::<u8>(1); };
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    func_sig(&module, "id", vec![Type::U8], Type::U8);
+}
+
+#[test]
+fn a_turbofish_settles_an_otherwise_uninferable_param() {
+    let module = check_ok(
+        "
+        fn main() = ignore::<u8>();
+        fn ignore<T>() = {};
+        ",
+    );
+    func_sig(&module, "ignore", vec![], Type::Void);
+}
+
+#[test]
+fn a_turbofish_works_through_a_pipe() {
+    let module = check_ok(
+        "
+        fn main() = { 1 |> id::<u8>(); };
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    func_sig(&module, "id", vec![Type::U8], Type::U8);
+}
+
+#[test]
+fn a_turbofish_selects_the_generic_over_a_concrete_overload() {
+    // Without the turbofish an i8 argument fits both overloads and the call is
+    // ambiguous; the turbofish rules the concrete one out.
+    let module = check_ok(
+        "
+        fn main() = { id::<i8>(1); };
+        fn id(a: i8) -> i8 = a;
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    let insts = &module.funcs[&m("id", vec![Type::I8], Type::I8)];
+    assert_eq!(insts.len(), 2, "both overloads should have been checked");
+}
+
+#[test]
+fn a_turbofish_conflicting_with_the_arguments_is_an_error() {
+    let errs = check_err(
+        "
+        fn main() = { id::<u8>(true); };
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+#[test]
+fn a_turbofish_with_the_wrong_number_of_arguments_is_an_error() {
+    let errs = check_err(
+        "
+        fn main() = { id::<u8, bool>(1); };
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+#[test]
+fn a_turbofish_on_a_non_generic_function_is_an_error() {
+    let errs = check_err(
+        "
+        fn main() = { id::<i32>(1); };
+        fn id(a: i32) -> i32 = a;
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+#[test]
+fn an_empty_type_param_list_is_a_parse_error() {
+    let err = parse_err("fn id<>(a: i32) -> i32 = a;");
+    assert!(
+        matches!(err, FloErr::EmptyTypeParamList { .. }),
+        "expected an empty-type-param-list error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_repeated_type_param_is_a_parse_error() {
+    let err = parse_err("fn id<T, T>(a: T) -> T = a;");
+    assert!(
+        matches!(err, FloErr::RedifinitionOfTypeParam { .. }),
+        "expected a repeated-type-param error, got: {err:?}"
+    );
+}
+
+#[test]
+fn type_params_do_not_leak_between_functions() {
+    // `T` is only a type parameter in `id`. In `other` it reads as the name of
+    // a declared type, and nothing declares one.
+    let errs = check_err(
+        "
+        fn id<T>(a: T) -> T = a;
+        fn other(a: T) -> T = a;
+        ",
+    );
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "T");
+}
+
+// --------------------------------------------------------------------------
+// User defined types
+// --------------------------------------------------------------------------
+
+/// The case name and field initialisers of a type literal.
+fn case_lit(expr: &Expr) -> (&str, &[FieldInit]) {
     match &expr.kind {
-        ExprKind::Defer(body) => body,
-        other => panic!("expected a defer expression, got {other:?}"),
+        ExprKind::CaseLit(None, case, fields) => (case.as_str(), fields),
+        ExprKind::CaseLit(Some(q), ..) => panic!("literal kept its qualifier {q:?}"),
+        other => panic!("expected a type literal, got {other:?}"),
     }
 }
 
-// --------------------------------------------------------------------------
-// Defer
-//
-// `defer <body>` is an expression of type `void`. The body is checked like any
-// other expression, but nothing constrains its type: wherever it ends up
-// running its value is discarded. What the checker does *not* do is move it —
-// that is the `lower` pass, which runs afterwards and has its own tests.
-// --------------------------------------------------------------------------
-
-#[test]
-fn defer_is_void() {
-    let module = check_ok("fn main() = { defer 1; };");
-    let main = func_sig(&module, "main", vec![], Type::Void);
-    assert_eq!(main.body.ty, Type::Void);
-    let (stmts, tail) = scope_parts(&main.body);
-    assert_eq!(stmts[0].ty, Type::Void);
-    assert!(tail.is_none());
+/// The receiver and name of a field access.
+fn field_parts(expr: &Expr) -> (&Expr, &str) {
+    match &expr.kind {
+        ExprKind::Field(recv, name) => (recv, name.as_str()),
+        other => panic!("expected a field access, got {other:?}"),
+    }
 }
 
+fn user(name: &str, args: Vec<Type>) -> Type {
+    Type::User(name.to_string(), args)
+}
+
+/// An anonymous type of one case, for comparing against an inferred one.
+fn anon(case: &str, fields: Vec<(&str, Type)>) -> Type {
+    Type::Anon(vec![TypeCase::new(
+        case.to_string(),
+        fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
+    )])
+}
+
+// --- Declarations ---------------------------------------------------------
+
 #[test]
-fn deferred_value_is_discarded() {
-    // `inc` yields an i32; deferring the call is fine, the value goes nowhere.
+fn a_type_is_declared_with_its_cases_in_order() {
     let module = check_ok(
         "
-        fn main() = { defer inc(1); };
-        fn inc(a: i32) -> i32 = a;
+        type Option = Some { val: i32 } | None;
+        fn main() = {};
         ",
     );
-    let main = func_sig(&module, "main", vec![], Type::Void);
-    let (stmts, _) = scope_parts(&main.body);
-    let body = defer_body(&stmts[0]);
+
+    let decl = &module.types["Option"];
+    assert!(decl.type_params.is_empty());
     assert_eq!(
-        resolved_call_name(body),
-        m("inc", vec![Type::I32], Type::I32)
+        decl.cases.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["Some", "None"]
     );
+    assert_eq!(decl.cases[0].fields[0].name, "val");
+    assert_eq!(decl.cases[0].fields[0].ty, Type::I32);
+    assert!(decl.cases[1].fields.is_empty());
 }
 
 #[test]
-fn deferred_body_is_still_checked() {
-    let errs = check_err("fn main() = { defer nope(); };");
-    assert_err!(errs, FloErr::UndefinedFunction { .. });
-}
-
-#[test]
-fn deferred_body_resolves_overloads() {
+fn a_case_with_no_name_takes_the_types_name() {
     let module = check_ok(
         "
-        fn main() = { let a = 0; defer a = a + 1; };
+        type Vec = { len: u64 };
+        fn main() = {};
         ",
     );
-    let main = func_sig(&module, "main", vec![], Type::Void);
-    let (stmts, _) = scope_parts(&main.body);
-    let ExprKind::Assign(_, value) = &defer_body(&stmts[1]).kind else {
-        unreachable!("expected the deferred assignment")
-    };
-    assert_eq!(
-        resolved_call_name(value),
-        m("+", vec![Type::I32, Type::I32], Type::I32)
+    assert_eq!(module.types["Vec"].cases[0].name, "Vec");
+}
+
+#[test]
+fn the_one_case_shorthand_is_the_named_form() {
+    let shorthand = check_ok("type Foo = { bar: i32 };\nfn main() = {};");
+    let named = check_ok("type Foo = Foo { bar: i32 };\nfn main() = {};");
+
+    let a = &shorthand.types["Foo"].cases;
+    let b = &named.types["Foo"].cases;
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a[0].name, b[0].name);
+    assert_eq!(a[0].fields[0].name, b[0].fields[0].name);
+    assert_eq!(a[0].fields[0].ty, b[0].fields[0].ty);
+}
+
+#[test]
+fn type_and_field_lists_allow_trailing_commas() {
+    let module = check_ok(
+        "
+        type Foo<T,> = Foo { a: T, b: bool, };
+        fn main() = {};
+        ",
+    );
+    assert_eq!(module.types["Foo"].type_params.len(), 1);
+    assert_eq!(module.types["Foo"].cases[0].fields.len(), 2);
+}
+
+#[test]
+fn a_type_and_a_function_may_share_a_name() {
+    // Types, functions and variables are three separate namespaces.
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn Foo() -> Foo = Foo { bar: 0 };
+        fn main() = { Foo(); };
+        ",
+    );
+    func_sig(&module, "Foo", vec![], user("Foo", vec![]));
+}
+
+#[test]
+fn a_type_declared_twice_is_an_error() {
+    let err = parse_err(
+        "
+        type Foo = Foo { a: i32 };
+        type Foo = Foo { b: i32 };
+        fn main() = {};
+        ",
+    );
+    assert!(
+        matches!(err, FloErr::DuplicateType { ref name, .. } if name == "Foo"),
+        "expected a duplicate type error, got: {err:?}"
     );
 }
 
 #[test]
-fn defer_does_not_make_its_scope_take_the_body_type() {
-    // The scope's type still comes from its tail, not from the deferred body.
-    let module = check_ok("fn main() -> bool = { defer 1; true };");
-    let main = func_sig(&module, "main", vec![], Type::Bool);
-    assert_eq!(main.body.ty, Type::Bool);
+fn a_case_declared_twice_is_an_error() {
+    let err = parse_err("type Foo = A { x: i32 } | A { y: i32 };\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::DuplicateCase { ref case, .. } if case == "A"),
+        "expected a duplicate case error, got: {err:?}"
+    );
 }
 
 #[test]
-fn a_deferred_return_diverges_its_scope() {
-    // The body runs on every path out of the scope, so the scope cannot be left
-    // normally — the same answer its lowered form would get.
-    let module = check_ok("fn main() -> i32 = { defer return 1; };");
+fn a_field_declared_twice_is_an_error() {
+    let err = parse_err("type Foo = Foo { x: i32, x: bool };\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::DuplicateField { ref field, .. } if field == "x"),
+        "expected a duplicate field error, got: {err:?}"
+    );
+}
+
+#[test]
+fn an_unknown_type_in_an_annotation_is_an_error() {
+    let errs = check_err("fn main() -> Nope = 0;");
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Nope");
+}
+
+#[test]
+fn an_unknown_type_in_a_let_annotation_is_an_error() {
+    let errs = check_err("fn main() = { let a: Nope = 0; };");
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Nope");
+}
+
+#[test]
+fn a_type_may_be_used_before_it_is_declared() {
+    let module = check_ok(
+        "
+        fn main() -> Foo = Foo { bar: 0 };
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        ",
+    );
+    func_sig(&module, "main", vec![], user("Foo", vec![]));
+}
+
+#[test]
+fn the_wrong_number_of_type_arguments_is_an_error() {
+    let errs = check_err(
+        "
+        type Pair<T> = Pair { a: T, b: T };
+        fn main() -> Pair = 0;
+        ",
+    );
+    assert_err!(
+        errs,
+        FloErr::TypeArityMismatch { name, expected: 1, got: 0, .. } if name == "Pair"
+    );
+}
+
+// --- Recursion ------------------------------------------------------------
+
+#[test]
+fn a_directly_recursive_type_is_an_error() {
+    let errs = check_err(
+        "
+        type List = Cons { next: List } | Nil;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::RecursiveType { name, .. } if name == "List");
+}
+
+#[test]
+fn a_mutually_recursive_type_is_an_error() {
+    let errs = check_err(
+        "
+        type A = A { b: B };
+        type B = B { a: A };
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::RecursiveType { .. });
+    // One cycle, reported once, not once per type on it.
+    assert_eq!(
+        errs.iter()
+            .filter(|e| matches!(e, FloErr::RecursiveType { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn recursion_through_a_generic_type_argument_is_an_error() {
+    // `A` only contains itself because `Holder<T>` holds its `T` by value,
+    // which is not visible until `A` is substituted in for it.
+    let errs = check_err(
+        "
+        type Holder<T> = Holder { it: T };
+        type A = A { held: Holder<A> };
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::RecursiveType { .. });
+}
+
+#[test]
+fn a_generic_that_nests_itself_is_an_error() {
+    let errs = check_err(
+        "
+        type Deep<T> = Deep { next: Deep<Deep<T>> };
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::RecursiveType { name, .. } if name == "Deep");
+}
+
+#[test]
+fn two_fields_of_the_same_type_are_not_recursion() {
+    check_ok(
+        "
+        type Pair<T> = Pair { a: T, b: T };
+        type Both = Both { ints: Pair<i32>, bools: Pair<bool> };
+        fn main() = {};
+        ",
+    );
+}
+
+// --- Literals -------------------------------------------------------------
+
+#[test]
+fn a_literal_takes_the_type_the_context_wants() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32, baz: bool };
+        use Foo::Foo;
+        fn main() -> Foo = Foo { bar: 0, baz: true };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
+    assert_eq!(main.body.ty, user("Foo", vec![]));
+
+    let (case, fields) = case_lit(&main.body);
+    assert_eq!(case, "Foo");
+    // The declared field type is what the literal's `0` became.
+    assert_eq!(fields[0].value.ty, Type::I32);
+}
+
+#[test]
+fn literal_fields_may_come_in_any_order() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32, baz: bool };
+        use Foo::Foo;
+        fn main() -> Foo = Foo { baz: true, bar: 0 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
+    let (_, fields) = case_lit(&main.body);
+    assert_eq!(fields[0].name, "baz");
+    assert_eq!(fields[1].name, "bar");
+}
+
+#[test]
+fn a_literal_is_pinned_by_a_function_boundary() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn take(f: Foo) -> i32 = 0;
+        fn main() -> i32 = take(Foo { bar: 1 });
+        ",
+    );
     let main = func_sig(&module, "main", vec![], Type::I32);
-    let (stmts, _) = scope_parts(&main.body);
-    assert_eq!(stmts[0].ty, Type::Void);
-    assert_eq!(return_value(defer_body(&stmts[0])).unwrap().ty, Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("take", vec![user("Foo", vec![])], Type::I32)
+    );
+    assert_eq!(call_args(&main.body)[0].ty, user("Foo", vec![]));
 }
 
 #[test]
-fn a_deferred_return_type_must_match() {
-    let errs = check_err("fn main() -> i32 = { defer return true; };");
+fn a_literal_that_meets_no_declared_type_becomes_anonymous() {
+    let module = check_ok(
+        "
+        type Nowhere = Nowhere { n: i32 };
+        use Nowhere::Nowhere;
+        fn main() = { let a = Nowhere { n: 1 }; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, _) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, anon("Nowhere", vec![("n", Type::I32)]));
+}
+
+#[test]
+fn identical_anonymous_types_are_the_same_type() {
+    // Structural, so two literals written apart from each other unify.
+    let module = check_ok(
+        "
+        type Point = Point { x: i32, y: i32 };
+        use Point::Point;
+        fn main() = {
+            let a = Point { x: 1, y: 2 };
+            let b = Point { y: 4, x: 3 };
+            a = b;
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, a_ty, _) = let_parts(&stmts[0]);
+    let (_, b_ty, _) = let_parts(&stmts[1]);
+    assert_eq!(a_ty, b_ty);
+    assert_eq!(*a_ty, anon("Point", vec![("x", Type::I32), ("y", Type::I32)]));
+}
+
+#[test]
+fn an_anonymous_type_is_not_a_declared_type_of_the_same_shape() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        type Other = Nope { bar: i32 };
+        use Other::Nope;
+        fn take(f: Foo) -> i32 = 0;
+        fn main() -> i32 = {
+            let a = Nope { bar: 1 };
+            take(a)
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { name, .. } if name == "take");
+}
+
+#[test]
+fn a_case_the_type_does_not_have_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        type Other = Nope { bar: i32 };
+        use Other::Nope;
+        fn main() -> Foo = Nope { bar: 0 };
+        ",
+    );
+    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
+}
+
+#[test]
+fn a_literal_missing_a_field_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32, baz: bool };
+        use Foo::Foo;
+        fn main() -> Foo = Foo { bar: 0 };
+        ",
+    );
+    assert_err!(errs, FloErr::WrongFields { case, .. } if case == "Foo");
+}
+
+#[test]
+fn a_literal_with_an_extra_field_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn main() -> Foo = Foo { bar: 0, nope: 1 };
+        ",
+    );
+    assert_err!(errs, FloErr::WrongFields { case, .. } if case == "Foo");
+}
+
+#[test]
+fn a_field_given_twice_is_an_error() {
+    let err = parse_err(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn main() -> Foo = Foo { bar: 0, bar: 1 };
+        ",
+    );
+    assert!(
+        matches!(err, FloErr::DuplicateFieldInit { ref field, .. } if field == "bar"),
+        "expected a duplicate field error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_field_of_the_wrong_type_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn main() -> Foo = Foo { bar: true };
+        ",
+    );
     assert_err!(errs, FloErr::TypeMismatch { .. });
 }
 
 #[test]
-fn defer_sees_only_what_was_in_scope_where_it_was_written() {
-    // The body is parsed against the scope at the `defer`, not at the point it
-    // will run, so a variable declared below it is not visible.
-    let err = parse_err("fn main() = { defer id(a); let a = 1; };");
+fn a_case_with_no_fields_is_written_bare() {
+    let module = check_ok(
+        "
+        type Option = Some { val: i32 } | None;
+        use Option::None;
+        fn main() -> Option = None;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Option", vec![]));
+    let (case, fields) = case_lit(&main.body);
+    assert_eq!(case, "None");
+    assert!(fields.is_empty());
+    assert_eq!(main.body.ty, user("Option", vec![]));
+}
+
+#[test]
+fn a_variable_wins_over_a_case_of_the_same_name() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() -> i32 = {
+            let Foo = 7;
+            Foo
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    assert!(matches!(tail.unwrap().kind, ExprKind::Var(_)));
+}
+
+#[test]
+fn a_variable_in_a_condition_is_not_read_as_a_literal() {
+    let module = check_ok(
+        "
+        fn main() -> i32 = {
+            let flag = true;
+            if flag { 1 } else { 2 }
+        };
+        ",
+    );
+    func_sig(&module, "main", vec![], Type::I32);
+}
+
+// --- Qualified literals ---------------------------------------------------
+
+#[test]
+fn a_qualifier_pins_a_literal_outright() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() = { let a = Foo::Foo { bar: 0 }; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, user("Foo", vec![]));
+    // The qualifier is dropped once it has done its job: `ty` says which type
+    // this is, exactly as it does for a bare literal.
+    let (case, _) = case_lit(init.unwrap());
+    assert_eq!(case, "Foo");
+}
+
+#[test]
+fn a_turbofish_qualifier_pins_a_generic_type() {
+    let module = check_ok(
+        "
+        type Vec<T> = Vec { len: u64, cap: T };
+        fn main() = { let v = Vec::<u8>::Vec { len: 0, cap: 1 }; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, _) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, user("Vec", vec![Type::U8]));
+}
+
+#[test]
+fn a_qualifier_naming_a_case_the_type_lacks_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        type Baz = Baz { bar: i32 };
+        fn main() = { let a = Foo::Baz { bar: 0 }; };
+        ",
+    );
+    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Baz");
+}
+
+#[test]
+fn a_qualifier_without_a_turbofish_infers_the_type_arguments() {
+    // Naming the type is not the same as giving its arguments: `Option::Some`
+    // says which declaration this is and leaves `T` to inference, which takes it
+    // from the annotation.
+    let module = check_ok(
+        "
+        type Option<T> = Some { val: T } | None;
+        fn main() = { let a: Option<u8> = Option::Some { val: 1 }; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, user("Option", vec![Type::U8]));
+    assert_eq!(init.unwrap().ty, user("Option", vec![Type::U8]));
+}
+
+#[test]
+fn a_qualifier_whose_arguments_cannot_be_inferred_is_an_error() {
+    // Nothing here says what `T` is, so the literal's type never becomes known.
+    let errs = check_err(
+        "
+        type Option<T> = Some { val: T } | None;
+        fn main() = { let a = Option::None; };
+        ",
+    );
+    assert_err!(errs, FloErr::UnresolvedType { .. });
+}
+
+#[test]
+fn a_qualifier_with_the_wrong_number_of_turbofish_arguments_is_an_error() {
+    // Written out, they still have to be right — it is only leaving them off
+    // entirely that defers to inference.
+    let errs = check_err(
+        "
+        type Option<T> = Some { val: T } | None;
+        fn main() = { let a = Option::<u8, u8>::None; };
+        ",
+    );
+    assert_err!(errs, FloErr::TypeArityMismatch { name, .. } if name == "Option");
+}
+
+// --- use ------------------------------------------------------------------
+//
+// A bare name is a variable if one is in scope, then a case a `use` brought in,
+// and otherwise nothing at all. A `use` only makes the name legal: which type
+// the literal belongs to is inferred exactly as it is for the qualified form.
+// --------------------------------------------------------------------------
+
+#[test]
+fn a_bare_case_name_needs_a_use() {
+    let err = parse_err(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() -> Foo = Foo { bar: 0 };
+        ",
+    );
     assert!(
-        matches!(err, FloErr::UndefinedIdentifier { .. }),
-        "expected an undefined-identifier error, got: {err:?}"
+        matches!(err, FloErr::UnknownIdentifier { ref name, .. } if name == "Foo"),
+        "expected an unknown-identifier error, got: {err:?}"
     );
 }
 
 #[test]
-fn defer_in_a_loop_body_may_break() {
-    // `defer` does not change what counts as being inside the loop.
-    check_ok("fn main() = { while true { defer break; }; };");
+fn a_misspelt_variable_is_an_unknown_identifier() {
+    let err = parse_err("fn main() -> i32 = { let count = 1; conut };");
+    assert!(
+        matches!(err, FloErr::UnknownIdentifier { ref name, .. } if name == "conut"),
+        "expected an unknown-identifier error, got: {err:?}"
+    );
 }
 
 #[test]
-fn defer_outside_a_loop_may_not_break() {
-    let err = parse_err("fn main() = { defer break; };");
+fn a_file_scope_use_applies_before_it_is_written() {
+    // Like `fn` and `type`, a file-scope `use` is not order dependent.
+    let module = check_ok(
+        "
+        fn main() -> Foo = Foo { bar: 0 };
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        ",
+    );
+    func_sig(&module, "main", vec![], user("Foo", vec![]));
+}
+
+#[test]
+fn a_use_may_be_a_statement_inside_a_scope() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() -> Foo = {
+            use Foo::Foo;
+            Foo { bar: 0 }
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(matches!(&stmts[0].kind, StmtKind::Use(t, c) if t == "Foo" && c == "Foo"));
+    assert_eq!(tail.unwrap().ty, user("Foo", vec![]));
+}
+
+#[test]
+fn a_scoped_use_does_not_escape_its_scope() {
+    let err = parse_err(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() = {
+            { use Foo::Foo; };
+            Foo { bar: 0 };
+        };
+        ",
+    );
     assert!(
-        matches!(err, FloErr::BreakOutsideLoop { .. }),
-        "expected a break-outside-loop error, got: {err:?}"
+        matches!(err, FloErr::UnknownIdentifier { ref name, .. } if name == "Foo"),
+        "expected an unknown-identifier error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_use_does_not_pin_the_literal_to_the_type_it_named() {
+    // It only makes the name writable. `B` is what the context wants, so `B` is
+    // what the literal becomes, even though the `use` named `A`.
+    let module = check_ok(
+        "
+        type A = Same { n: i32 };
+        type B = Same { n: i32 };
+        use A::Same;
+        fn main() -> B = Same { n: 0 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("B", vec![]));
+    assert_eq!(main.body.ty, user("B", vec![]));
+}
+
+#[test]
+fn a_variable_still_wins_over_a_used_case_of_the_same_name() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn main() -> i32 = {
+            let Foo = 7;
+            Foo
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    assert!(matches!(tail.unwrap().kind, ExprKind::Var(_)));
+}
+
+#[test]
+fn a_use_of_an_undeclared_type_is_an_error() {
+    let errs = check_err(
+        "
+        use Ghost::Ghost;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Ghost");
+}
+
+#[test]
+fn a_use_of_a_case_the_type_lacks_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Nope;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
+}
+
+#[test]
+fn a_scoped_use_is_checked_too() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() = { use Foo::Nope; };
+        ",
+    );
+    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
+}
+
+#[test]
+fn a_use_of_a_generic_types_case_needs_no_type_arguments() {
+    let module = check_ok(
+        "
+        type Option<T> = Some { val: T } | None;
+        use Option::Some;
+        fn main() -> Option<u8> = Some { val: 1 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Option", vec![Type::U8]));
+    let (_, fields) = case_lit(&main.body);
+    assert_eq!(fields[0].value.ty, Type::U8);
+}
+
+#[test]
+fn a_use_is_not_an_expression() {
+    let err = parse_err("fn main() -> i32 = 1 + use Foo::Foo;");
+    assert!(
+        matches!(err, FloErr::UseOutsideStatementPosition { .. }),
+        "expected a misplaced-`use` error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_use_cannot_be_a_scope_tail() {
+    let err = parse_err(
+        "
+        type Foo = Foo { bar: i32 };
+        fn main() = { use Foo::Foo };
+        ",
+    );
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::Semicolon,
+                ..
+            }
+        ),
+        "expected a missing-`;` error, got: {err:?}"
+    );
+}
+
+// --- Shared case names ----------------------------------------------------
+
+#[test]
+fn a_shared_case_name_is_resolved_by_the_expected_type() {
+    let module = check_ok(
+        "
+        type A = Same { n: i32 };
+        type B = Same { n: i32 };
+        use A::Same;
+        fn main() -> B = Same { n: 0 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("B", vec![]));
+    assert_eq!(main.body.ty, user("B", vec![]));
+}
+
+#[test]
+fn a_shared_case_name_prunes_overloads_by_its_fields() {
+    // Both overloads take a type with a case called `Same`, so only the fields
+    // can tell them apart.
+    let module = check_ok(
+        "
+        type A = Same { n: i32 };
+        type B = Same { flag: bool };
+        use A::Same;
+        fn take(a: A) -> i32 = 1;
+        fn take(b: B) -> i32 = 2;
+        fn main() -> i32 = take(Same { flag: true });
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("take", vec![user("B", vec![])], Type::I32)
+    );
+}
+
+#[test]
+fn a_case_name_no_overload_can_take_is_an_error() {
+    let errs = check_err(
+        "
+        type A = OnlyA { n: i32 };
+        type B = Other { n: i32 };
+        use B::Other;
+        fn take(a: A) -> i32 = 1;
+        fn main() -> i32 = take(Other { n: 0 });
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { name, .. } if name == "take");
+}
+
+// --- Field access ---------------------------------------------------------
+
+#[test]
+fn a_field_can_be_read() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32, baz: bool };
+        fn get(f: Foo) -> i32 = f.bar;
+        fn main() = {};
+        ",
+    );
+    let get = func_sig(&module, "get", vec![user("Foo", vec![])], Type::I32);
+    let (recv, name) = field_parts(&get.body);
+    assert_eq!(name, "bar");
+    assert_eq!(recv.ty, user("Foo", vec![]));
+    assert_eq!(get.body.ty, Type::I32);
+}
+
+#[test]
+fn a_field_can_be_assigned() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        fn set(f: Foo) = { f.bar = 100; };
+        fn main() = {};
+        ",
+    );
+    let set = func_sig(&module, "set", vec![user("Foo", vec![])], Type::Void);
+    let (stmts, _) = scope_parts(&set.body);
+    let (target, value) = assign_parts(stmt_expr(&stmts[0]));
+    assert_eq!(field_parts(target).1, "bar");
+    assert_eq!(value.ty, Type::I32);
+}
+
+#[test]
+fn a_field_of_a_temporary_cannot_be_assigned() {
+    let err = parse_err(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn make() -> Foo = Foo { bar: 0 };
+        fn main() = make().bar = 1;
+        ",
+    );
+    assert!(
+        matches!(err, FloErr::NotAssignable { .. }),
+        "expected a not-assignable error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_field_of_a_literal_type_needs_no_annotation() {
+    let module = check_ok(
+        "
+        type Holder = Holder { n: i32 };
+        use Holder::Holder;
+        fn main() -> i32 = {
+            let v = Holder { n: 1 };
+            v.n + 1
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, _) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, anon("Holder", vec![("n", Type::I32)]));
+}
+
+#[test]
+fn field_access_chains() {
+    let module = check_ok(
+        "
+        type Inner = Inner { n: i32 };
+        type Outer = Outer { inner: Inner };
+        fn get(o: Outer) -> i32 = o.inner.n;
+        fn main() = {};
+        ",
+    );
+    let get = func_sig(&module, "get", vec![user("Outer", vec![])], Type::I32);
+    let (recv, name) = field_parts(&get.body);
+    assert_eq!(name, "n");
+    assert_eq!(recv.ty, user("Inner", vec![]));
+}
+
+#[test]
+fn field_access_binds_tighter_than_an_operator() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        fn neg(f: Foo) -> i32 = -f.bar;
+        fn main() = {};
+        ",
+    );
+    let neg = func_sig(&module, "neg", vec![user("Foo", vec![])], Type::I32);
+    // `-(f.bar)`, so the operand of the negation is the access.
+    let arg = &call_args(&neg.body)[0];
+    assert_eq!(field_parts(arg).1, "bar");
+}
+
+#[test]
+fn a_field_in_a_condition_reads_as_a_condition() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32, baz: bool };
+        fn pick(f: Foo) -> i32 = if f.baz { 1 } else { 2 };
+        fn main() = {};
+        ",
+    );
+    func_sig(&module, "pick", vec![user("Foo", vec![])], Type::I32);
+}
+
+#[test]
+fn a_field_of_a_sum_type_is_an_error() {
+    let errs = check_err(
+        "
+        type Option = Some { val: i32 } | None;
+        fn get(o: Option) -> i32 = o.val;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::FieldAccessOnSumType { field, .. } if field == "val");
+}
+
+#[test]
+fn a_field_the_type_does_not_have_is_an_error() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        fn get(f: Foo) -> i32 = f.nope;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::UnknownField { field, .. } if field == "nope");
+}
+
+#[test]
+fn a_field_of_a_primitive_is_an_error() {
+    let errs = check_err("fn get(n: i32) -> i32 = n.bar;\nfn main() = {};");
+    assert_err!(errs, FloErr::NotAStruct { field, .. } if field == "bar");
+}
+
+#[test]
+fn an_access_is_rechecked_after_its_receiver_gains_a_case() {
+    // `v.n` resolves while `v` still looks like a one-case type; the assignment
+    // below widens it, and the final check is what catches that.
+    let errs = check_err(
+        "
+        type Option = Some { n: i32 } | None;
+        use Option::Some;
+        use Option::None;
+        fn main() -> i32 = {
+            let v = Some { n: 1 };
+            let n = v.n;
+            v = None;
+            n
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::FieldAccessOnSumType { field, .. } if field == "n");
+}
+
+// --- Generic types --------------------------------------------------------
+
+#[test]
+fn a_generic_type_is_specialized_by_its_use() {
+    let module = check_ok(
+        "
+        type Holder<T> = Holder { it: T };
+        use Holder::Holder;
+        fn main() -> Holder<u8> = Holder { it: 1 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Holder", vec![Type::U8]));
+    // The field type came from the declaration with `T` substituted away.
+    let (_, fields) = case_lit(&main.body);
+    assert_eq!(fields[0].value.ty, Type::U8);
+}
+
+#[test]
+fn one_generic_type_at_two_specializations() {
+    let module = check_ok(
+        "
+        type Holder<T> = Holder { it: T };
+        use Holder::Holder;
+        fn take(h: Holder<i32>) -> i32 = 1;
+        fn take(h: Holder<bool>) -> i32 = 2;
+        fn main() -> i32 = take(Holder { it: true });
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("take", vec![user("Holder", vec![Type::Bool])], Type::I32)
+    );
+}
+
+#[test]
+fn a_generic_function_over_a_generic_type() {
+    let module = check_ok(
+        "
+        type Holder<T> = Holder { it: T };
+        use Holder::Holder;
+        fn get<T>(h: Holder<T>) -> T = h.it;
+        fn main() -> u8 = get(Holder { it: 1 });
+        ",
+    );
+    func_sig(
+        &module,
+        "get",
+        vec![user("Holder", vec![Type::U8])],
+        Type::U8,
+    );
+}
+
+#[test]
+fn a_turbofish_qualifier_fixes_the_field_type() {
+    let module = check_ok(
+        "
+        type Holder<T> = Holder { it: T };
+        fn main() = { let h = Holder::<u8>::Holder { it: 1 }; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, user("Holder", vec![Type::U8]));
+    let (_, fields) = case_lit(init.unwrap());
+    assert_eq!(fields[0].value.ty, Type::U8);
+}
+
+#[test]
+fn a_user_type_appears_in_the_mangled_name() {
+    let module = check_ok(
+        "
+        type Holder<T> = Holder { it: T };
+        use Holder::Holder;
+        fn take(h: Holder<i32>) -> i32 = 0;
+        fn main() -> i32 = take(Holder { it: 1 });
+        ",
+    );
+    assert!(
+        module
+            .funcs
+            .keys()
+            .any(|k| k.contains("Holder<i32>") && k.starts_with("take")),
+        "expected a mangled name mentioning the specialization, got: {:?}",
+        module.funcs.keys().collect::<Vec<_>>()
+    );
+}
+
+// --- Interaction with the rest of the checker -----------------------------
+
+#[test]
+fn a_diverging_field_value_makes_the_literal_diverge() {
+    let module = check_ok(
+        "
+        type Foo = Foo { bar: i32 };
+        use Foo::Foo;
+        fn main() -> i32 = { let f = Foo { bar: return 1 }; 0 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, Type::Never);
+    assert_eq!(init.unwrap().ty, Type::Never);
+}
+
+#[test]
+fn a_literal_in_both_branches_of_an_if_is_one_type() {
+    let module = check_ok(
+        "
+        type Option = Some { val: i32 } | None;
+        use Option::Some;
+        use Option::None;
+        fn pick(c: bool) -> Option = if c { Some { val: 1 } } else { None };
+        fn main() = {};
+        ",
+    );
+    let pick = func_sig(&module, "pick", vec![Type::Bool], user("Option", vec![]));
+    assert_eq!(pick.body.ty, user("Option", vec![]));
+}
+
+#[test]
+fn two_literals_that_join_become_one_anonymous_sum() {
+    let module = check_ok(
+        "
+        type Option = Some { val: i32 } | None;
+        use Option::Some;
+        use Option::None;
+        fn main() = {
+            let v = Some { val: 1 };
+            v = None;
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, _) = let_parts(&stmts[0]);
+    assert_eq!(
+        *var_ty,
+        Type::Anon(vec![
+            TypeCase::new("None".to_string(), vec![]),
+            TypeCase::new("Some".to_string(), vec![("val".to_string(), Type::I32)]),
+        ])
+    );
+}
+
+#[test]
+fn a_case_that_disagrees_with_itself_is_an_error() {
+    let errs = check_err(
+        "
+        type S = Same { a: i32 };
+        use S::Same;
+        fn main() = {
+            let v = Same { a: 1 };
+            v = Same { b: 2 };
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::WrongFields { case, .. } if case == "Same");
+}
+
+#[test]
+fn a_field_holds_a_literal_of_another_type() {
+    let module = check_ok(
+        "
+        type Inner = Inner { n: i32 };
+        type Outer = Outer { inner: Inner };
+        use Inner::Inner;
+        use Outer::Outer;
+        fn main() -> Outer = Outer { inner: Inner { n: 1 } };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Outer", vec![]));
+    let (_, fields) = case_lit(&main.body);
+    assert_eq!(fields[0].value.ty, user("Inner", vec![]));
+}
+
+#[test]
+fn a_user_type_has_no_builtin_operators() {
+    let errs = check_err(
+        "
+        type Foo = Foo { bar: i32 };
+        fn add(a: Foo, b: Foo) -> Foo = a + b;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { name, .. } if name == "+");
+}
+
+#[test]
+fn an_operator_can_be_overloaded_on_a_user_type() {
+    let module = check_ok(
+        "
+        type Vec2 = Vec2 { x: i32, y: i32 };
+        use Vec2::Vec2;
+        op +(a: Vec2, b: Vec2) -> Vec2 = Vec2 { x: a.x + b.x, y: a.y + b.y };
+        fn plus(a: Vec2, b: Vec2) -> Vec2 = a + b;
+        fn main() = {};
+        ",
+    );
+    let plus = func_sig(
+        &module,
+        "plus",
+        vec![user("Vec2", vec![]), user("Vec2", vec![])],
+        user("Vec2", vec![]),
+    );
+    assert_eq!(
+        resolved_call_name(&plus.body),
+        m(
+            "+",
+            vec![user("Vec2", vec![]), user("Vec2", vec![])],
+            user("Vec2", vec![])
+        )
     );
 }

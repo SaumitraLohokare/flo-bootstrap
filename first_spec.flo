@@ -1,0 +1,606 @@
+-- =============================================================================
+--  FLO -- FIRST SPECIFICATION
+--
+--  The feature set the first version of the compiler targets. This is also
+--  meant to be the minimal subset the language needs in order for the compiler
+--  to be rewritten in itself.
+--
+--  1. Lexical structure
+--  2. Types
+--  3. Declarations
+--  4. Expressions
+--  5. Generics
+--  6. Programs & modules
+--  7. Implementation status
+-- =============================================================================
+
+
+-- =============================================================================
+--  1. LEXICAL STRUCTURE
+-- =============================================================================
+
+--- 1.1 Comments
+
+-- A comment runs from `--` to the end of the line.
+
+--- 1.2 Literals
+
+fn int_lit() -> i32 = 0; -- it can coerce to any integral type
+fn flt_lit() -> f32 = 0.0; -- it can also coerce to any float type
+-- can omit the trailing 0 => 0. == 0.0
+fn bool_lit() -> bool = true; -- or false
+fn char_lit() -> u8 = 'a'; -- char literals are u8
+
+-- String literals also allow multi-line
+let code: string = "
+#version core 330
+
+int main() {
+    // shader code
+}
+";
+
+-- String and char literals allow the same escape sequences as C
+
+--- 1.3 Trailing commas
+
+-- Trailing commas are allowed everywhere there is a comma separated list
+
+
+-- =============================================================================
+--  2. TYPES
+-- =============================================================================
+
+--- 2.1 Primitive types
+
+-- u8 u16 u32 u64     unsigned integers
+-- i8 i16 i32 i64     signed integers
+-- f32 f64            floats
+-- bool               true / false
+-- void               the type of an expression that yields no value
+-- noreturn           the type of an expression that never yields (see 4.6)
+
+-- Cannot do: type Id = i32;
+-- No plan to add typedef for first spec
+
+--- 2.2 Pointers
+
+-- Uses the same syntax as C
+fn swap(a: *i32, b: *i32) = {
+    let temp = *b;
+    *b = *a;
+    *a = temp;
+};
+
+fn pointers() -> i32 = {
+    let a = 10;
+    let b = 20;
+    let c = 30;
+
+    &a |> swap(&c); -- & and * bind tighter than any binary op (even pipe)
+    a + b
+};
+
+-- This follows the same rules as C. values taken address of are always l_value, etc.
+
+-- The null pointer is `nil`
+let null_ptr: *i32 = nil;
+
+-- We also have pointer arithmetic, same as C
+
+--- 2.3 Arrays
+
+let arr: [3]i32 = [1, 1, 0];
+
+fn arrays() = {
+    let a = arr[0];
+    let b = arr[1];
+    arr[2] = a + b;
+
+    -- The pointer to the first element can be taken like this:
+    let ptr = &arr;
+
+    -- unlike C, arrays are not treated as pointers.
+    -- In the future we'd like to add bounds checking for arrays
+};
+
+-- Arrays can be multi dimensional
+let ident: [2][2]i32 = [
+    [1, 0],
+    [0, 1],
+];
+
+--- 2.4 Slices
+
+let slice: []i32 = [1, 2, 3, 4]; -- arrays can be implicitly typed to slices
+-- A slice is simply a pointer and a length
+-- Rest everything is similar to arrays
+
+-- slices can also be multi dimensional
+-- TODO: How would you implicitly slice a multi-dim array?
+
+--- 2.5 Strings
+
+let s: string = "Hello, World!";
+-- Internally, string == []u8
+-- So all strings are length based instead of null terminated
+
+-- All strings are also modifiable
+fn change_s() = s[12] = '?'; -- This would've been UB in C
+
+-- This does mean that in each function the strings are copied
+fn copied_strings() = {
+    let a = "Hi"; -- String get's copied every time
+    a[0] = 'G';
+};
+
+-- There should be a future optimization to put strings in .rodata
+-- if they're not modified & remove the copy
+
+--- 2.6 User defined types
+
+type Foo = Foo { bar: i32, baz: bool };
+
+type Option<T> = Some { val: T } | None;
+
+-- An easier way to define a type with only one case is:
+type Vec<T> = { data: *T, len: u64, cap: u64 };
+-- This is the same as:
+type Vec<T> = Vec { data: *T, len: u64, cap: u64 };
+
+-- Types and functions have separate namespaces
+-- Globals also have a separate namespace
+
+-- Recursive types whose size cannot be calculated aren't allowed, all types must have a fixed size at
+-- compile time
+
+--- 2.7 Type literals
+
+use Foo::Foo;
+fn type_literals() -> Foo = Foo { bar: 0, baz: true };
+-- fields must be named, order independent
+-- Names are always the tag
+
+-- A literal names a *case*, never a type, so a bare case name has to have been
+-- brought into scope by a `use` (see 3.7). Written out it needs no `use`:
+fn qualified() -> Foo = Foo::Foo { bar: 0, baz: true };
+--                     ^--- the type
+--                          ^--- the case
+
+fn Vec<T>() -> Vec<T> = Vec::<T>::Vec { data: nil, len: 0, cap: 0 };
+-- The turbofish is only needed to say what the type arguments are. Left off,
+-- they are inferred like anything else:
+fn some(v: i32) -> Option<i32> = Option::Some { val: v };
+
+--- 2.8 Field access
+
+fn field_access() = {
+    let foo = Foo { bar: 0, baz: false };
+
+    -- Fields can be accessed of a type with only one
+    -- case without needing is expr
+    if foo.baz {
+        foo.bar = 100;
+    }
+};
+
+--- 2.9 Layout
+
+-- The tag takes the smallest size uint possible
+-- It is represented in C as a struct with a tag and a union.
+-- If there is only one case, there is no tag, and is represented as
+-- a struct in C.
+
+
+-- =============================================================================
+--  3. DECLARATIONS
+-- =============================================================================
+
+--- 3.1 Functions
+
+fn main() = println("Hello, World!");
+
+--- 3.2 Arguments & Return
+
+fn add(a: i32, b: i32) -> i32 = a + b;
+
+--- 3.3 Overloading
+
+fn add(a: i32, b: i32) -> i32 = a + b;
+fn add(a: u32, b: u32) -> u32 = a + b;
+
+-- Having multiple similar or same overloads isn't an error in itself
+-- The error comes from not being able to decide an overload at call site
+
+--- 3.4 Operators
+
+op +(a: i32, b: i32) -> i32 = -- ...
+
+-- The operator set is the same as C's
+-- Operators on primitive types are built-in
+-- Only the dereference and address of and [] operators cannot be overloaded
+
+--- 3.5 External functions
+
+extern fn println(s: string);
+-- External functions to interop with C
+-- All functions in the langauge use C ABI
+-- There will be a separate function to convert a string
+-- to cstring. Our language will only use length based strings.
+-- A C string will be *u8
+
+--- 3.6 Global Variables
+
+let global_counter: i32 = 0; -- Global vars must always be given a type
+
+-- Global variables don't allow shadowing
+
+-- Their rhs assignment must only be a constexpr.
+-- A const expr is one where all expressions are either literals,
+-- A later update will allow function calls of pure functions.
+-- A function is pure if it doesn't use any global variables,
+-- and doesn't call any external functions, and doesn't call any
+-- other impure function
+
+--- 3.7 Use declarations
+
+use Option::Some;
+use Option::None;
+
+-- A `use` brings a case name into scope so that it may be written bare, the
+-- way `Some { val: 0 }` is. Without one there is nothing a bare name could
+-- mean: a case name says nothing about which type it belongs to, and several
+-- types may declare a case by the same name.
+
+-- A `use` does NOT decide which type a literal is. It only makes the name
+-- writable; which type it becomes is inferred exactly as it is for the
+-- `Type::Case` form. So this is legal, and yields a `Result`:
+type Result<T> = Some { val: T } | Err;
+fn takes_result() -> Result<i32> = Some { val: 0 };
+
+-- Nothing about a generic type's arguments is named here, so one `use` covers
+-- every specialization of it.
+
+-- A `use` may appear at file scope, where it covers the whole file regardless
+-- of where it is written, or as a statement inside a scope (see 4.1), where it
+-- covers the rest of that scope only.
+
+
+-- =============================================================================
+--  4. EXPRESSIONS
+-- =============================================================================
+
+--- 4.1 Scope expr
+
+-- A scope is a list of statements followed by an optional tail expression.
+-- A statement is a `let` (4.2), a `use` (3.7), or an expression written for its
+-- effect. Only the tail has a value, and it is the scope's.
+
+fn scope_ex() = {}; -- Empty scope evaluated to void
+fn scope_ex() = {
+    print("Hi");  -- Multiple expressions can be chained with `;`
+    print("Hi");
+    {                   -- Scopes can also be inserted in
+        print("Hi");
+    }                   -- They don't need to end in a `;` (implicit)
+    if foo() {
+        -- If also has the implicit `;`
+    }
+    while foo() {
+        -- While also has implicit `;`
+    }
+    print("Hi");
+};
+fn scope_ex() -> i32 = { 0 }; -- Scoped have implicit return
+
+--- 4.2 Variables
+
+fn var() -> u8 = {
+    let x = 10; -- This is mutable
+    x = 2;
+    let y: u8 = 1; -- Can specify types
+
+    {
+        let x = 32; -- shadowing is allowed
+        y = x;
+    }
+
+    x + y
+};
+
+fn var() = {
+    let x; -- This is ok, we will figure out it's type from usage, the space is reserved, and zero initialized by default
+    x = 20;
+
+    -- let can only occur at statement level inside a scope
+    -- Anywhere else is illegal. A statement has no value, so a `let` always
+    -- ends in a `;` -- it can never be the scope's tail.
+};
+
+--- 4.3 If expr
+
+fn if_ex(a: bool) -> u8 = if a { 0 } else { 1 };
+-- Both branches of a complete if must have the same type
+
+fn dangling_if(a: bool) -> void = if a {
+    -- Do something
+};
+-- An incomplete if evaluates to void & it's body must also evaluate to void
+
+-- The if body must be a scope
+-- The else body can be a scope or another if (allows `else if`)
+
+--- 4.4 While
+
+fn while_ex() = while false {
+    -- Do something
+};
+-- while always evaluates to void
+-- it's body also must be a scope that evaluates to void
+
+--- 4.5 Break & Continue
+
+fn break_continue() = {
+    while foo() {
+        if bar() { break }
+        if baz() { continue }
+    }
+};
+-- break and continue must be inside a loop
+-- They also evaluate to noreturn type
+
+--- 4.6 Return expr
+
+fn foo() -> i32 = return 0;
+-- return evaluates to noreturn type
+-- noreturn unifies with any other type
+-- type of expr after return must unify with return type
+
+fn foo() = return;
+-- No expr after return means return void
+
+--- 4.7 Piping
+
+fn foo(a: i32) -> bool = -- ...
+fn bar(a: bool) -> i32 = -- ...
+
+fn main() = 0 |> foo |> bar;
+
+-- The piped value is passed in as the first argument
+-- additional arguments can be passed further
+
+fn baz(a: i32, b: i32) -> i32 = -- ...
+
+fn main() = 0 |> foo() |> bar() |> baz(1);
+
+--- 4.8 is expression
+
+-- <expr> is <destructure> -> bool
+-- Allows defining new variables
+
+if option is Some { val } {
+    -- val is usable here
+} else {
+    -- val isn't usable here
+}
+
+-- The bool of an is expr must be used or it's a warning
+-- eg:
+option is Some { val }; -- Will give a warning (unused result of is expr)
+
+--- 4.9 Casting
+
+let cast_from: i32 = 20;
+let cast_to: u8  = @cast(u8) cast_from;
+
+-- @cast does a simple bit-cast
+-- It can give a warning if the sizes of the two types
+-- arent the same.
+
+--- 4.10 Size & Align
+
+let size: u64 = @sizeof(i32); -- Can only take a type as argument
+let align: u64 = @alignof(i32); -- Same here
+
+
+-- =============================================================================
+--  5. GENERICS
+-- =============================================================================
+
+--- 5.1 Generic functions
+
+fn add<T>(a: T, b: T) -> T = a + b;
+
+-- Every call site can specialize a new version of the generic.
+
+-- A generic function is never checked on its own -- it has no single type.
+-- Only its specializations are checked, which has two consequences:
+--   - A generic nothing ever calls is never checked at all.
+--   - A mistake in the body is reported for the specialization that exposes
+--     it, at the place in the body where it is, with a note naming the
+--     specialization. See 5.3.
+
+--- 5.2 Generic types
+
+type View<T> = { data: *T, len: u64 };
+
+-- Similarly every use of this type can be specialized
+
+--- 5.3 Specialization & the turbofish
+
+fn uses() = {
+    let a = 10;
+    let b = 20;
+
+    let view_a = View { data: &a, len: 1 };
+    let view_b = View::<i32>::View { data: &b, len: 1 };
+    --           ^---------- This is the type
+    --                        ^--- This is the case
+
+    let new_view = view_a |> add(view_b); -- ERROR, the error will be printed in `add`
+                                          -- Error because it tried to monomorphize and failed
+    let new_num = a |> add::<i32>(b); -- We use turbofish operator to tell the generic type
+};
+
+-- This shows us a funny mechanic of the language. All user type literals just give the case name.
+-- The return types or argument types is what allows us to infer their type.
+
+
+-- =============================================================================
+--  6. PROGRAMS & MODULES
+-- =============================================================================
+
+--- 6.1 The main function
+
+fn main(args: []string) = {
+    -- This is how to get cmdline args
+};
+
+-- main function can either take no args or []string
+-- and it can return void or i32
+
+-- main cannot have any overloads
+
+--- 6.2 Multi File
+
+-- Importing single files only allowed
+-- No complex modules system
+
+-- Imports foo.flo from relative to this file
+-- All imported functions and globals are visible
+-- by default
+import "./foo.flo"
+
+-- Imports it under foo namespace
+import foo "./foo.flo"
+
+-- imports from foo will be visible inside `foo::`
+let imported: i32 = foo::a;
+
+-- If the path isn't relative, it checks the folder the compiler is present in
+-- And the folder the compiler was run from
+import "std/vec.flo";
+
+-- The std library will be present in compiler folder
+
+-- To make something public, use pub
+pub fn add(a: i32, b: i32) -> i32 = a + b;
+
+pub type Foo = { bar: i32 }; -- All fields are public like C struct
+
+pub let a: i32 = 100;
+
+-- Recursive imports are ok
+
+-- No forced structure for code by compiler
+
+
+-- =============================================================================
+--  7. IMPLEMENTATION STATUS
+-- =============================================================================
+
+--- 7.1 Implemented
+
+-- 1.1  Comments
+-- 1.2  Integer, float and bool literals, and their coercion
+-- 1.3  Trailing commas, in the comma separated lists that exist so far
+-- 2.1  Primitive types -- except `noreturn` as something you can write down
+-- 2.6  User defined types: declaration, sum cases, the one-case shorthand,
+--      and the rejection of a type that has no size (2.9's lowering is not
+--      done, so a one-case type is not yet *treated* as a struct anywhere)
+-- 2.7  Type literals, including the `Vec::<i32>::Vec { .. }` form and the
+--      `Option::Some { .. }` one, whose type arguments are inferred
+-- 2.8  Field access, and assignment through it
+-- 3.1  Functions
+-- 3.2  Arguments & return
+-- 3.3  Overloading, on argument types AND on return type
+-- 3.4  `op` overloads, and the built-in operators on primitives
+-- 3.7  `use`, at file scope and as a statement
+-- 4.1  Scope expr, including the implicit `;` and the implicit tail value
+-- 4.2  Variables: `let` with/without a type, with/without an initializer,
+--      shadowing, and assignment
+-- 4.3  If expr, including `else if`
+-- 4.4  While
+-- 4.5  Break & continue
+-- 4.6  Return, and `noreturn` as an internal type
+-- 4.7  Piping
+-- 5.1  Generic functions
+-- 5.2  Generic types
+-- 5.3  The turbofish, and specialization -- for functions and for types
+-- 6.1  The main function -- except the `[]string` argument form
+
+-- Also, not visible in the spec but done: whole-function type inference, with
+-- literal defaulting ({integer} -> i32, {decimal} -> f32) and overload
+-- resolution iterated to a fixpoint. Overload resolution sees generic and
+-- ordinary functions as one set, so the two can overload each other.
+
+-- And, on 2.6/2.7: a literal names a *case*, and several types may have a case
+-- by that name, so a literal does not pick a type when it is written. It gets
+-- an open type of the cases it is known to have, which narrows as it meets
+-- other types -- merging with another open one, or becoming a declared type
+-- when it reaches an annotation or a function boundary. A literal that never
+-- meets a declared type closes into an anonymous type of exactly the cases it
+-- had. Anonymous types are structural (two with the same cases are one type)
+-- and are never equal to a declared type of the same shape.
+--
+-- A bare name that is not followed by `(` is read as a variable if one is in
+-- scope, then as a case a `use` brought in, and is an unknown identifier
+-- otherwise. Which means an anonymous type can no longer be written down
+-- directly: every bare case name comes from a `use`, and a `use` names a
+-- declared type. One still arises whenever a literal never meets the
+-- declaration it was used from -- `let a = Some { val: 1 };` with nothing
+-- pinning it closes into `{Some { val: i32 }}`, not into `Option<i32>`.
+
+--- 7.2 Not implemented
+
+-- Types & data
+-- 2.2  Pointers: `*T`, `&x`, `*p`, `nil`, pointer arithmetic
+-- 2.3  Arrays: `[N]T`, array literals, indexing, `&arr`
+-- 2.4  Slices: `[]T`, implicit array -> slice
+-- 2.5  Strings: the `string` type, string and char literals, escape
+--      sequences, multi-line literals, and the copy-on-use rule
+-- 2.9  Layout (tag + union lowering). Nothing lowers yet, so a one-case type
+--      is checked as a one-case type rather than as a struct.
+-- 4.8  is expression & destructuring. Until it lands, a sum type can be
+--      declared and built, but its fields cannot be read: field access is
+--      rejected on anything with more than one case.
+--      Recursive types through a pointer. Every field holds its type by
+--      value today, so the size check rejects any cycle at all; a `*T` field
+--      will break the cycle once 2.2 exists.
+
+-- Declarations
+-- 3.5  External functions
+-- 3.6  Global variables & their constexpr initializers
+
+-- Operators & builtins
+-- 3.4  Missing operators: `!`, `~`, `<<`, `>>`
+-- 3.4  Short-circuiting `&&` and `||`. Today they are ordinary built-in
+--      calls, so both sides are always evaluated.
+-- 4.9  @cast
+-- 4.10 @sizeof / @alignof
+
+-- Programs
+-- 6.1  `main(args: []string)` -- blocked on 2.4 and 2.5
+-- 6.2  Multi file: `import`, namespaced import, `pub`
+
+-- Compiler infrastructure -- not language features, but needed
+-- - Warnings of any kind. Both the unused-`is`-result warning (4.8) and the
+--   @cast size-mismatch warning (4.9) need a diagnostic sink that is not
+--   error-only.
+-- - Tokenizer error reporting. It panics on an unknown character or a
+--   malformed number instead of reporting one.
+-- - Deterministic error ordering. Functions are checked by iterating a
+--   HashMap, so errors come out in a random order.
+-- - Code generation. Nothing exists yet; the plan is to transpile to C.
+
+--- 7.3 Suggested order
+
+-- TODO: Change && and || to not be overloadable, since shortcircuit
+-- TODO: Add missing operators & cast & sizeof/alignof
+-- TODO: Add pointers & pointer operators
+-- TODO: Add arrays
+-- TODO: Add slices & strings & char
+-- TODO: Add global variables (without function constexpr)
+-- TODO: Add multi file support
+-- TODO: Add C transpile & C ABI support (extern functions & variables)
+-- TODO: Test in real usecase

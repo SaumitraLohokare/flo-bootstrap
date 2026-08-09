@@ -1,10 +1,13 @@
 use std::process::exit;
 
-use crate::{lower::lower, parser::Parser, tokenizer::Tokenizer, type_checker::TypeChecker};
+use crate::{
+    parser::{Parser, check_entry_point},
+    tokenizer::Tokenizer,
+    type_checker::TypeChecker,
+};
 
 mod ast;
 mod errors;
-mod lower;
 mod parser;
 mod tokenizer;
 mod type_checker;
@@ -14,39 +17,42 @@ mod util;
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
 // FIXME: Add bitwise shift/not & logical not
 // FIXME: No warnings for using an uninitialized variable
-// FIXME: Scopes, If, While need a `;` after them.
+// FIXME: Tokenizer panics instead of reporting an error (unknown char, bad number)
 
 // Then: Pointers -> Arrays & Slices -> Strings
-// Then: Generics -> Sum Types -> is & Destructuring
+// Then: is & Destructuring
 // Then: Modules & Project Structure
 // Then: C Transpiling -> External Funcs -> Compiler Directives (@windows/@linux/@macos/@extern/@link)
 
 fn main() {
     let src = r#"
-        fn main() -> i32 = defer_ex(10);
+        type Vec2 = { x: i32, y: i32 };         -- one case, named after the type
 
-        fn defer_ex(n: i32) -> i32 = {
-            let acc = 0;
-            let i = 0;
+        type Option<T> = Some { val: T } | None;
 
-            while i < n {
-                -- Runs at the end of every iteration, `continue` and `break`
-                -- included, so the loop always makes progress.
-                defer i = i + 1;
+        use Vec2::Vec2;                         -- file scope, and order does not
+        use Option::None;                       -- matter: `wrap` below uses `Some`
 
-                if i % 2 == 0 {
-                    continue;
-                };
+        op +(a: Vec2, b: Vec2) -> Vec2 = Vec2 { x: a.x + b.x, y: a.y + b.y };
 
-                if i > 7 {
-                    break;
-                };
+        fn main() -> i32 = {
+            let a = Vec2 { x: 1, y: 2 };
+            let b = Vec2 { y: 4, x: 3 };        -- fields in any order
+            let sum = a + b;
 
-                acc = acc + i;
-            };
+            let some = wrap::<u8>(7);           -- Option<u8>
+            let none: Option<i32> = None;       -- the case alone gives the type
 
-            acc
+            -- Written out, so no `use` is needed. The type argument is left to
+            -- inference, which takes it from the annotation.
+            let two: Option<i32> = Option::Some { val: sum.x };
+
+            sum.x + sum.y
         };
+
+        use Option::Some;
+
+        fn wrap<T>(v: T) -> Option<T> = Some { val: v };
     "#
     .to_string();
 
@@ -59,6 +65,11 @@ fn main() {
         }
     };
 
+    if let Err(err) = check_entry_point(&module) {
+        err.pretty_print(&src);
+        exit(1);
+    }
+
     println!("{module:?}");
 
     let module = match TypeChecker::new().check(module) {
@@ -70,12 +81,6 @@ fn main() {
             exit(1);
         }
     };
-
-    println!("{module:?}");
-
-    // `defer` is the only thing lowering touches so far, so this runs on a
-    // fully typed module and cannot fail.
-    let module = lower(module);
 
     println!("{module:?}");
 }

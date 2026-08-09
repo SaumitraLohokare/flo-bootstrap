@@ -26,12 +26,153 @@ pub enum FloErr {
 
     MultipleMainFunction,
 
+    InvalidMainSignature {
+        ty: Type,
+        loc: Loc,
+    },
+
+    LetOutsideStatementPosition {
+        loc: Loc,
+    },
+
+    UseOutsideStatementPosition {
+        loc: Loc,
+    },
+
+    /// A bare name that is neither a variable in scope nor a case brought in by
+    /// a `use`. Without one of those there is nothing it could mean: a case name
+    /// says nothing about which type it belongs to, so an unknown one cannot
+    /// just be taken as a literal.
+    UnknownIdentifier {
+        name: String,
+        loc: Loc,
+    },
+
+    RedifinitionOfTypeParam {
+        name: String,
+        loc: Loc,
+    },
+
+    EmptyTypeParamList {
+        loc: Loc,
+    },
+
+    /// A type parameter that nothing at the call site pins down.
+    CannotInferTypeParam {
+        name: String,
+        loc: Loc,
+    },
+
+    /// Something went wrong inside a generic function's body, for one
+    /// particular instantiation of it. `cause` is reported at its own location
+    /// inside the generic; this wrapper adds the call site that asked for it.
+    InGenericInstantiation {
+        name: String,
+        type_args: Vec<Type>,
+        call_loc: Loc,
+        cause: Box<FloErr>,
+    },
+
+    /// Guards against a generic that instantiates itself without ever bottoming
+    /// out, which would otherwise loop forever.
+    MonomorphizationLimit {
+        name: String,
+        limit: usize,
+        loc: Loc,
+    },
+
     NotAType {
         token: Token,
     },
 
-    UndefinedIdentifier {
+    /// A `type` case that is neither `Name`, `Name { .. }` nor `{ .. }`.
+    ExpectedCase {
+        found: Token,
+    },
+
+    DuplicateType {
         name: String,
+        loc: Loc,
+        prev_loc: Loc,
+    },
+
+    DuplicateCase {
+        type_name: String,
+        case: String,
+        loc: Loc,
+        prev_loc: Loc,
+    },
+
+    DuplicateField {
+        case: String,
+        field: String,
+        loc: Loc,
+        prev_loc: Loc,
+    },
+
+    /// The same field given twice in one type literal.
+    DuplicateFieldInit {
+        field: String,
+        loc: Loc,
+        prev_loc: Loc,
+    },
+
+    /// A type annotation naming a type that nothing declares.
+    UnknownType {
+        name: String,
+        loc: Loc,
+    },
+
+    TypeArityMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+        loc: Loc,
+    },
+
+    /// A type that contains itself with nothing to break the cycle, so it has
+    /// no size. `cycle` is the path back to the type, in order.
+    RecursiveType {
+        name: String,
+        cycle: Vec<String>,
+        loc: Loc,
+    },
+
+    /// A literal of a case the type it was pinned to does not have.
+    NoSuchCase {
+        ty: Type,
+        case: String,
+        loc: Loc,
+    },
+
+    /// A literal that gave a case the wrong fields. A literal must give every
+    /// field of its case and no others, so this covers missing and unknown ones
+    /// alike.
+    WrongFields {
+        case: String,
+        expected: Vec<String>,
+        got: Vec<String>,
+        loc: Loc,
+    },
+
+    UnknownField {
+        ty: Type,
+        field: String,
+        loc: Loc,
+    },
+
+    /// Field access on a type with more than one case. Which case a value holds
+    /// is not known without asking, so its fields are reached through `is`.
+    FieldAccessOnSumType {
+        ty: Type,
+        field: String,
+        loc: Loc,
+    },
+
+    /// Field access on something that has no fields at all, like `1.x`.
+    NotAStruct {
+        ty: Type,
+        field: String,
         loc: Loc,
     },
 
@@ -66,12 +207,6 @@ pub enum FloErr {
         loc: Loc,
     },
 
-    AmbiguousOverload {
-        name: String,
-        found_loc: Loc,
-        previous_loc: Loc,
-    },
-
     NoPossibleOverloads {
         name: String,
         known_ty: Type,
@@ -101,6 +236,28 @@ impl FloErr {
     pub fn pretty_print(self, src: &String) {
         use FloErr::*;
 
+        // This one has no message of its own. The cause is the error, and it
+        // prints at its own location inside the generic; all this adds is a note
+        // saying which instantiation exposed it. Handled before the `error:`
+        // prefix so the cause is the thing labelled as the error.
+        if let InGenericInstantiation {
+            name,
+            type_args,
+            call_loc,
+            cause,
+        } = self
+        {
+            cause.pretty_print(src);
+            let args = type_args
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("\x1b[1;36mnote\x1b[0m: while instantiating `{name}::<{args}>`");
+            print_src(src, &[call_loc]);
+            return;
+        }
+
         eprint!("\x1b[1;31merror\x1b[0m: ");
 
         match self {
@@ -125,6 +282,95 @@ impl FloErr {
                 eprintln!("`{}` is not a type", token.kind.pretty_name(),);
                 print_src(src, &[token.loc]);
             }
+            ExpectedCase { found } => {
+                eprintln!(
+                    "Expected a case of the type, but found `{}`",
+                    found.kind.pretty_name()
+                );
+                eprintln!("    a case is `Name`, `Name {{ .. }}`, or `{{ .. }}` to reuse the type's name");
+                print_src(src, &[found.loc]);
+            }
+            DuplicateType {
+                name,
+                loc,
+                prev_loc,
+            } => {
+                eprintln!("Type `{name}` is declared more than once");
+                print_src(src, &[prev_loc, loc]);
+            }
+            DuplicateCase {
+                type_name,
+                case,
+                loc,
+                prev_loc,
+            } => {
+                eprintln!("Type `{type_name}` declares the case `{case}` more than once");
+                print_src(src, &[prev_loc, loc]);
+            }
+            DuplicateField {
+                case,
+                field,
+                loc,
+                prev_loc,
+            } => {
+                eprintln!("Case `{case}` declares the field `{field}` more than once");
+                print_src(src, &[prev_loc, loc]);
+            }
+            DuplicateFieldInit {
+                field,
+                loc,
+                prev_loc,
+            } => {
+                eprintln!("Field `{field}` is given more than once");
+                print_src(src, &[prev_loc, loc]);
+            }
+            UnknownType { name, loc } => {
+                eprintln!("Unknown type `{name}`");
+                print_src(src, &[loc]);
+            }
+            TypeArityMismatch {
+                name,
+                expected,
+                got,
+                loc,
+            } => {
+                eprintln!(
+                    "Type `{name}` takes {expected} type argument(s), but {got} were given"
+                );
+                print_src(src, &[loc]);
+            }
+            RecursiveType { name, cycle, loc } => {
+                eprintln!("Type `{name}` contains itself, so it has no fixed size");
+                eprintln!("    {}", cycle.join(" -> "));
+                print_src(src, &[loc]);
+            }
+            NoSuchCase { ty, case, loc } => {
+                eprintln!("Type `{ty:?}` has no case `{case}`");
+                print_src(src, &[loc]);
+            }
+            WrongFields {
+                case,
+                expected,
+                got,
+                loc,
+            } => {
+                eprintln!("Case `{case}` needs the fields {}", named(&expected));
+                eprintln!("    but was given {}", named(&got));
+                print_src(src, &[loc]);
+            }
+            UnknownField { ty, field, loc } => {
+                eprintln!("Type `{ty:?}` has no field `{field}`");
+                print_src(src, &[loc]);
+            }
+            FieldAccessOnSumType { ty, field, loc } => {
+                eprintln!("Cannot read `{field}` of `{ty:?}`, which has more than one case");
+                eprintln!("    which case it holds has to be established with `is` first");
+                print_src(src, &[loc]);
+            }
+            NotAStruct { ty, field, loc } => {
+                eprintln!("Cannot read `{field}` of `{ty:?}`, which has no fields");
+                print_src(src, &[loc]);
+            }
             TypeMismatch {
                 expected: t1,
                 got: t2,
@@ -139,8 +385,46 @@ impl FloErr {
             MultipleMainFunction => {
                 eprintln!("Multiple definitions of `main` function found.");
             }
-            UndefinedIdentifier { name, loc } => {
-                eprintln!("Undefined identifier `{name}`");
+            InvalidMainSignature { ty, loc } => {
+                eprintln!("`main` cannot have the type `{ty:?}`");
+                eprintln!(
+                    "    it must be `fn main()` or `fn main(args: []string)`, returning `void` or `i32`"
+                );
+                print_src(src, &[loc]);
+            }
+            LetOutsideStatementPosition { loc } => {
+                eprintln!("`let` may only appear as a statement inside a scope");
+                print_src(src, &[loc]);
+            }
+            UseOutsideStatementPosition { loc } => {
+                eprintln!("`use` may only appear at file scope, or as a statement inside a scope");
+                print_src(src, &[loc]);
+            }
+            UnknownIdentifier { name, loc } => {
+                eprintln!("Unknown identifier `{name}`");
+                eprintln!(
+                    "    it is not a variable in scope; if it is a case of a type, bring it in with `use Type::{name};` or write it as `Type::{name}`"
+                );
+                print_src(src, &[loc]);
+            }
+            RedifinitionOfTypeParam { name, loc } => {
+                eprintln!("Redifinition of type parameter `{name}`");
+                print_src(src, &[loc]);
+            }
+            EmptyTypeParamList { loc } => {
+                eprintln!("Empty type parameter list");
+                print_src(src, &[loc]);
+            }
+            CannotInferTypeParam { name, loc } => {
+                eprintln!("Cannot infer type parameter `{name}` at this call");
+                eprintln!("    give it explicitly with a turbofish, eg `f::<i32>(..)`");
+                print_src(src, &[loc]);
+            }
+            // Handled above, before the `error:` prefix.
+            InGenericInstantiation { .. } => unreachable!(),
+            MonomorphizationLimit { name, limit, loc } => {
+                eprintln!("`{name}` was instantiated more than {limit} times");
+                eprintln!("    it is probably generic over itself without a base case");
                 print_src(src, &[loc]);
             }
             UndefinedFunction { name, loc } => {
@@ -181,14 +465,6 @@ impl FloErr {
                 eprintln!("    {possible_tys}");
                 print_src(src, &[loc]);
             }
-            AmbiguousOverload {
-                name,
-                found_loc,
-                previous_loc,
-            } => {
-                eprintln!("Ambiguous overload `{name}`");
-                print_src(src, &[found_loc, previous_loc]);
-            }
             ExpectedOp { found, loc } => {
                 eprintln!("Expected an operator but found: `{}`", found.pretty_name());
                 print_src(src, &[loc]);
@@ -207,6 +483,18 @@ impl FloErr {
             }
         }
     }
+}
+
+/// A list of names for a message: `none`, `` `a` ``, `` `a`, `b` ``.
+fn named(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 use std::collections::BTreeMap;
@@ -305,7 +593,11 @@ impl TokenKind {
             TokenKind::Equal => "=",
             TokenKind::Semicolon => ";",
             TokenKind::Colon => ":",
+            TokenKind::ColonColon => "::",
             TokenKind::Comma => ",",
+            TokenKind::Dot => ".",
+            TokenKind::TypeKw => "type",
+            TokenKind::Use => "use",
             TokenKind::Plus => "+",
             TokenKind::Minus => "-",
             TokenKind::Star => "*",
@@ -332,7 +624,6 @@ impl TokenKind {
             TokenKind::Break => "break",
             TokenKind::Continue => "continue",
             TokenKind::Return => "return",
-            TokenKind::Defer => "defer",
             TokenKind::Let => "let",
         }
     }
