@@ -181,6 +181,10 @@ fn walk_written_types(expr: &Expr, f: &mut impl FnMut(&Type, Loc, bool)) {
             walk_written_types(cond, f);
             walk_written_types(body, f);
         }
+        Logical(_, lhs, rhs) => {
+            walk_written_types(lhs, f);
+            walk_written_types(rhs, f);
+        }
         Return(value) => {
             if let Some(value) = value {
                 walk_written_types(value, f);

@@ -113,6 +113,16 @@ pub enum ExprKind {
     // leaves no trace here, it is recorded in the resolved name.
     Call(String, Vec<Type>, Vec<Expr>, Option<String>),
 
+    // Logical(op, lhs, rhs) - `&&` or `||`, and only ever those two. Always bool
+    // typed, and both operands are required to be bool.
+    //
+    // Every other operator is sugar for a `Call`, which is what makes them
+    // overloadable. These two are not, because they short-circuit: `rhs` is only
+    // evaluated when `lhs` does not already decide the answer. A call has to
+    // evaluate its arguments before it runs, so there is no user-written `op &&`
+    // that could keep that promise — the parser rejects the declaration outright.
+    Logical(Op, Box<Expr>, Box<Expr>),
+
     // Scope(stmts, tail)
     Scope(Vec<Statement>, Option<Box<Expr>>),
 
@@ -353,6 +363,7 @@ impl Expr {
                 sub_box(then),
                 otherwise.as_deref().map(sub_box),
             ),
+            Logical(op, lhs, rhs) => Logical(*op, sub_box(lhs), sub_box(rhs)),
             While(cond, body) => While(sub_box(cond), sub_box(body)),
             Return(value) => Return(value.as_deref().map(sub_box)),
             Assign(target, value) => Assign(sub_box(target), sub_box(value)),
@@ -454,6 +465,15 @@ impl Expr {
                     cond.pretty_print(indent_amt),
                     then.pretty_print(indent_amt),
                     otherwise
+                )
+            }
+            ExprKind::Logical(op, lhs, rhs) => {
+                let symbol = if matches!(op, Op::And) { "&&" } else { "||" };
+                format!(
+                    "{indent}{} {symbol} {}:{:?}",
+                    lhs.pretty_print(0),
+                    rhs.pretty_print(0),
+                    self.ty
                 )
             }
             ExprKind::While(cond, body) => format!(

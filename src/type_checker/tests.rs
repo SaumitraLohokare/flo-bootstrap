@@ -11,7 +11,7 @@
 //! these tests — only a genuine change in *resolution* behavior can.
 
 use super::{TypeChecker, mangle_name};
-use crate::ast::{Expr, ExprKind, FieldInit, Func, Module, Statement, StmtKind};
+use crate::ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind};
 use crate::errors::FloErr;
 use crate::parser::{Parser, check_entry_point};
 use crate::tokenizer::{TokenKind, Tokenizer};
@@ -106,6 +106,15 @@ fn call_args(expr: &Expr) -> &[Expr] {
     match &expr.kind {
         ExprKind::Call(_, _, args, _) => args,
         other => panic!("expected a call expression, got {other:?}"),
+    }
+}
+
+/// The operands of a `&&` / `||`. Those are the only operators that are not
+/// calls, so `call_args` does not reach them (see `ExprKind::Logical`).
+fn logical_operands(expr: &Expr) -> (&Expr, &Expr) {
+    match &expr.kind {
+        ExprKind::Logical(_, lhs, rhs) => (lhs, rhs),
+        other => panic!("expected a `&&` / `||` expression, got {other:?}"),
     }
 }
 
@@ -634,13 +643,68 @@ fn equality_operator_works_on_bools() {
 
 #[test]
 fn logical_operators_require_bools() {
+    // Not calls, so there is no overload to resolve: the node is bool and so are
+    // both of its operands, always.
     for op in ["&&", "||"] {
         let src = format!("fn main() -> bool = true {op} false;");
         let module = check_ok(&src);
         let main = func_sig(&module, "main", vec![], Type::Bool);
-        assert_eq!(
-            resolved_call_name(&main.body),
-            m(op, vec![Type::Bool, Type::Bool], Type::Bool)
+        assert_eq!(main.body.ty, Type::Bool);
+        let (lhs, rhs) = logical_operands(&main.body);
+        assert_eq!(lhs.ty, Type::Bool);
+        assert_eq!(rhs.ty, Type::Bool);
+    }
+}
+
+#[test]
+fn logical_operators_take_the_result_of_a_call() {
+    // An operand does not have to be a literal; it just has to end up bool, and
+    // that requirement resolves the overload the same way an `if` condition does.
+    let module = check_ok(
+        "
+        fn main() -> bool = zero() && zero();
+        fn zero() -> bool = true;
+        fn zero() -> i32 = 0;
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    let (lhs, rhs) = logical_operands(&main.body);
+    let expected = m("zero", vec![], Type::Bool);
+    assert_eq!(resolved_call_name(lhs), expected);
+    assert_eq!(resolved_call_name(rhs), expected);
+}
+
+#[test]
+fn a_diverging_left_operand_diverges_the_logical_operator() {
+    // The left operand always runs, so nothing after this statement is reachable
+    // and the tail-less scope satisfies i32 the way a bare `return` would. The
+    // operator itself is still bool: NoReturn is absorbed, not propagated.
+    let module = check_ok("fn main() -> i32 = { (return 1) && true; };");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (stmts, tail) = scope_parts(&main.body);
+    assert!(tail.is_none());
+    assert_eq!(stmt_expr(&stmts[0]).ty, Type::Bool);
+}
+
+#[test]
+fn a_diverging_right_operand_does_not_diverge_the_logical_operator() {
+    // The mirror of the test above: the right operand only runs when the left
+    // does not already decide the answer, so it cannot make the scope diverge --
+    // which leaves this one void where i32 was expected.
+    let errs = check_err("fn main() -> i32 = { true && return 1; };");
+    assert_err!(errs, FloErr::TypeMismatch { .. });
+}
+
+#[test]
+fn logical_operators_are_not_overloadable() {
+    // They short-circuit, so they cannot be functions -- a call evaluates every
+    // argument before it runs. Rejected at the declaration, not the call site.
+    for op in ["&&", "||"] {
+        let src = format!("op {op}(a: bool, b: bool) -> bool = a; fn main() = {{}};");
+        let err = parse_err(&src);
+        assert!(
+            matches!(err, FloErr::OpNotOverloadable { .. }),
+            "expected an `OpNotOverloadable` error for `{op}`, got: {err:?}"
         );
     }
 }
@@ -698,9 +762,17 @@ fn operator_on_mismatched_int_widths_is_an_error() {
 
 #[test]
 fn logical_operator_on_integers_is_an_error() {
-    // `&&` only has a (bool, bool) overload.
+    // `&&` is not a call, so this is a plain mismatch against bool rather than
+    // an exhausted overload set.
     let errs = check_err("fn main() -> bool = 1 && 2;");
-    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+    assert_err!(
+        errs,
+        FloErr::TypeMismatch {
+            expected: Type::Integer,
+            got: Type::Bool,
+            ..
+        }
+    );
 }
 
 #[test]
@@ -728,11 +800,33 @@ fn main_func(module: &Module) -> &Func {
         .expect("no main function")
 }
 
+/// Names the operator at the root of `expr`, whichever shape it has: the
+/// resolved (mangled) callee for the operators that are calls, and the bare
+/// symbol for `&&` / `||`, which are not.
+fn op_node_name(expr: &Expr) -> String {
+    match &expr.kind {
+        ExprKind::Logical(Op::And, ..) => "&&".to_string(),
+        ExprKind::Logical(Op::Or, ..) => "||".to_string(),
+        _ => resolved_call_name(expr).to_string(),
+    }
+}
+
+/// Operand `idx` of an operator node, call or not.
+fn op_node_arg(expr: &Expr, idx: usize) -> &Expr {
+    match &expr.kind {
+        ExprKind::Logical(..) => {
+            let (lhs, rhs) = logical_operands(expr);
+            if idx == 0 { lhs } else { rhs }
+        }
+        _ => &call_args(expr)[idx],
+    }
+}
+
 /// Root operator name and the operator name nested at argument `idx`.
 fn op_and_nested(module: &Module, arg_idx: usize) -> (String, String) {
     let body = &main_func(module).body;
-    let root = resolved_call_name(body).to_string();
-    let nested = resolved_call_name(&call_args(body)[arg_idx]).to_string();
+    let root = op_node_name(body);
+    let nested = op_node_name(op_node_arg(body, arg_idx));
     (root, nested)
 }
 
@@ -818,7 +912,7 @@ fn bitwise_or_binds_tighter_than_logical_and() {
     // true && false | true  ==  true && (false | true)
     let module = check_ok("fn main() -> bool = true && false | true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, op("&&", Type::Bool, Type::Bool));
+    assert_eq!(root, "&&");
     assert_eq!(nested, op("|", Type::Bool, Type::Bool));
 }
 
@@ -827,8 +921,8 @@ fn logical_and_binds_tighter_than_logical_or() {
     // true || false && true  ==  true || (false && true)
     let module = check_ok("fn main() -> bool = true || false && true;");
     let (root, nested) = op_and_nested(&module, 1);
-    assert_eq!(root, op("||", Type::Bool, Type::Bool));
-    assert_eq!(nested, op("&&", Type::Bool, Type::Bool));
+    assert_eq!(root, "||");
+    assert_eq!(nested, "&&");
 }
 
 #[test]
@@ -845,8 +939,8 @@ fn full_precedence_ladder_nests_deepest_operator_last() {
     );
     let main = func_sig(&module, "main", vec![], Type::Bool);
     let expected = [
-        op("||", Type::Bool, Type::Bool),
-        op("&&", Type::Bool, Type::Bool),
+        "||".to_string(),
+        "&&".to_string(),
         op("|", Type::Bool, Type::Bool),
         op("^", Type::Bool, Type::Bool),
         op("&", Type::Bool, Type::Bool),
@@ -857,9 +951,9 @@ fn full_precedence_ladder_nests_deepest_operator_last() {
     ];
     let mut node = &main.body;
     for expected_name in expected {
-        assert_eq!(resolved_call_name(node), expected_name);
+        assert_eq!(op_node_name(node), expected_name);
         // Every level nests its tighter-binding neighbour in the right arg.
-        node = &call_args(node)[1];
+        node = op_node_arg(node, 1);
     }
 }
 
@@ -1398,7 +1492,7 @@ fn statement_position_calls_are_resolved() {
         "
         fn main() -> bool = {
             nop();
-            true && false
+            true & false
         };
         fn nop() = {};
         ",
@@ -1412,7 +1506,7 @@ fn statement_position_calls_are_resolved() {
 
     assert_eq!(
         resolved_call_name(tail.unwrap()),
-        m("&&", vec![Type::Bool, Type::Bool], Type::Bool)
+        m("&", vec![Type::Bool, Type::Bool], Type::Bool)
     );
 }
 
@@ -1761,18 +1855,18 @@ fn unary_user_operator_overload_resolves() {
 #[test]
 fn user_operator_overload_without_return_type_is_void() {
     // Omitting `-> ret` makes the overload return `void`. It is picked over the
-    // built-in `&&` (which returns bool) because the call site wants `void`.
+    // built-in `&` (which returns bool) because the call site wants `void`.
     let module = check_ok(
         "
-        op &&(a: bool, b: bool) = nop();
+        op &(a: bool, b: bool) = nop();
         fn nop() = {};
-        fn main() = true && false;
+        fn main() = true & false;
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
     assert_eq!(
         resolved_call_name(&main.body),
-        m("&&", vec![Type::Bool, Type::Bool], Type::Void)
+        m("&", vec![Type::Bool, Type::Bool], Type::Void)
     );
     assert_eq!(main.body.ty, Type::Void);
 }

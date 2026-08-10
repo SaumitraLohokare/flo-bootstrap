@@ -220,6 +220,13 @@ op +(a: i32, b: i32) -> i32 = -- ...
 -- Operators on primitive types are built-in
 -- Only the dereference and address of and [] operators cannot be overloaded
 
+-- `&&` and `||` cannot be overloaded either. They short-circuit -- the right
+-- operand is only evaluated when the left one does not already decide the
+-- answer -- and a call cannot promise that, since its arguments are all
+-- evaluated before it runs. So they are not calls at all: both operands must be
+-- bool, the result is bool, and that is the whole of it.
+op &&(a: bool, b: bool) -> bool = a;    -- error: `&&` cannot be overloaded
+
 --- 3.5 External functions
 
 extern fn println(s: string);
@@ -514,7 +521,8 @@ pub let a: i32 = 100;
 -- 3.1  Functions
 -- 3.2  Arguments & return
 -- 3.3  Overloading, on argument types AND on return type
--- 3.4  `op` overloads, and the built-in operators on primitives
+-- 3.4  `op` overloads, and the built-in operators on primitives, including
+--      `&&` and `||` being rejected as overloads because they short-circuit
 -- 3.7  `use`, at file scope and as a statement
 -- 4.1  Scope expr, including the implicit `;` and the implicit tail value
 -- 4.2  Variables: `let` with/without a type, with/without an initializer,
@@ -574,8 +582,10 @@ pub let a: i32 = 100;
 
 -- Operators & builtins
 -- 3.4  Missing operators: `!`, `~`, `<<`, `>>`
--- 3.4  Short-circuiting `&&` and `||`. Today they are ordinary built-in
---      calls, so both sides are always evaluated.
+-- 3.4  The short circuit in `&&` and `||` itself. The front end models them
+--      as their own expression rather than a call, which is what makes them
+--      un-overloadable, but nothing actually skips the right operand yet --
+--      that is codegen's job, and there is no codegen.
 -- 4.9  @cast
 -- 4.10 @sizeof / @alignof
 
@@ -595,8 +605,8 @@ pub let a: i32 = 100;
 
 --- 7.3 Suggested order
 
--- TODO: Change && and || to not be overloadable, since shortcircuit
 -- TODO: Add missing operators & cast & sizeof/alignof
+-- TODO: Add is expr
 -- TODO: Add pointers & pointer operators
 -- TODO: Add arrays
 -- TODO: Add slices & strings & char

@@ -1,0 +1,51 @@
+# Words
+def main in
+    "Hello, World" println
+end
+
+# Words with input and output
+def add i32 i32 -- i32 in
+    let a b in
+        a b +
+    end
+end
+
+# Groups
+def Foo is { i32 i32 }
+
+def Vec(T) is { *T u64 u64 }
+
+def Foo i32 i32 -- Foo in
+    let a b in { a b } end
+end
+
+def UnFoo Foo -- i32 i32 in
+    let { a b } in a b end
+end
+
+# If
+def if_else bool -- i32 in
+    let cond in
+        if cond do
+            0
+        elif cond not do
+            1
+        else
+            2
+        end
+    end
+end
+
+# While
+def sum i32 -- i32 in
+    let max in
+        0 # Sum 
+        0 # Counter
+        while max < do
+            let sum counter in
+                sum counter +   # Increment sum by counter
+                counter 1 +     # Increment counter
+            end
+        end
+    end
+end

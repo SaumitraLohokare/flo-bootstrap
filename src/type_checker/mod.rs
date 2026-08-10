@@ -427,6 +427,18 @@ impl TypeChecker {
                     out.push(Constraint::IsEqual(Void, expr.ty.clone(), expr.loc));
                 }
             }
+            Logical(_, lhs, rhs) => {
+                self.collect_expr_constraints(lhs, ret_ty, out);
+                out.push(Constraint::IsEqual(Type::Bool, lhs.ty.clone(), lhs.loc));
+
+                self.collect_expr_constraints(rhs, ret_ty, out);
+                out.push(Constraint::IsEqual(Type::Bool, rhs.ty.clone(), rhs.loc));
+
+                // The result is bool whatever the operands turn out to be (set by
+                // the parser), so there is nothing to say about `expr.ty`. Nor is
+                // there an overload to resolve: unlike every other operator, this
+                // is not a call.
+            }
             While(cond, body) => {
                 self.collect_expr_constraints(cond, ret_ty, out);
                 out.push(Constraint::IsEqual(Type::Bool, cond.ty.clone(), cond.loc));
@@ -1019,6 +1031,9 @@ fn diverges(expr: &Expr) -> bool {
         // be false on the first check, so control always reaches what follows.
         // Spotting that `while true` cannot exit would need real flow analysis.
         While(..) => false,
+        // Only the left operand counts: the right one is skipped whenever the
+        // left already decides the answer, so it may never run.
+        Logical(_, lhs, _) => diverges(lhs),
         Assign(target, value) => diverges(target) || diverges(value),
         // A literal whose field value diverges is never built, and a field of a
         // receiver that diverges is never read.
@@ -1218,6 +1233,11 @@ impl Expr {
                 };
                 If(cond, then, otherwise)
             }
+            Logical(op, lhs, rhs) => Logical(
+                *op,
+                Box::new(lhs.resolve(set, ctx)?),
+                Box::new(rhs.resolve(set, ctx)?),
+            ),
             While(cond, body) => While(
                 Box::new(cond.resolve(set, ctx)?),
                 Box::new(body.resolve(set, ctx)?),

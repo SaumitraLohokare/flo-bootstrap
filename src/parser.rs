@@ -534,8 +534,12 @@ impl Parser {
             TK::Amp => Ok((Op::BitAnd, tok.kind.pretty_name().to_string(), tok.loc)),
             TK::Pipe => Ok((Op::BitOr, tok.kind.pretty_name().to_string(), tok.loc)),
             TK::Cap => Ok((Op::BitXor, tok.kind.pretty_name().to_string(), tok.loc)),
-            TK::AmpAmp => Ok((Op::And, tok.kind.pretty_name().to_string(), tok.loc)),
-            TK::PipePipe => Ok((Op::Or, tok.kind.pretty_name().to_string(), tok.loc)),
+            // `&&` and `||` short-circuit, so they are not calls and there is
+            // nothing to overload. See `ExprKind::Logical`.
+            TK::AmpAmp | TK::PipePipe => Err(FloErr::OpNotOverloadable {
+                op: tok.kind,
+                loc: tok.loc,
+            })?,
             TK::EqualEqual => Ok((Op::Eq, tok.kind.pretty_name().to_string(), tok.loc)),
             TK::BangEqual => Ok((Op::NEq, tok.kind.pretty_name().to_string(), tok.loc)),
             TK::LessThan => Ok((Op::Lt, tok.kind.pretty_name().to_string(), tok.loc)),
@@ -591,6 +595,22 @@ impl Parser {
                     Expr {
                         kind: Assign(Box::new(lhs), Box::new(rhs)),
                         ty: self.fresh_type(),
+                        loc,
+                    }
+                } else if op == AmpAmp || op == PipePipe {
+                    // Not a call, unlike every other operator: these short-circuit,
+                    // so they cannot be overloaded and their type is fixed rather
+                    // than inferred (see `ExprKind::Logical`).
+                    // Spelled out because `use TokenKind::*` above shadows `Op`
+                    // with the `op` keyword's token kind.
+                    let logical_op = if op == AmpAmp {
+                        crate::ast::Op::And
+                    } else {
+                        crate::ast::Op::Or
+                    };
+                    Expr {
+                        kind: Logical(logical_op, Box::new(lhs), Box::new(rhs)),
+                        ty: Type::Bool,
                         loc,
                     }
                 } else {
@@ -1487,11 +1507,8 @@ impl Parser {
         cap_op.push(builtin_op(BitXor, vec![I64, I64], I64));
         cap_op.push(builtin_op(BitXor, vec![Bool, Bool], Bool));
 
-        let amp_amp_op = self.funcs.entry("&&".to_string()).or_default();
-        amp_amp_op.push(builtin_op(And, vec![Bool, Bool], Bool));
-
-        let pipe_pipe_op = self.funcs.entry("||".to_string()).or_default();
-        pipe_pipe_op.push(builtin_op(Or, vec![Bool, Bool], Bool));
+        // No `&&` / `||` entries: they short-circuit, so they are not calls at
+        // all and there is no function for a call site to resolve to.
 
         let eq_eq_op = self.funcs.entry("==".to_string()).or_default();
         eq_eq_op.push(builtin_op(Eq, vec![U8, U8], Bool));

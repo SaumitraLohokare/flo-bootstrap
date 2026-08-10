@@ -186,6 +186,13 @@ pub enum FloErr {
         loc: Loc,
     },
 
+    /// `op &&(..)` / `op ||(..)`. The two short-circuiting operators are the only
+    /// ones that are not calls, so there is nothing for an overload to hook into.
+    OpNotOverloadable {
+        op: TokenKind,
+        loc: Loc,
+    },
+
     CallArityMismatch {
         expected: usize,
         got: usize,
@@ -468,6 +475,15 @@ impl FloErr {
             ExpectedOp { found, loc } => {
                 eprintln!("Expected an operator but found: `{}`", found.pretty_name());
                 print_src(src, &[loc]);
+            }
+            OpNotOverloadable { op, loc } => {
+                let op = op.pretty_name();
+                eprintln!("`{op}` cannot be overloaded, because it short-circuits");
+                print_src(src, &[loc]);
+                eprintln!(
+                    "\x1b[1;36mnote\x1b[0m: `{op}` only evaluates its right operand when it has to, \
+                     which a function call cannot do -- its arguments are always evaluated first"
+                );
             }
             NotAssignable { loc } => {
                 eprintln!("Cannot assign to this expression");
