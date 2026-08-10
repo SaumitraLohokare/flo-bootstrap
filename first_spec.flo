@@ -220,6 +220,21 @@ op +(a: i32, b: i32) -> i32 = -- ...
 -- Operators on primitive types are built-in
 -- Only the dereference and address of and [] operators cannot be overloaded
 
+-- Two of the built-in ones are not quite C's:
+
+-- `!` is logical negation of a bool, and nothing else. There is no truthiness,
+-- so an integer is not something that can be negated. (`~` does have a bool
+-- overload, the way `&`, `|` and `^` do.)
+fn not_a_number() -> bool = !1;        -- error: no `!` takes an integer
+
+-- `<<` and `>>` are the only operators whose operands need not agree: what is
+-- being shifted decides the result type, and the amount only says how far.
+fn shift(v: i32, by: u8) -> i32 = v << by;      -- fine, yields i32
+
+-- Neither `<<` nor `>>` is a single token, because `View<View<i32>>` closes two
+-- argument lists with two `>` in a row. A shift is two of them written with
+-- nothing in between, so `a >> b` shifts and `a > > b` is an error.
+
 -- `&&` and `||` cannot be overloaded either. They short-circuit -- the right
 -- operand is only evaluated when the left one does not already decide the
 -- answer -- and a call cannot promise that, since its arguments are all
@@ -394,6 +409,9 @@ if option is Some { val } {
 -- The bool of an is expr must be used or it's a warning
 -- eg:
 option is Some { val }; -- Will give a warning (unused result of is expr)
+-- Warnings should be given in cases where the is might return false, but the destructured
+-- variables are used.
+-- For example `opt is Some { val } || val == 0`
 
 --- 4.9 Casting
 
@@ -521,8 +539,9 @@ pub let a: i32 = 100;
 -- 3.1  Functions
 -- 3.2  Arguments & return
 -- 3.3  Overloading, on argument types AND on return type
--- 3.4  `op` overloads, and the built-in operators on primitives, including
---      `&&` and `||` being rejected as overloads because they short-circuit
+-- 3.4  `op` overloads, and the built-in operators on primitives -- the whole
+--      set, `!`, `~`, `<<` and `>>` included -- with `&&` and `||` rejected as
+--      overloads because they short-circuit
 -- 3.7  `use`, at file scope and as a statement
 -- 4.1  Scope expr, including the implicit `;` and the implicit tail value
 -- 4.2  Variables: `let` with/without a type, with/without an initializer,
@@ -534,6 +553,11 @@ pub let a: i32 = 100;
 -- 4.7  Piping
 -- 5.1  Generic functions
 -- 5.2  Generic types
+-- 4.9  @cast, as the bit-cast between any two types that have bits. Its type
+--      is the one written into it, and it says nothing about its operand's; the
+--      size-mismatch case is a warning, so it waits on a diagnostic sink
+-- 4.10 @sizeof / @alignof -- checked, and u64. The number each yields is a
+--      property of the target, so it is codegen that will work it out
 -- 5.3  The turbofish, and specialization -- for functions and for types
 -- 6.1  The main function -- except the `[]string` argument form
 
@@ -581,13 +605,10 @@ pub let a: i32 = 100;
 -- 3.6  Global variables & their constexpr initializers
 
 -- Operators & builtins
--- 3.4  Missing operators: `!`, `~`, `<<`, `>>`
 -- 3.4  The short circuit in `&&` and `||` itself. The front end models them
 --      as their own expression rather than a call, which is what makes them
 --      un-overloadable, but nothing actually skips the right operand yet --
 --      that is codegen's job, and there is no codegen.
--- 4.9  @cast
--- 4.10 @sizeof / @alignof
 
 -- Programs
 -- 6.1  `main(args: []string)` -- blocked on 2.4 and 2.5
@@ -605,7 +626,6 @@ pub let a: i32 = 100;
 
 --- 7.3 Suggested order
 
--- TODO: Add missing operators & cast & sizeof/alignof
 -- TODO: Add is expr
 -- TODO: Add pointers & pointer operators
 -- TODO: Add arrays

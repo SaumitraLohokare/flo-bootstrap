@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind, UseDecl},
+    ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind, TypeQuery, UseDecl},
     errors::{FloErr, FloResult},
     tokenizer::{Loc, Token, TokenKind, TokenValue},
     types::{CaseDecl, FieldDecl, Type, TypeDecl, TypeTable},
@@ -524,6 +524,15 @@ impl Parser {
     fn parse_operator(&mut self) -> FloResult<(Op, String, Loc)> {
         use TokenKind as TK;
 
+        // Before the single-token operators: a shift is two of them (see
+        // `peek_shift`), so `op <<(..)` would otherwise read as `op <` followed
+        // by a stray `<`.
+        if let Some((op, name, loc)) = self.peek_shift() {
+            self.skip();
+            self.skip();
+            return Ok((op, name.to_string(), loc));
+        }
+
         let tok = self.peek()?;
         let result = match tok.kind {
             TK::Plus => Ok((Op::Add, tok.kind.pretty_name().to_string(), tok.loc)),
@@ -534,6 +543,8 @@ impl Parser {
             TK::Amp => Ok((Op::BitAnd, tok.kind.pretty_name().to_string(), tok.loc)),
             TK::Pipe => Ok((Op::BitOr, tok.kind.pretty_name().to_string(), tok.loc)),
             TK::Cap => Ok((Op::BitXor, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Tilde => Ok((Op::BitNot, tok.kind.pretty_name().to_string(), tok.loc)),
+            TK::Bang => Ok((Op::Not, tok.kind.pretty_name().to_string(), tok.loc)),
             // `&&` and `||` short-circuit, so they are not calls and there is
             // nothing to overload. See `ExprKind::Logical`.
             TK::AmpAmp | TK::PipePipe => Err(FloErr::OpNotOverloadable {
@@ -564,6 +575,31 @@ impl Parser {
         loop {
             let tok = self.peek()?;
             let op = tok.kind;
+
+            // Checked before the single-token operators: `<` and `>` are binary
+            // operators in their own right, so a shift has to be recognised
+            // first or it would parse as a comparison against nothing.
+            if let Some((_, name, _)) = self.peek_shift() {
+                if SHIFT_PRECEDENCE < precedence {
+                    break;
+                }
+
+                self.skip();
+                self.skip();
+
+                let rhs = self.parse_expr(SHIFT_PRECEDENCE + 1, scope)?;
+                let loc = Loc {
+                    start: lhs.loc.start,
+                    end: rhs.loc.end,
+                };
+
+                lhs = Expr {
+                    kind: Call(name.to_string(), Vec::new(), vec![lhs, rhs], None),
+                    ty: self.fresh_type(),
+                    loc,
+                };
+                continue;
+            }
 
             if op.is_binary_op() {
                 let op_precedence = op.precedence();
@@ -664,6 +700,9 @@ impl Parser {
 
         let token = self.peek()?;
         let op = token.kind;
+        if op == TokenKind::At {
+            return self.parse_builtin(scope);
+        }
         if op.is_unary_op() {
             let start = token.loc.start;
             self.skip();
@@ -685,6 +724,78 @@ impl Parser {
         } else {
             self.parse_postfix(scope)
         }
+    }
+
+    /// Parses one of the `@` builtins: `@cast(T) expr`, `@sizeof(T)` or
+    /// `@alignof(T)`.
+    ///
+    /// None of them is a call, and none can be: each takes a *type* where a call
+    /// takes values. Which also means there is nothing to overload and nothing
+    /// to infer — a builtin's type is the one written into it.
+    ///
+    /// Parsed at unary level, so a cast binds tighter than every binary operator
+    /// the way C's does: `@cast(u8) a + b` is `(@cast(u8) a) + b`.
+    fn parse_builtin(&mut self, scope: &mut Scope) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        let at = self.expect_get(At)?;
+        let name_token = self.expect_get(Ident)?;
+        let TokenValue::String(name) = name_token.value.clone() else {
+            unreachable!()
+        };
+        let name_loc = Loc {
+            start: at.loc.start,
+            end: name_token.loc.end,
+        };
+
+        let query = match name.as_str() {
+            "cast" => None,
+            "sizeof" => Some(TypeQuery::Size),
+            "alignof" => Some(TypeQuery::Align),
+            _ => {
+                return Err(FloErr::UnknownBuiltin {
+                    name,
+                    loc: name_loc,
+                });
+            }
+        };
+
+        self.expect(LParen)?;
+        let (ty, ty_loc) = self.parse_type()?;
+        let r_paren = self.expect_get(RParen)?;
+
+        // All three work on the bits of a value of the type, and `void` has
+        // none. Caught here because the type is written down; a cast's *operand*
+        // can also turn out to be void, which only the checker can see.
+        if matches!(ty, Type::Void) {
+            return Err(FloErr::TypeHasNoSize { ty, loc: ty_loc });
+        }
+
+        if let Some(query) = query {
+            return Ok(Expr {
+                kind: ExprKind::TypeInfo(query, ty),
+                // Fixed by the spec, not inferred: a size is a u64.
+                ty: Type::U64,
+                loc: Loc {
+                    start: at.loc.start,
+                    end: r_paren.loc.end,
+                },
+            });
+        }
+
+        let value = self.parse_unary(scope)?;
+        let loc = Loc {
+            start: at.loc.start,
+            end: value.loc.end,
+        };
+
+        Ok(Expr {
+            kind: ExprKind::Cast(ty.clone(), Box::new(value)),
+            // A cast yields exactly the type it names, so its own type is that
+            // type — there is no fresh variable for the checker to solve.
+            ty,
+            loc,
+        })
     }
 
     /// Parses an atom and any `.field` chained onto it. Field access binds
@@ -1325,6 +1436,43 @@ impl Parser {
         self.tokens.get(self.idx + n).map(|t| t.kind)
     }
 
+    /// The shift operator at the cursor, if there is one: its `Op`, the symbol
+    /// it is written with, and the span of both halves.
+    ///
+    /// `<<` and `>>` are two tokens each, not one. They have to be, because
+    /// `View<View<i32>>` closes two argument lists with two `>` in a row and the
+    /// tokenizer cannot know which of the two it is looking at — so joining them
+    /// is the grammar's job, and it only happens where a shift is what was
+    /// meant. Adjacency in the source is what says so: `a >> b` is a shift,
+    /// `Foo<Bar<i32>>` is not, and `a > > b` is neither (it stays the error it
+    /// always was).
+    fn peek_shift(&self) -> Option<(Op, &'static str, Loc)> {
+        use TokenKind::*;
+
+        let first = self.tokens.get(self.idx)?;
+        let second = self.tokens.get(self.idx + 1)?;
+
+        // Both are one character wide, so "nothing between them" is exactly
+        // this. Anything else — a space, a comment, a newline — is not a shift.
+        if second.loc.start != first.loc.end + 1 {
+            return None;
+        }
+
+        // Spelled out because `use TokenKind::*` above shadows `Op` with the
+        // `op` keyword's token kind.
+        let (op, name) = match (first.kind, second.kind) {
+            (LessThan, LessThan) => (crate::ast::Op::Shl, "<<"),
+            (GreaterThan, GreaterThan) => (crate::ast::Op::Shr, ">>"),
+            _ => return None,
+        };
+
+        let loc = Loc {
+            start: first.loc.start,
+            end: second.loc.end,
+        };
+        Some((op, name, loc))
+    }
+
     fn skip(&mut self) {
         self.idx += 1;
     }
@@ -1507,6 +1655,41 @@ impl Parser {
         cap_op.push(builtin_op(BitXor, vec![I64, I64], I64));
         cap_op.push(builtin_op(BitXor, vec![Bool, Bool], Bool));
 
+        let tilde_op = self.funcs.entry("~".to_string()).or_default();
+        tilde_op.push(builtin_op(BitNot, vec![U8], U8));
+        tilde_op.push(builtin_op(BitNot, vec![U16], U16));
+        tilde_op.push(builtin_op(BitNot, vec![U32], U32));
+        tilde_op.push(builtin_op(BitNot, vec![U64], U64));
+        tilde_op.push(builtin_op(BitNot, vec![I8], I8));
+        tilde_op.push(builtin_op(BitNot, vec![I16], I16));
+        tilde_op.push(builtin_op(BitNot, vec![I32], I32));
+        tilde_op.push(builtin_op(BitNot, vec![I64], I64));
+        // A bool overload, like the other bitwise operators have.
+        tilde_op.push(builtin_op(BitNot, vec![Bool], Bool));
+
+        // `!` is logical negation and nothing else: there is no truthiness in
+        // the language, so an integer is not something that can be negated.
+        let bang_op = self.funcs.entry("!".to_string()).or_default();
+        bang_op.push(builtin_op(Not, vec![Bool], Bool));
+
+        // The shifts are the only operators whose operands need not agree: what
+        // is being shifted decides the result type, and the shift amount only
+        // says how far — so any integer width will do for it. Hence the square
+        // rather than the single row every other table above has.
+        let int_types = [U8, U16, U32, U64, I8, I16, I32, I64];
+        for (name, op) in [("<<", Shl), (">>", Shr)] {
+            let shift_op = self.funcs.entry(name.to_string()).or_default();
+            for value in &int_types {
+                for amount in &int_types {
+                    shift_op.push(builtin_op(
+                        op,
+                        vec![value.clone(), amount.clone()],
+                        value.clone(),
+                    ));
+                }
+            }
+        }
+
         // No `&&` / `||` entries: they short-circuit, so they are not calls at
         // all and there is no function for a call site to resolve to.
 
@@ -1664,10 +1847,19 @@ impl Expr {
     }
 }
 
+/// Where `<<` and `>>` sit in the ladder below — between the additive operators
+/// and the relational ones, as in C. It is a constant rather than an arm of
+/// [`TokenKind::precedence`] because a shift is not a token (see
+/// [`Parser::peek_shift`]); keep it in step with that ladder.
+const SHIFT_PRECEDENCE: i32 = 8;
+
 impl TokenKind {
     fn is_unary_op(&self) -> bool {
         use TokenKind::*;
-        matches!(self, Plus | Minus)
+        // `!` and `~` are unary only. `+` and `-` are both, which the parser
+        // does not have to distinguish: the arity of the `Call` it builds is
+        // what picks the overload.
+        matches!(self, Plus | Minus | Bang | Tilde)
     }
 
     #[rustfmt::skip]
@@ -1692,8 +1884,9 @@ impl TokenKind {
             Amp => 5,
             EqualEqual | BangEqual => 6,
             LessThan | LessThanEqual | GreaterThan | GreaterThanEqual => 7,
-            Minus | Plus => 8,
-            Star | Slash | Percent => 9,
+            // 8 is the shifts; see `SHIFT_PRECEDENCE`.
+            Minus | Plus => 9,
+            Star | Slash | Percent => 10,
             _ => unreachable!("Called TokenKind::precedence(`{self:?}`)"),
         }
     }

@@ -15,8 +15,8 @@ mod types;
 mod util;
 
 // FIXME: Errors are printed randomly, because we check functions by iterating HashMap
-// FIXME: Add bitwise shift/not & logical not
 // FIXME: No warnings for using an uninitialized variable
+// FIXME: No warning when @cast's two types are of different sizes (needs a warning sink)
 // FIXME: Tokenizer panics instead of reporting an error (unknown char, bad number)
 
 // Then: Pointers -> Arrays & Slices -> Strings

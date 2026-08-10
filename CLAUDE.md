@@ -11,7 +11,7 @@ A bootstrap compiler for **Flo**, a statically typed language, written in Rust (
 ```sh
 cargo build
 cargo run                       # compiles the source string hardcoded in main.rs
-cargo test                      # 289 tests, all in src/type_checker/tests.rs
+cargo test                      # 329 tests, all in src/type_checker/tests.rs
 cargo test literal_body_defaults_to_i32   # single test by name
 cargo test -- --nocapture       # see printed output
 ```
@@ -37,7 +37,8 @@ Each stage in [main.rs](src/main.rs) prints and exits on error; errors are `FloE
 - Hands out **variable ids** and **type variable ids** (via `util::Iota`); the counts land in `Module::var_count` / `type_var_count` so later passes can mint non-colliding ids with `Iota::seeded`.
 - Every `Expr` leaves the parser with `ty` already set — usually a fresh `Type::T(n)`. The checker *asserts* on this: `Call` and `Field` expressions must carry a `Type::T`, since its id is the key their constraints are recorded under.
 - Tracks scopes, `use`d case names (so a bare `Some` parses as a literal, not an unknown ident), `loop_depth` (rejects `break`/`continue` outside a loop), and duplicate declarations.
-- Sets fixed types where they are structural, not inferred: `while` is `Void`, `return`/`break`/`continue` are `Never`.
+- Sets fixed types where they are structural, not inferred: `while` is `Void`, `return`/`break`/`continue` are `Never`, `@sizeof`/`@alignof` are `U64`, and a `@cast`'s type is the one written into it.
+- Joins `<<` and `>>` itself, from two adjacent `<`/`>` tokens (`Parser::peek_shift`). Neither can be a token, because `View<View<i32>>` closes two argument lists with two `>` in a row.
 
 ### Type representation ([types.rs](src/types.rs))
 
@@ -58,6 +59,7 @@ Also: `Never` is the bottom type (`return`, `break`, `continue`) and is delibera
 - Per function: collect every `Constraint` in one AST pass (children before parents), then `solve`, then `Func::resolve` rebuilds the tree with concrete types and mangled call names.
 - `solve` is staged and each stage can unblock the next: `reduce` to fixpoint → `default_types()` → `reduce` → `close_some_types()` → `reduce` → report. `reduce` retries every pending call and field access until a round commits nothing new, because committing one binds variables that can narrow a neighbour.
 - A call commits only when **exactly one** candidate survives pruning. Candidates are instantiated once per call site and reused across rounds — re-instantiating would throw away everything the solver learned about their fresh variables and the fixpoint would never converge.
+- Before that, `bind_agreed_params` binds any argument whose type *every* surviving candidate agrees on — sound because the set only shrinks. Without it a wide overload set (the 64 `<<` builtins, whose operands may differ in width) would still be waiting when `default_types()` ran, and defaulting would answer `i32` however the context was annotated.
 - [replace_set.rs](src/type_checker/replace_set.rs) — union-find over type variables with the bindings attached to roots.
 - Output functions are keyed by **mangled name**: `name__arg1_arg2__ret`, built from the `Debug` of each `Type`. Two overloads may legitimately share one; that's reported at the call site, not the declaration.
 

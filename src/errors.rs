@@ -130,6 +130,19 @@ pub enum FloErr {
         loc: Loc,
     },
 
+    /// `void` where a builtin needed a type with bits: either side of a
+    /// `@cast`, or the argument of `@sizeof` / `@alignof`.
+    TypeHasNoSize {
+        ty: Type,
+        loc: Loc,
+    },
+
+    /// An `@name` that is not one of the builtins.
+    UnknownBuiltin {
+        name: String,
+        loc: Loc,
+    },
+
     /// A type that contains itself with nothing to break the cycle, so it has
     /// no size. `cycle` is the path back to the type, in order.
     RecursiveType {
@@ -344,6 +357,18 @@ impl FloErr {
                 eprintln!(
                     "Type `{name}` takes {expected} type argument(s), but {got} were given"
                 );
+                print_src(src, &[loc]);
+            }
+            TypeHasNoSize { ty, loc } => {
+                eprintln!("`{ty:?}` has no size");
+                eprintln!(
+                    "    `@cast`, `@sizeof` and `@alignof` all work on the bits of a value, and `{ty:?}` has none"
+                );
+                print_src(src, &[loc]);
+            }
+            UnknownBuiltin { name, loc } => {
+                eprintln!("Unknown builtin `@{name}`");
+                eprintln!("    the builtins are `@cast`, `@sizeof` and `@alignof`");
                 print_src(src, &[loc]);
             }
             RecursiveType { name, cycle, loc } => {
@@ -622,8 +647,11 @@ impl TokenKind {
             TokenKind::Amp => "&",
             TokenKind::Pipe => "|",
             TokenKind::Cap => "^",
+            TokenKind::Tilde => "~",
             TokenKind::AmpAmp => "&&",
             TokenKind::PipePipe => "||",
+            TokenKind::Bang => "!",
+            TokenKind::At => "@",
             TokenKind::EqualEqual => "==",
             TokenKind::BangEqual => "!=",
             TokenKind::LessThan => "<",

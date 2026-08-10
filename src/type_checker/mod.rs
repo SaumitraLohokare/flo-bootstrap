@@ -543,6 +543,19 @@ impl TypeChecker {
                     bound: false,
                 }));
             }
+            Cast(_, value) => {
+                // Only the operand is walked, and nothing is said about either
+                // type. A cast reinterprets whatever bits it is handed, so it
+                // constrains its operand not at all — and its own type is the
+                // one that was written, which the parser already put on
+                // `expr.ty`. Whether the operand's type is one that *has* bits
+                // has to wait for `resolve`, when it is known.
+                self.collect_expr_constraints(value, ret_ty, out);
+            }
+            TypeInfo(..) => {
+                // Both halves are fixed by the syntax: the type asked about is
+                // written down, and the answer is a u64.
+            }
             Assign(target, value) => {
                 self.collect_expr_constraints(target, ret_ty, out);
                 self.collect_expr_constraints(value, ret_ty, out);
@@ -773,6 +786,16 @@ impl TypeChecker {
         let types = Rc::clone(&self.types);
         prune(cands, &call.args, &Type::T(call.key), set, &types);
 
+        // Where every survivor agrees on a parameter's type, that IS the
+        // argument's type — whichever candidate is eventually chosen has to be
+        // one of these, since the set only ever shrinks. Binding it now rather
+        // than waiting for the commit is what keeps an overload set that is
+        // *wide* from being decided by defaulting: `let x: u8 = 1 << 2` prunes
+        // to the eight `u8 << {any width}` shifts, and if nothing pinned the
+        // left operand first, `default_types` would answer i32 for it and every
+        // one of the eight would then be ruled out.
+        self.bind_agreed_params(cands, &call.args, set)?;
+
         // Only commit when EXACTLY one overload survives.
         let [cand] = &cands[..] else {
             return Ok(None);
@@ -804,6 +827,55 @@ impl TypeChecker {
             type_args: cand.type_args,
             loc: call.loc,
         }))
+    }
+
+    /// Bind each argument whose type every surviving candidate agrees on.
+    ///
+    /// This is sound for the same reason pruning is: the set only shrinks, so a
+    /// type all of today's candidates share is a type tomorrow's chosen one has.
+    /// And it terminates, because a binding only happens where the argument does
+    /// not already resolve to that type — so each one leaves strictly fewer
+    /// variables unbound and a later round finds nothing left to do.
+    ///
+    /// Nothing is agreed unless there is at least one candidate; an empty set is
+    /// a call that has failed, which `overload_error` reports.
+    fn bind_agreed_params(
+        &self,
+        cands: &[Candidate],
+        args: &[(Type, Loc)],
+        set: &mut ReplaceSet,
+    ) -> FloResult<()> {
+        let [first, rest @ ..] = cands else {
+            return Ok(());
+        };
+
+        let first_params = params_of(first);
+        for (i, (arg_ty, arg_loc)) in args.iter().enumerate() {
+            let Some(param) = first_params.get(i) else {
+                continue;
+            };
+
+            // Only a type that is fully known can be agreed on. A generic
+            // candidate's parameter is a variable minted per candidate, and two
+            // of those standing for different things must never be read as
+            // agreeing just because neither is bound yet.
+            if !param.is_known() {
+                continue;
+            }
+            if !rest.iter().all(|c| params_of(c).get(i) == Some(param)) {
+                continue;
+            }
+
+            // Already settled: binding again would be a no-op that still looked
+            // like progress, and `reduce` would never reach its fixpoint.
+            if set.resolve(arg_ty) == *param {
+                continue;
+            }
+
+            self.solve_constraint(set, param.clone(), arg_ty.clone(), *arg_loc)?;
+        }
+
+        Ok(())
     }
 
     /// Build the initial candidate set for a call: every overload of the name,
@@ -912,6 +984,14 @@ impl TypeChecker {
         }
 
         Ok(())
+    }
+}
+
+/// A candidate's parameter types. Every signature is a `Fn`, by construction.
+fn params_of(cand: &Candidate) -> &[Type] {
+    match &cand.sig {
+        Type::Fn(params, _) => params,
+        _ => unreachable!(),
     }
 }
 
@@ -1039,6 +1119,11 @@ fn diverges(expr: &Expr) -> bool {
         // receiver that diverges is never read.
         CaseLit(_, _, fields) => fields.iter().any(|f| diverges(&f.value)),
         Field(recv, _) => diverges(recv),
+        // There are no bits to reinterpret if the operand never yields any.
+        // Note that no `Constraint::Diverges` is emitted for a cast (see the
+        // collection arm): its type is the one written, never a variable, so
+        // there is nothing divergence could be pinned onto.
+        Cast(_, value) => diverges(value),
         _ => false,
     }
 }
@@ -1268,6 +1353,26 @@ impl Expr {
                 CaseLit(None, case.clone(), new_fields)
             }
             Field(recv, name) => Field(Box::new(recv.resolve(set, ctx)?), name.clone()),
+            Cast(_, value) => {
+                let value = value.resolve(set, ctx)?;
+
+                // The written target was checked while parsing; the operand
+                // could only be checked once solving had given it a type. A
+                // NoReturn operand is fine — nothing is ever cast, because the
+                // cast is never reached.
+                if matches!(value.ty, Type::Void) {
+                    return Err(FloErr::TypeHasNoSize {
+                        ty: value.ty,
+                        loc: value.loc,
+                    });
+                }
+
+                // `ty` is the resolved target: it and the node's own type are
+                // the same thing for a cast, so taking it from one place keeps
+                // them from ever drifting apart.
+                Cast(ty.clone(), Box::new(value))
+            }
+            TypeInfo(query, queried) => TypeInfo(*query, set.resolve(queried)),
 
             Num(n) => Num(*n),
             Flt(n) => Flt(*n),

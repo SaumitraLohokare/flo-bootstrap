@@ -163,6 +163,40 @@ pub enum ExprKind {
     // Field(receiver, name) - `foo.bar`. Only legal on a type with a single
     // case; reaching into a sum type needs `is`. An l-value when the receiver is.
     Field(Box<Expr>, String),
+
+    // Cast(target, value) - `@cast(u8) x`. A bit-cast: it reinterprets the bits
+    // it is given rather than converting between representations, so it says
+    // nothing at all about `value`'s type.
+    //
+    // `target` is what was written, and is also this expression's `ty` — a cast
+    // yields exactly the type it names, so there is nothing here to infer. Both
+    // are substituted together, which is what makes `@cast(T) x` inside a
+    // generic mean the instantiation's type.
+    Cast(Type, Box<Expr>),
+
+    // TypeInfo(query, ty) - `@sizeof(i32)` / `@alignof(i32)`. Its operand is a
+    // *type*, never a value, which is why it is not a call.
+    //
+    // Always u64 typed (per the spec), and the number itself is never computed
+    // here: a size is a property of the target, so it is codegen that knows one.
+    TypeInfo(TypeQuery, Type),
+}
+
+/// Which property of a type an [`ExprKind::TypeInfo`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeQuery {
+    Size,
+    Align,
+}
+
+impl TypeQuery {
+    /// The builtin that spells this query, without the `@`.
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            TypeQuery::Size => "sizeof",
+            TypeQuery::Align => "alignof",
+        }
+    }
 }
 
 /// One `name: value` in a type literal.
@@ -186,9 +220,14 @@ pub enum Op {
     BitAnd,
     BitOr,
     BitXor,
+    BitNot,
+
+    Shl,
+    Shr,
 
     And,
     Or,
+    Not,
 
     Eq,
     NEq,
@@ -387,6 +426,12 @@ impl Expr {
                     .collect(),
             ),
             Field(recv, name) => Field(sub_box(recv), name.clone()),
+            // The target is substituted alongside `ty`, which mirrors it: a
+            // `@cast(T) x` in a generic body casts to whatever `T` became.
+            Cast(target, value) => Cast(target.substitute(subst), sub_box(value)),
+            // Likewise `@sizeof(T)`: the queried type is a written one, so it
+            // can name a type parameter. The u64 result never changes.
+            TypeInfo(query, ty) => TypeInfo(*query, ty.substitute(subst)),
 
             BuiltinOp(op) => BuiltinOp(*op),
             Num(n) => Num(*n),
@@ -522,6 +567,14 @@ impl Expr {
             }
             ExprKind::Field(recv, name) => {
                 format!("{indent}{}.{name}:{:?}", recv.pretty_print(0), self.ty)
+            }
+            // The target is printed as the cast, not as a trailing `:ty`, since
+            // for a cast the two are the same thing.
+            ExprKind::Cast(target, value) => {
+                format!("{indent}@cast({target:?}) {}", value.pretty_print(0))
+            }
+            ExprKind::TypeInfo(query, ty) => {
+                format!("{indent}@{}({ty:?}):{:?}", query.keyword(), self.ty)
             }
         }
     }

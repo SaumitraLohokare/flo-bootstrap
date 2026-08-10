@@ -161,6 +161,14 @@ fn walk_written_types(expr: &Expr, f: &mut impl FnMut(&Type, Loc, bool)) {
             }
         }
         Field(recv, _) => walk_written_types(recv, f),
+        // A builtin's type argument is written out in full — there is no
+        // context for it to be inferred from — so both must give the
+        // declaration's arguments.
+        Cast(target, value) => {
+            f(target, expr.loc, true);
+            walk_written_types(value, f);
+        }
+        TypeInfo(_, ty) => f(ty, expr.loc, true),
 
         Scope(stmts, tail) => {
             for stmt in stmts {

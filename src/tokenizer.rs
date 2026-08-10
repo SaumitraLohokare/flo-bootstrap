@@ -49,9 +49,15 @@ pub enum TokenKind {
     Amp,
     Pipe,
     Cap,
+    Tilde,
 
     AmpAmp,
     PipePipe,
+    Bang,
+
+    /// Introduces a builtin: `@cast`, `@sizeof`, `@alignof`. Which one it is
+    /// stays an `Ident`, so adding a builtin never adds a keyword.
+    At,
 
     EqualEqual,
     BangEqual,
@@ -137,7 +143,16 @@ impl Tokenizer {
                 '!' if self.peek_n(1) == Some('=') => {
                     tokens.push(self.tokenize_symbol("!=", TokenKind::BangEqual))
                 }
+                '!' => tokens.push(self.tokenize_symbol("!", TokenKind::Bang)),
 
+                '~' => tokens.push(self.tokenize_symbol("~", TokenKind::Tilde)),
+
+                // `<<` and `>>` are deliberately NOT tokens of their own, even
+                // though they are operators. `View<View<i32>>` closes two
+                // argument lists with two `>` in a row, and nothing here can
+                // tell that from a shift — that needs the grammar. So both
+                // shifts stay two tokens and the parser joins them when they
+                // are written adjacent (see `Parser::peek_shift`).
                 '<' if self.peek_n(1) == Some('=') => {
                     tokens.push(self.tokenize_symbol("<=", TokenKind::LessThanEqual))
                 }
@@ -168,6 +183,8 @@ impl Tokenizer {
                 '|' => tokens.push(self.tokenize_symbol("|", TokenKind::Pipe)),
 
                 '^' => tokens.push(self.tokenize_symbol("^", TokenKind::Cap)),
+
+                '@' => tokens.push(self.tokenize_symbol("@", TokenKind::At)),
 
                 ';' => tokens.push(self.tokenize_symbol(";", TokenKind::Semicolon)),
 

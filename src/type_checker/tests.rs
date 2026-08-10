@@ -11,7 +11,7 @@
 //! these tests — only a genuine change in *resolution* behavior can.
 
 use super::{TypeChecker, mangle_name};
-use crate::ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind};
+use crate::ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind, TypeQuery};
 use crate::errors::FloErr;
 use crate::parser::{Parser, check_entry_point};
 use crate::tokenizer::{TokenKind, Tokenizer};
@@ -737,6 +737,176 @@ fn bitwise_operators_resolve_on_bools() {
     }
 }
 
+#[test]
+fn shift_operators_resolve_on_integers() {
+    for op in ["<<", ">>"] {
+        let src = format!("fn main() -> i32 = 6 {op} 2;");
+        let module = check_ok(&src);
+        let main = func_sig(&module, "main", vec![], Type::I32);
+        assert_eq!(
+            resolved_call_name(&main.body),
+            m(op, vec![Type::I32, Type::I32], Type::I32)
+        );
+        assert_eq!(main.body.ty, Type::I32);
+    }
+}
+
+#[test]
+fn a_shift_amount_may_be_a_different_width() {
+    // The shifts are the only builtin operators whose operands need not agree:
+    // the amount says how far to shift, not what the result is.
+    let module = check_ok(
+        "
+        fn shift(v: i32, by: u8) -> i32 = v << by;
+        fn main() = {};
+        ",
+    );
+    let shift = func_sig(&module, "shift", vec![Type::I32, Type::U8], Type::I32);
+    assert_eq!(
+        resolved_call_name(&shift.body),
+        m("<<", vec![Type::I32, Type::U8], Type::I32)
+    );
+}
+
+#[test]
+fn a_shift_yields_the_shifted_operands_type() {
+    let module = check_ok(
+        "
+        fn shift(v: u8, by: i64) -> u8 = v >> by;
+        fn main() = {};
+        ",
+    );
+    let shift = func_sig(&module, "shift", vec![Type::U8, Type::I64], Type::U8);
+    assert_eq!(
+        resolved_call_name(&shift.body),
+        m(">>", vec![Type::U8, Type::I64], Type::U8)
+    );
+}
+
+#[test]
+fn an_unannotated_shift_defaults_both_operands() {
+    let module = check_ok("fn main() = { let x = 1 << 2; };");
+    let main = main_func(&module);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*ty, Type::I32);
+    assert_eq!(
+        resolved_call_name(init.unwrap()),
+        m("<<", vec![Type::I32, Type::I32], Type::I32)
+    );
+}
+
+#[test]
+fn an_annotation_narrows_only_the_shifted_operand() {
+    // The annotation reaches the left operand through the return type; the
+    // amount is free to stay whatever it defaults to.
+    let module = check_ok("fn main() = { let x: u8 = 1 << 2; };");
+    let main = main_func(&module);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*ty, Type::U8);
+    assert_eq!(
+        resolved_call_name(init.unwrap()),
+        m("<<", vec![Type::U8, Type::I32], Type::U8)
+    );
+}
+
+#[test]
+fn shift_operators_have_no_bool_overload() {
+    // Unlike `&`, `|`, `^` and `~`, there is nothing to shift in a bool.
+    for op in ["<<", ">>"] {
+        let src = format!("fn main() -> bool = true {op} true;");
+        let errs = check_err(&src);
+        assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+    }
+}
+
+#[test]
+fn nested_generic_arguments_close_with_two_angle_brackets() {
+    // `>>` is not a token, which is exactly what lets this parse: the two `>`
+    // close one argument list each. A shift is joined from two of them in the
+    // parser instead (see `Parser::peek_shift`).
+    let module = check_ok(
+        "
+        type View<T> = { data: T };
+        fn inner(v: View<View<i32>>) -> i32 = v.data.data;
+        fn main() = {};
+        ",
+    );
+    let view_i32 = user("View", vec![Type::I32]);
+    let inner = func_sig(
+        &module,
+        "inner",
+        vec![user("View", vec![view_i32.clone()])],
+        Type::I32,
+    );
+    assert_eq!(
+        inner.ty,
+        fn_ty(vec![user("View", vec![view_i32])], Type::I32)
+    );
+}
+
+#[test]
+fn a_gap_between_the_angle_brackets_is_not_a_shift() {
+    // Adjacency in the source is what makes a shift, so this stays a comparison
+    // against a stray `>`.
+    let err = parse_err("fn main() -> i32 = 8 > > 2;");
+    assert!(
+        matches!(err, FloErr::UnexpectedToken { .. }),
+        "expected an unexpected-token error, got: {err:?}"
+    );
+}
+
+#[test]
+fn bitwise_not_resolves_on_integers() {
+    let module = check_ok("fn main() -> u8 = ~6;");
+    let main = func_sig(&module, "main", vec![], Type::U8);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("~", vec![Type::U8], Type::U8)
+    );
+    assert_eq!(call_args(&main.body).len(), 1);
+}
+
+#[test]
+fn bitwise_not_resolves_on_bool() {
+    // `~` has a bool overload, like the other bitwise operators.
+    let module = check_ok("fn main() -> bool = ~true;");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("~", vec![Type::Bool], Type::Bool)
+    );
+}
+
+#[test]
+fn logical_not_resolves_on_bool() {
+    let module = check_ok("fn main() -> bool = !true;");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("!", vec![Type::Bool], Type::Bool)
+    );
+}
+
+#[test]
+fn logical_not_on_an_integer_is_an_error() {
+    // There is no truthiness in the language: `!` negates a bool, and that is
+    // the only overload it has.
+    let errs = check_err("fn main() -> bool = !1;");
+    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+}
+
+#[test]
+fn double_not_nests() {
+    // `!!true` == `!(!true)`, two unary calls.
+    let module = check_ok("fn main() -> bool = !!true;");
+    let main = func_sig(&module, "main", vec![], Type::Bool);
+    let not_bool = m("!", vec![Type::Bool], Type::Bool);
+    assert_eq!(resolved_call_name(&main.body), not_bool);
+    assert_eq!(resolved_call_name(&call_args(&main.body)[0]), not_bool);
+}
+
 // --------------------------------------------------------------------------
 // Binary operator errors
 // --------------------------------------------------------------------------
@@ -863,6 +1033,24 @@ fn div_and_mod_bind_tighter_than_sub() {
 }
 
 #[test]
+fn add_binds_tighter_than_a_shift() {
+    // 1 << 2 + 3  ==  1 << (2 + 3)
+    let module = check_ok("fn main() -> i32 = 1 << 2 + 3;");
+    let (root, nested) = op_and_nested(&module, 1);
+    assert_eq!(root, op("<<", Type::I32, Type::I32));
+    assert_eq!(nested, op("+", Type::I32, Type::I32));
+}
+
+#[test]
+fn a_shift_binds_tighter_than_comparison() {
+    // 1 << 2 < 3  ==  (1 << 2) < 3
+    let module = check_ok("fn main() -> bool = 1 << 2 < 3;");
+    let (root, nested) = op_and_nested(&module, 0);
+    assert_eq!(root, op("<", Type::I32, Type::Bool));
+    assert_eq!(nested, op("<<", Type::I32, Type::I32));
+}
+
+#[test]
 fn add_binds_tighter_than_comparison() {
     // 1 + 2 < 3  ==  (1 + 2) < 3
     let module = check_ok("fn main() -> bool = 1 + 2 < 3;");
@@ -928,14 +1116,14 @@ fn logical_and_binds_tighter_than_logical_or() {
 #[test]
 fn full_precedence_ladder_nests_deepest_operator_last() {
     // A chain touching every precedence level, associating rightward:
-    //   a || b && c | d ^ e & f == g < h + i * j
+    //   a || b && c | d ^ e & f == g < h << i + j * k
     // Each operator binds tighter than the one to its left, so the tree is a
     // right-leaning spine ending in the `*` (tightest) node. The leaves are
     // chosen so every level type-checks: bool down to the `==`, then the `<`
     // compares integers (yielding the bool that `==` consumes).
     let module = check_ok(
         "fn main() -> bool =
-            true || true && true | true ^ true & true == 2 < 3 + 4 * 5;",
+            true || true && true | true ^ true & true == 2 < 3 << 4 + 5 * 6;",
     );
     let main = func_sig(&module, "main", vec![], Type::Bool);
     let expected = [
@@ -946,6 +1134,7 @@ fn full_precedence_ladder_nests_deepest_operator_last() {
         op("&", Type::Bool, Type::Bool),
         op("==", Type::Bool, Type::Bool),
         op("<", Type::I32, Type::Bool),
+        op("<<", Type::I32, Type::I32),
         op("+", Type::I32, Type::I32),
         op("*", Type::I32, Type::I32),
     ];
@@ -1164,6 +1353,15 @@ fn unary_minus_binds_tighter_than_addition() {
     let (root, nested) = op_and_nested(&module, 0);
     assert_eq!(root, op("+", Type::I32, Type::I32));
     assert_eq!(nested, m("-", vec![Type::I32], Type::I32));
+}
+
+#[test]
+fn not_binds_tighter_than_equality() {
+    // `!true == false` == `(!true) == false`, like every other unary operator.
+    let module = check_ok("fn main() -> bool = !true == false;");
+    let (root, nested) = op_and_nested(&module, 0);
+    assert_eq!(root, op("==", Type::Bool, Type::Bool));
+    assert_eq!(nested, m("!", vec![Type::Bool], Type::Bool));
 }
 
 #[test]
@@ -4443,4 +4641,283 @@ fn an_operator_can_be_overloaded_on_a_user_type() {
             user("Vec2", vec![])
         )
     );
+}
+
+#[test]
+fn the_new_operators_can_be_overloaded_too() {
+    // `!`, `~`, `<<` and `>>` are ordinary overloadable operators -- only the
+    // short-circuiting pair is not. `op <<` also exercises declaring an operator
+    // the tokenizer never produces as a single token.
+    let module = check_ok(
+        "
+        type Bits = Bits { n: i32 };
+        use Bits::Bits;
+        op !(a: Bits) -> bool = a.n == 0;
+        op ~(a: Bits) -> Bits = Bits { n: ~a.n };
+        op <<(a: Bits, by: i32) -> Bits = Bits { n: a.n << by };
+        op >>(a: Bits, by: i32) -> Bits = Bits { n: a.n >> by };
+        fn shifted(a: Bits) -> Bits = a << 1;
+        fn main() = {};
+        ",
+    );
+    let bits = user("Bits", vec![]);
+
+    func_sig(&module, "!", vec![bits.clone()], Type::Bool);
+    func_sig(&module, "~", vec![bits.clone()], bits.clone());
+    func_sig(&module, ">>", vec![bits.clone(), Type::I32], bits.clone());
+
+    // And a use of one resolves to it rather than to any builtin.
+    let shifted = func_sig(&module, "shifted", vec![bits.clone()], bits.clone());
+    assert_eq!(
+        resolved_call_name(&shifted.body),
+        m("<<", vec![bits.clone(), Type::I32], bits)
+    );
+}
+
+// --------------------------------------------------------------------------
+// `@cast`
+//
+// A bit-cast between any two types that have bits. Its type is the one written
+// into it, so there is nothing to infer, and it says nothing whatsoever about
+// its operand's type. Neither side may be `void`.
+// --------------------------------------------------------------------------
+
+/// The target type and operand of a `@cast`.
+fn cast_parts(expr: &Expr) -> (&Type, &Expr) {
+    match &expr.kind {
+        ExprKind::Cast(target, value) => (target, value),
+        other => panic!("expected a cast expression, got {other:?}"),
+    }
+}
+
+/// The query and the type asked about of a `@sizeof` / `@alignof`.
+fn type_info_parts(expr: &Expr) -> (TypeQuery, &Type) {
+    match &expr.kind {
+        ExprKind::TypeInfo(query, ty) => (*query, ty),
+        other => panic!("expected a `@sizeof` / `@alignof` expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_cast_yields_the_type_it_names() {
+    let module = check_ok("fn main() -> u8 = @cast(u8) 300;");
+    let main = func_sig(&module, "main", vec![], Type::U8);
+    let (target, value) = cast_parts(&main.body);
+    assert_eq!(*target, Type::U8);
+    assert_eq!(main.body.ty, Type::U8);
+    // The cast constrains its operand not at all, so the literal defaults as it
+    // would anywhere else.
+    assert_eq!(value.ty, Type::I32);
+}
+
+#[test]
+fn a_cast_leaves_its_operands_type_alone() {
+    let module = check_ok(
+        "
+        fn narrow(a: i64) -> u8 = @cast(u8) a;
+        fn main() = {};
+        ",
+    );
+    let narrow = func_sig(&module, "narrow", vec![Type::I64], Type::U8);
+    let (_, value) = cast_parts(&narrow.body);
+    assert_eq!(value.ty, Type::I64);
+}
+
+#[test]
+fn a_cast_binds_tighter_than_a_binary_operator() {
+    // `@cast(u8) 1 + 2` == `(@cast(u8) 1) + 2`, as in C.
+    let module = check_ok("fn main() -> u8 = @cast(u8) 1 + 2;");
+    let main = func_sig(&module, "main", vec![], Type::U8);
+    assert_eq!(resolved_call_name(&main.body), op("+", Type::U8, Type::U8));
+    let (target, _) = cast_parts(&call_args(&main.body)[0]);
+    assert_eq!(*target, Type::U8);
+}
+
+#[test]
+fn a_cast_can_reinterpret_one_user_type_as_another() {
+    // Any two types that have bits, which is the spec's "simple bit-cast".
+    // Nothing checks that the two line up -- the size-mismatch diagnostic is a
+    // warning, and there is no warning sink yet.
+    let module = check_ok(
+        "
+        type Pair = Pair { a: i32, b: i32 };
+        type Wide = Wide { n: i64 };
+        fn widen(p: Pair) -> Wide = @cast(Wide) p;
+        fn main() = {};
+        ",
+    );
+    let (pair, wide) = (user("Pair", vec![]), user("Wide", vec![]));
+    let widen = func_sig(&module, "widen", vec![pair.clone()], wide.clone());
+    let (target, value) = cast_parts(&widen.body);
+    assert_eq!(*target, wide);
+    assert_eq!(value.ty, pair);
+}
+
+#[test]
+fn a_cast_inside_a_generic_casts_to_the_instantiated_type() {
+    let module = check_ok(
+        "
+        fn bits<T>(a: i32) -> T = @cast(T) a;
+        fn main() -> u8 = bits::<u8>(1);
+        ",
+    );
+    let bits = func_sig(&module, "bits", vec![Type::I32], Type::U8);
+    let (target, _) = cast_parts(&bits.body);
+    assert_eq!(*target, Type::U8);
+    assert_eq!(bits.body.ty, Type::U8);
+}
+
+#[test]
+fn casting_to_void_is_an_error() {
+    // The target is written down, so this one is the parser's to catch.
+    let err = parse_err("fn main() = @cast(void) 1;");
+    assert!(
+        matches!(err, FloErr::TypeHasNoSize { ty: Type::Void, .. }),
+        "expected a no-size error, got: {err:?}"
+    );
+}
+
+#[test]
+fn casting_a_void_value_is_an_error() {
+    // The operand's type is only known once solving has settled, which is why
+    // this side of the same rule is the checker's.
+    let errs = check_err(
+        "
+        fn nothing() = {};
+        fn main() -> u8 = @cast(u8) nothing();
+        ",
+    );
+    assert_err!(errs, FloErr::TypeHasNoSize { ty: Type::Void, .. });
+}
+
+#[test]
+fn casting_to_an_unknown_type_is_an_error() {
+    // A cast's target is checked with every other written type.
+    let errs = check_err("fn main() -> i32 = @cast(Nope) 1;");
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Nope");
+}
+
+#[test]
+fn a_cast_is_not_assignable() {
+    let err = parse_err("fn main() = { let a = 1; @cast(u8) a = 2; };");
+    assert!(
+        matches!(err, FloErr::NotAssignable { .. }),
+        "expected a not-assignable error, got: {err:?}"
+    );
+}
+
+#[test]
+fn an_unknown_builtin_is_an_error() {
+    let err = parse_err("fn main() -> i32 = @frobnicate(i32);");
+    assert!(
+        matches!(&err, FloErr::UnknownBuiltin { name, .. } if name == "frobnicate"),
+        "expected an unknown-builtin error, got: {err:?}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// `@sizeof` / `@alignof`
+//
+// Both take a *type*, never a value, and both are u64. What a type's size
+// actually is belongs to the target, so nothing here computes one: the front end
+// checks the type and records which question was asked.
+// --------------------------------------------------------------------------
+
+#[test]
+fn sizeof_and_alignof_are_u64() {
+    for (builtin, query) in [("sizeof", TypeQuery::Size), ("alignof", TypeQuery::Align)] {
+        let src = format!("fn main() -> u64 = @{builtin}(i32);");
+        let module = check_ok(&src);
+        let main = func_sig(&module, "main", vec![], Type::U64);
+        let (found, ty) = type_info_parts(&main.body);
+        assert_eq!(found, query);
+        assert_eq!(*ty, Type::I32);
+        assert_eq!(main.body.ty, Type::U64);
+    }
+}
+
+#[test]
+fn sizeof_is_a_u64_not_an_integer_literal() {
+    // It does not coerce the way `0` does: the spec says u64, so u64 it is.
+    let errs = check_err("fn main() -> u32 = @sizeof(i32);");
+    assert_err!(
+        errs,
+        FloErr::TypeMismatch {
+            expected: Type::U32,
+            got: Type::U64,
+            ..
+        }
+    );
+}
+
+#[test]
+fn sizeof_takes_a_user_type() {
+    let module = check_ok(
+        "
+        type Vec2 = { x: i32, y: i32 };
+        fn main() -> u64 = @sizeof(Vec2);
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::U64);
+    let (_, ty) = type_info_parts(&main.body);
+    assert_eq!(*ty, user("Vec2", vec![]));
+}
+
+#[test]
+fn sizeof_is_an_operand_like_any_other() {
+    let module = check_ok("fn main() -> u64 = @sizeof(i32) + @alignof(i64);");
+    let main = func_sig(&module, "main", vec![], Type::U64);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        op("+", Type::U64, Type::U64)
+    );
+}
+
+#[test]
+fn sizeof_inside_a_generic_asks_about_the_instantiated_type() {
+    let module = check_ok(
+        "
+        fn size<T>() -> u64 = @sizeof(T);
+        fn main() -> u64 = size::<u8>();
+        ",
+    );
+    let size = func_sig(&module, "size", vec![], Type::U64);
+    let (_, ty) = type_info_parts(&size.body);
+    assert_eq!(*ty, Type::U8);
+}
+
+#[test]
+fn sizeof_of_an_unknown_type_is_an_error() {
+    let errs = check_err("fn main() -> u64 = @sizeof(Nope);");
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Nope");
+}
+
+#[test]
+fn sizeof_of_a_generic_type_needs_its_arguments() {
+    // A written type gives its arguments in full; there is no value here for
+    // them to be inferred from.
+    let errs = check_err(
+        "
+        type Box<T> = { v: T };
+        fn main() -> u64 = @sizeof(Box);
+        ",
+    );
+    assert_err!(errs, FloErr::TypeArityMismatch { name, .. } if name == "Box");
+}
+
+#[test]
+fn sizeof_of_void_is_an_error() {
+    let err = parse_err("fn main() -> u64 = @sizeof(void);");
+    assert!(
+        matches!(err, FloErr::TypeHasNoSize { ty: Type::Void, .. }),
+        "expected a no-size error, got: {err:?}"
+    );
+}
+
+#[test]
+fn sizeof_takes_a_type_and_not_a_value() {
+    // So a variable's name in there is read as a type name, and there is no
+    // type by that name.
+    let errs = check_err("fn main() -> u64 = { let x = 1; @sizeof(x) };");
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "x");
 }
