@@ -8,7 +8,7 @@ use crate::{
     errors::{FloErr, FloResult},
     tokenizer::Loc,
     type_checker::replace_set::ReplaceSet,
-    types::{Type, TypeCase, TypeTable},
+    types::{FieldName, Record, SumCase, Type, TypeTable},
     util::Iota,
 };
 
@@ -48,7 +48,7 @@ struct FieldConstraint {
     /// identified. `T(key)` is the field's type.
     key: usize,
     recv: Type,
-    field: String,
+    field: FieldName,
     loc: Loc,
     /// Whether the field's type has been bound yet. The constraint is kept
     /// either way: an open receiver can gain cases after this resolved, and the
@@ -66,8 +66,6 @@ struct CallConstraint {
     key: usize,
     name: String,
     args: Vec<(Type, Loc)>,
-    /// Type arguments written explicitly with a turbofish. Empty otherwise.
-    type_args: Vec<Type>,
     loc: Loc,
     /// The overloads that are still compatible. `None` until the first solver
     /// round so that an undefined function is reported while solving rather
@@ -81,10 +79,9 @@ struct CallConstraint {
 struct Candidate {
     /// Which overload of the name this is: an index into `schemes[name]`.
     idx: usize,
-    /// The scheme's signature with its type parameters replaced — by the
-    /// turbofish arguments if there were any, otherwise by fresh variables for
-    /// the solver to pin down. Identical to the scheme's signature when the
-    /// overload isn't generic.
+    /// The scheme's signature with its type parameters replaced by fresh
+    /// variables for the solver to pin down. Identical to the scheme's signature
+    /// when the overload isn't generic.
     sig: Type,
     /// What each type parameter was replaced with, in declaration order. Empty
     /// when the overload isn't generic.
@@ -274,7 +271,6 @@ impl TypeChecker {
             Ok(Module {
                 funcs: new_funcs,
                 types: module.types,
-                uses: module.uses,
                 var_count: module.var_count,
                 type_var_count: self.fresh.count(),
             })
@@ -303,7 +299,8 @@ impl TypeChecker {
         // 3. Rebuild the func with concrete types and resolved call names,
         //    noting which generics that pinned down along the way.
 
-        func.resolve(&mut set, &resolutions, requested, &self.schemes)
+        let types = Rc::clone(&self.types);
+        func.resolve(&mut set, &resolutions, requested, &self.schemes, &types)
     }
 
     // ----------------------------------------------------------------------
@@ -344,7 +341,7 @@ impl TypeChecker {
                 out.push(Constraint::IsEqual(Type::Bool, expr.ty.clone(), expr.loc))
             }
             BuiltinOp(_) | Var(_) => {}
-            Call(name, type_args, arg_exprs, _) => {
+            Call(name, arg_exprs, _) => {
                 for arg_expr in arg_exprs {
                     self.collect_expr_constraints(arg_expr, ret_ty, out);
                 }
@@ -363,7 +360,6 @@ impl TypeChecker {
                         .iter()
                         .map(|arg| (arg.ty.clone(), arg.loc))
                         .collect(),
-                    type_args: type_args.clone(),
                     loc: expr.loc,
                     cands: None,
                 }));
@@ -473,7 +469,7 @@ impl TypeChecker {
                 // The `return` expression's own type is already NoReturn (set by
                 // the parser), so it needs no constraint here.
             }
-            CaseLit(qualifier, case, fields) => {
+            RecordLit(qualifier, fields) => {
                 for field in fields {
                     self.collect_expr_constraints(&field.value, ret_ty, out);
                 }
@@ -485,45 +481,53 @@ impl TypeChecker {
                     return;
                 }
 
-                // The literal names a case, not a type. All it says is that
-                // whatever this is, it has *this* case with *these* fields —
-                // which type that makes it is left to unification.
-                let known = TypeCase::new(
-                    case.clone(),
+                // The literal names no type at all. All it says is that whatever
+                // this is, it has *these* fields — which record that makes it,
+                // and which fields it is therefore missing, is left to
+                // unification.
+                let record = Record::build(
                     fields
                         .iter()
                         .map(|f| (f.name.clone(), f.value.ty.clone()))
                         .collect(),
-                );
+                )
+                .expect("the parser rejects a literal whose fields are mixed");
+
                 out.push(Constraint::IsEqual(
                     expr.ty.clone(),
-                    Type::SomeType(vec![known]),
+                    Type::SomeRecord(record),
                     expr.loc,
                 ));
 
-                // A qualifier says outright which type it is, so it is just one
-                // more equality — and the check above is what validates it.
-                if let Some((name, args)) = qualifier {
-                    // No turbofish does not mean "no type arguments": in
-                    // `Option::Some { val: 0 }` the argument is simply left to
-                    // inference, so it gets a fresh variable per parameter of
-                    // the declaration. An undeclared name has no parameters to
-                    // count and is reported by the declaration check.
-                    let args = if args.is_empty() {
-                        let arity = self.types.get(name).map_or(0, |d| d.type_params.len());
-                        (0..arity).map(|_| Type::T(self.fresh.next())).collect()
-                    } else {
-                        args.clone()
-                    };
-
-                    out.push(Constraint::IsEqual(
-                        expr.ty.clone(),
-                        Type::User(name.clone(), args),
-                        expr.loc,
-                    ));
-                }
+                self.constrain_qualifier(qualifier.as_deref(), expr, out);
             }
-            Field(recv, name) => {
+            CaseLit(qualifier, case, payload) => {
+                if let Some(payload) = payload {
+                    self.collect_expr_constraints(payload, ret_ty, out);
+                }
+
+                if diverges(expr) {
+                    out.push(Constraint::Diverges(expr.ty.clone(), expr.loc));
+                    return;
+                }
+
+                // Names a case, not a type: whatever this is, it has *this* case,
+                // carrying *this* payload. Which sum that makes it is left to
+                // unification.
+                let known = SumCase::new(case.clone(), payload.as_ref().map(|p| p.ty.clone()));
+                out.push(Constraint::IsEqual(
+                    expr.ty.clone(),
+                    Type::SomeSum(vec![known]),
+                    expr.loc,
+                ));
+
+                self.constrain_qualifier(qualifier.as_deref(), expr, out);
+            }
+            Zeroed => {
+                // Only `resolve` builds one of these, from a type it already
+                // knows, so there is never one here to say anything about.
+            }
+            Field(recv, field) => {
                 self.collect_expr_constraints(recv, ret_ty, out);
 
                 if diverges(recv) {
@@ -538,7 +542,7 @@ impl TypeChecker {
                 out.push(Constraint::Field(FieldConstraint {
                     key,
                     recv: recv.ty.clone(),
-                    field: name.clone(),
+                    field: field.clone(),
                     loc: expr.loc,
                     bound: false,
                 }));
@@ -579,6 +583,26 @@ impl TypeChecker {
         }
     }
 
+    /// A literal's qualifier says outright which declared type it is, which is
+    /// just one more equality — the arms above are what validate it.
+    ///
+    /// A qualifier can never carry type arguments, since no type may be written
+    /// inside an expression, so every parameter of the declaration gets a fresh
+    /// variable for inference to fill in. An undeclared name has no parameters to
+    /// count and is reported by the declaration check.
+    fn constrain_qualifier(&mut self, name: Option<&str>, expr: &Expr, out: &mut Vec<Constraint>) {
+        let Some(name) = name else { return };
+
+        let arity = self.types.get(name).map_or(0, |d| d.type_params.len());
+        let args = (0..arity).map(|_| Type::T(self.fresh.next())).collect();
+
+        out.push(Constraint::IsEqual(
+            expr.ty.clone(),
+            Type::User(name.to_string(), args),
+            expr.loc,
+        ));
+    }
+
     fn collect_stmt_constraints(
         &mut self,
         stmt: &Statement,
@@ -589,10 +613,6 @@ impl TypeChecker {
             // A statement's value is discarded, so unlike a tail it constrains
             // nothing: whatever it evaluates to is fine.
             StmtKind::Expr(e) => self.collect_expr_constraints(e, ret_ty, out),
-
-            // Purely a name binding, resolved while parsing. Nothing to check
-            // here; that the type has the case is checked with the declarations.
-            StmtKind::Use(..) => {}
 
             StmtKind::Let(_, var_ty, init) => {
                 if let Some(init) = init {
@@ -881,18 +901,14 @@ impl TypeChecker {
     /// Build the initial candidate set for a call: every overload of the name,
     /// with its type parameters replaced.
     ///
-    /// An overload whose parameter count doesn't match an explicit turbofish is
-    /// dropped outright — including every non-generic one, since a turbofish
-    /// can only ever have been meant for a generic.
+    /// A generic's type parameters become fresh variables for the solver to pin
+    /// down: there is no way to write them at a call site, so every instantiation
+    /// is inferred.
     fn instantiate_candidates(&mut self, call: &CallConstraint) -> Vec<Candidate> {
         let schemes = &self.schemes[&call.name];
 
         let mut out = Vec::with_capacity(schemes.len());
         for (idx, scheme) in schemes.iter().enumerate() {
-            if !call.type_args.is_empty() && call.type_args.len() != scheme.type_params.len() {
-                continue;
-            }
-
             if !scheme.is_generic() {
                 out.push(Candidate {
                     idx,
@@ -902,15 +918,11 @@ impl TypeChecker {
                 continue;
             }
 
-            let type_args = if call.type_args.is_empty() {
-                scheme
-                    .type_params
-                    .iter()
-                    .map(|_| Type::T(self.fresh.next()))
-                    .collect::<Vec<_>>()
-            } else {
-                call.type_args.clone()
-            };
+            let type_args = scheme
+                .type_params
+                .iter()
+                .map(|_| Type::T(self.fresh.next()))
+                .collect::<Vec<_>>();
 
             let subst = scheme
                 .type_params
@@ -974,13 +986,17 @@ impl TypeChecker {
 
         match (t1, t2) {
             (T(a), T(b)) => set.unify(a, b, loc)?,
-            (T(id), ty) | (ty, T(id)) => set.bind(id, ty, loc)?,
-            (t1, t2) if t1 != t2 => Err(FloErr::TypeMismatch {
-                expected: t1,
-                got: t2,
-                loc,
-            })?,
-            _ => {}
+            // Every constraint is (expected, got), and the two arms are kept apart
+            // so that stays true of anything the binding goes on to report.
+            (T(id), ty) => set.bind_as(id, ty, false, loc)?,
+            (ty, T(id)) => set.bind_as(id, ty, true, loc)?,
+            // Two types with no variable at the root. Comparing them here would be
+            // wrong as well as unhelpful: a record can differ from an equal one by
+            // an `{integer}` sitting in a field, and a genuine mismatch deserves
+            // the unifier's specific error rather than a bare expected-and-got.
+            (t1, t2) => {
+                set.merge(t1, t2, loc)?;
+            }
         }
 
         Ok(())
@@ -1035,14 +1051,15 @@ fn lookup_field(
     use Type::*;
 
     let recv = set.resolve(&field.recv);
+    let field_name = format!("{:?}", field.field);
 
     let sum_type_err = || FloErr::FieldAccessOnSumType {
         ty: recv.clone(),
-        field: field.field.clone(),
+        field: field_name.clone(),
         loc: field.loc,
     };
 
-    let case = match &recv {
+    let record = match &recv {
         // Nothing to look the field up in yet.
         T(_) => return Ok(None),
         // The receiver never yields a value, so neither does the access.
@@ -1053,40 +1070,74 @@ fn lookup_field(
                 // Undeclared; reported by the declaration check.
                 return Ok(None);
             };
-            let [only] = &decl.cases[..] else {
-                return Err(sum_type_err());
-            };
-            decl.case_at(&only.name, args)
-                .expect("a declaration's own case")
+            match decl.record_at(args) {
+                Some(record) => record,
+                // Every sum, one case included: which case a value holds is a
+                // runtime question, so `match` is the only thing that reads one.
+                None => return Err(sum_type_err()),
+            }
         }
 
-        // A literal type is read the same way, so `let v = Foo { n: 0 }; v.n`
-        // needs no annotation. It is checked again once the type is closed, in
-        // case it gained a case in the meantime.
-        SomeType(cases) | Anon(cases) => {
-            let [only] = &cases[..] else {
-                return Err(sum_type_err());
-            };
-            only.clone()
-        }
+        // A record still being inferred is read the same way, so
+        // `let v = .{ n: 0 }; v.n` needs no annotation. The access is checked
+        // again once the type is closed, in case it gained a field meanwhile.
+        SomeRecord(record) | AnonRecord(record) => record.clone(),
+
+        SomeSum(_) | AnonSum(_) => return Err(sum_type_err()),
 
         _ => {
             return Err(FloErr::NotAStruct {
                 ty: recv.clone(),
-                field: field.field.clone(),
+                field: field_name,
                 loc: field.loc,
             });
         }
     };
 
-    match case.field(&field.field) {
+    match record.get(&field.field) {
         Some(ty) => Ok(Some(ty.clone())),
         None => Err(FloErr::UnknownField {
             ty: recv,
-            field: field.field.clone(),
+            field: field_name,
             loc: field.loc,
         }),
     }
+}
+
+/// The record a resolved type is, if it is one. Used to fill a record literal's
+/// missing fields in, once which record it is has been settled.
+fn record_of(ty: &Type, types: &TypeTable) -> Option<Record> {
+    match ty {
+        Type::AnonRecord(record) => Some(record.clone()),
+        Type::User(name, args) => types.get(name)?.record_at(args),
+        _ => None,
+    }
+}
+
+/// A record literal's fields, one per field of the record it turned out to be:
+/// the ones it gave, plus a zero for each one it left out.
+///
+/// The order is the record's canonical one — fields sorted by name, or by index
+/// for a positional record — and not the order they were written in. Which is
+/// deliberately *not* the declaration's layout order: a literal cannot carry
+/// that, because an anonymous record has no declaration to take it from, so the
+/// back end matches fields by name and lays them out from the declaration.
+fn fill_record(record: &Record, given: Vec<FieldInit>, loc: Loc) -> Vec<FieldInit> {
+    record
+        .iter()
+        .map(|(name, ty)| match given.iter().find(|f| f.name == name) {
+            Some(field) => field.clone(),
+            None => FieldInit {
+                name,
+                value: Expr {
+                    kind: ExprKind::Zeroed,
+                    ty: ty.clone(),
+                    loc,
+                },
+                loc,
+            },
+        })
+        .collect()
 }
 
 /// Whether an expression diverges (never yields a value), determined purely
@@ -1117,7 +1168,8 @@ fn diverges(expr: &Expr) -> bool {
         Assign(target, value) => diverges(target) || diverges(value),
         // A literal whose field value diverges is never built, and a field of a
         // receiver that diverges is never read.
-        CaseLit(_, _, fields) => fields.iter().any(|f| diverges(&f.value)),
+        RecordLit(_, fields) => fields.iter().any(|f| diverges(&f.value)),
+        CaseLit(_, _, payload) => payload.as_deref().is_some_and(diverges),
         Field(recv, _) => diverges(recv),
         // There are no bits to reinterpret if the operand never yields any.
         // Note that no `Constraint::Diverges` is emitted for a cast (see the
@@ -1134,8 +1186,6 @@ fn stmt_diverges(stmt: &Statement) -> bool {
     match &stmt.kind {
         StmtKind::Expr(e) => diverges(e),
         StmtKind::Let(_, _, init) => init.as_ref().is_some_and(diverges),
-        // Nothing to evaluate.
-        StmtKind::Use(..) => false,
     }
 }
 
@@ -1170,6 +1220,9 @@ struct ResolveCtx<'a> {
     schemes: &'a HashMap<String, Vec<Scheme>>,
     res: &'a HashMap<usize, Resolution>,
     requested: &'a mut Vec<WorkItem>,
+    /// Needed to fill a record literal's missing fields in: which fields a
+    /// declared record has is only in here.
+    types: &'a TypeTable,
 }
 
 impl Func {
@@ -1179,6 +1232,7 @@ impl Func {
         res: &HashMap<usize, Resolution>,
         requested: &mut Vec<WorkItem>,
         schemes: &HashMap<String, Vec<Scheme>>,
+        types: &TypeTable,
     ) -> FloResult<Self> {
         let ty = set.resolve(&self.ty);
         if !ty.is_known() {
@@ -1189,6 +1243,7 @@ impl Func {
             schemes,
             res,
             requested,
+            types,
         };
 
         Ok(Func {
@@ -1205,7 +1260,6 @@ impl Statement {
     fn resolve(&self, set: &mut ReplaceSet, ctx: &mut ResolveCtx) -> FloResult<Self> {
         let kind = match &self.kind {
             StmtKind::Expr(e) => StmtKind::Expr(e.resolve(set, ctx)?),
-            StmtKind::Use(ty, case) => StmtKind::Use(ty.clone(), case.clone()),
             StmtKind::Let(id, var_ty, init) => {
                 // A statement has no type of its own, so nothing else would ever
                 // look at the variable's. An unresolved one is reported here, at
@@ -1248,7 +1302,7 @@ impl Expr {
         }
 
         let kind = match &self.kind {
-            Call(name, _, args, _) => {
+            Call(name, args, _) => {
                 let mut new_args = Vec::new();
                 for arg in args {
                     new_args.push(arg.resolve(set, ctx)?);
@@ -1295,7 +1349,7 @@ impl Expr {
                     });
                 }
 
-                Call(name.clone(), Vec::new(), new_args, Some(mangled))
+                Call(name.clone(), new_args, Some(mangled))
             }
             Scope(stmts, tail) => {
                 let mut new_stmts = Vec::new();
@@ -1338,7 +1392,7 @@ impl Expr {
                 Box::new(target.resolve(set, ctx)?),
                 Box::new(value.resolve(set, ctx)?),
             ),
-            CaseLit(_, case, fields) => {
+            RecordLit(_, fields) => {
                 let mut new_fields = Vec::with_capacity(fields.len());
                 for field in fields {
                     new_fields.push(FieldInit {
@@ -1348,10 +1402,30 @@ impl Expr {
                     });
                 }
 
+                // Which record this is has been settled, so the fields the
+                // literal left out can be filled in with zeroes — and this is the
+                // only place that could do it, since what is missing is a
+                // property of each literal and not of the type they share.
+                //
+                // A literal whose type is not a record at all has nothing to fill
+                // against: that only happens when it diverges, and is never
+                // built.
+                if let Some(record) = record_of(&ty, ctx.types) {
+                    new_fields = fill_record(&record, new_fields, loc);
+                }
+
                 // The qualifier has done its job: `ty` now says which type this
                 // is, the same as it does for an unqualified literal.
-                CaseLit(None, case.clone(), new_fields)
+                RecordLit(None, new_fields)
             }
+            CaseLit(_, case, payload) => {
+                let payload = match payload {
+                    Some(payload) => Some(Box::new(payload.resolve(set, ctx)?)),
+                    None => None,
+                };
+                CaseLit(None, case.clone(), payload)
+            }
+            Zeroed => Zeroed,
             Field(recv, name) => Field(Box::new(recv.resolve(set, ctx)?), name.clone()),
             Cast(_, value) => {
                 let value = value.resolve(set, ctx)?;

@@ -35,14 +35,15 @@ pub enum FloErr {
         loc: Loc,
     },
 
-    UseOutsideStatementPosition {
+    /// A feature the syntax reserves but the compiler does not implement yet.
+    NotImplemented {
+        what: &'static str,
         loc: Loc,
     },
 
-    /// A bare name that is neither a variable in scope nor a case brought in by
-    /// a `use`. Without one of those there is nothing it could mean: a case name
-    /// says nothing about which type it belongs to, so an unknown one cannot
-    /// just be taken as a literal.
+    /// A bare name that is not a variable in scope. There is nothing else it
+    /// could be: a case is only ever written after a `.`, and a type name only as
+    /// a literal's qualifier, which needs a `.` after it too.
     UnknownIdentifier {
         name: String,
         loc: Loc,
@@ -85,8 +86,47 @@ pub enum FloErr {
         token: Token,
     },
 
-    /// A `type` case that is neither `Name`, `Name { .. }` nor `{ .. }`.
+    /// A `type` case that is neither `Name` nor `Name { .. }`.
     ExpectedCase {
+        found: Token,
+    },
+
+    /// A `|` in a type position whose alternative could not be a case: a
+    /// primitive, a type parameter, a generic mention, or a record.
+    NotACase {
+        ty: Type,
+        loc: Loc,
+    },
+
+    /// `Name { .. }` written in a type position with no `|` after it. It can only
+    /// have been meant as a case, and a one-case sum is a record written the long
+    /// way round.
+    SingleCaseAnonSum {
+        case: String,
+        loc: Loc,
+    },
+
+    /// The same case named twice in one anonymous sum.
+    DuplicateCaseInAnonSum {
+        case: String,
+        loc: Loc,
+    },
+
+    /// A record with both named and positional fields. It is addressed one way or
+    /// the other, so it has to be written one way or the other.
+    MixedFieldKinds {
+        loc: Loc,
+    },
+
+    /// `_0`, `_1`, ... name positional fields, so they cannot be written as the
+    /// name of one.
+    ReservedFieldName {
+        field: String,
+        loc: Loc,
+    },
+
+    /// A `.` after something that is neither a field name nor a `{`.
+    ExpectedLiteral {
         found: Token,
     },
 
@@ -104,7 +144,6 @@ pub enum FloErr {
     },
 
     DuplicateField {
-        case: String,
         field: String,
         loc: Loc,
         prev_loc: Loc,
@@ -119,6 +158,15 @@ pub enum FloErr {
 
     /// A type annotation naming a type that nothing declares.
     UnknownType {
+        name: String,
+        loc: Loc,
+    },
+
+    /// A literal qualified with a name that is neither a type nor a variable in
+    /// scope. Whether a name is a type cannot be known while parsing — the
+    /// declaration may be further down the file — so `foo.bar` is parsed as a
+    /// qualified literal and reported here instead.
+    NotATypeOrVariable {
         name: String,
         loc: Loc,
     },
@@ -158,13 +206,37 @@ pub enum FloErr {
         loc: Loc,
     },
 
-    /// A literal that gave a case the wrong fields. A literal must give every
-    /// field of its case and no others, so this covers missing and unknown ones
-    /// alike.
+    /// Two concrete records that are not the same record. Neither side can give
+    /// way — a record written down is closed over exactly its fields — so unlike
+    /// [`FloErr::UnexpectedField`] this is not about a literal at all.
     WrongFields {
-        case: String,
         expected: Vec<String>,
         got: Vec<String>,
+        loc: Loc,
+    },
+
+    /// A record literal gave a field that the record it turned out to be does not
+    /// have. Fields it *left out* are not an error: those are zero initialized.
+    UnexpectedField {
+        ty: Type,
+        field: String,
+        loc: Loc,
+    },
+
+    /// A record where a sum belongs, or the other way round. Its own error rather
+    /// than a plain mismatch because it is the easiest thing to get wrong: the two
+    /// are built with different syntax, and only the type says which is wanted.
+    RecordSumMismatch {
+        record: Type,
+        sum: Type,
+        loc: Loc,
+    },
+
+    /// A case given a payload it does not take, or not given the one it does.
+    /// `expected` is whether the case has a payload.
+    PayloadMismatch {
+        case: String,
+        expected: bool,
         loc: Loc,
     },
 
@@ -174,8 +246,10 @@ pub enum FloErr {
         loc: Loc,
     },
 
-    /// Field access on a type with more than one case. Which case a value holds
-    /// is not known without asking, so its fields are reached through `is`.
+    /// Field access on a sum. Which case a value holds is a runtime question, so
+    /// a sum's payload is reached through `match` and never through `.` — and
+    /// that holds for a one-case sum too, which is a choice of one and not a
+    /// record.
     FieldAccessOnSumType {
         ty: Type,
         field: String,
@@ -307,8 +381,43 @@ impl FloErr {
                     "Expected a case of the type, but found `{}`",
                     found.kind.pretty_name()
                 );
-                eprintln!("    a case is `Name`, `Name {{ .. }}`, or `{{ .. }}` to reuse the type's name");
+                eprintln!("    a case is `Name` or `Name {{ .. }}`");
+                eprintln!("    a `{{ .. }}` straight after the `=` declares a record instead");
                 print_src(src, &[found.loc]);
+            }
+            NotACase { ty, loc } => {
+                eprintln!("`{ty:?}` cannot be a case of a sum");
+                eprintln!("    a case is a name, optionally with a `{{ .. }}` payload");
+                print_src(src, &[loc]);
+            }
+            SingleCaseAnonSum { case, loc } => {
+                eprintln!("`{case} {{ .. }}` is a sum of one case, which is not a type you can write");
+                eprintln!("    write `{{ .. }}` for a record, or add a `| OtherCase` to make it a sum");
+                print_src(src, &[loc]);
+            }
+            DuplicateCaseInAnonSum { case, loc } => {
+                eprintln!("The case `{case}` appears more than once in this sum");
+                print_src(src, &[loc]);
+            }
+            MixedFieldKinds { loc } => {
+                eprintln!("This record mixes named and positional fields");
+                eprintln!("    a record is addressed by name or by position, so it is written one way or the other");
+                print_src(src, &[loc]);
+            }
+            ReservedFieldName { field, loc } => {
+                eprintln!("`{field}` is the name of a positional field, so it cannot be given to one");
+                print_src(src, &[loc]);
+            }
+            ExpectedLiteral { found } => {
+                eprintln!(
+                    "Expected a field name or `{{` after `.`, but found `{}`",
+                    found.kind.pretty_name()
+                );
+                print_src(src, &[found.loc]);
+            }
+            NotImplemented { what, loc } => {
+                eprintln!("`{what}` is not implemented yet");
+                print_src(src, &[loc]);
             }
             DuplicateType {
                 name,
@@ -328,12 +437,11 @@ impl FloErr {
                 print_src(src, &[prev_loc, loc]);
             }
             DuplicateField {
-                case,
                 field,
                 loc,
                 prev_loc,
             } => {
-                eprintln!("Case `{case}` declares the field `{field}` more than once");
+                eprintln!("The field `{field}` is declared more than once");
                 print_src(src, &[prev_loc, loc]);
             }
             DuplicateFieldInit {
@@ -346,6 +454,10 @@ impl FloErr {
             }
             UnknownType { name, loc } => {
                 eprintln!("Unknown type `{name}`");
+                print_src(src, &[loc]);
+            }
+            NotATypeOrVariable { name, loc } => {
+                eprintln!("`{name}` is not a type, and no variable of that name is in scope");
                 print_src(src, &[loc]);
             }
             TypeArityMismatch {
@@ -381,13 +493,35 @@ impl FloErr {
                 print_src(src, &[loc]);
             }
             WrongFields {
-                case,
                 expected,
                 got,
                 loc,
             } => {
-                eprintln!("Case `{case}` needs the fields {}", named(&expected));
-                eprintln!("    but was given {}", named(&got));
+                eprintln!("This record has the fields {}", named(&expected));
+                eprintln!("    but the other one has {}", named(&got));
+                print_src(src, &[loc]);
+            }
+            UnexpectedField { ty, field, loc } => {
+                eprintln!("`{ty:?}` has no field `{field}`");
+                eprintln!("    a field left *out* of a literal is zero initialized, but one it does not have cannot go anywhere");
+                print_src(src, &[loc]);
+            }
+            RecordSumMismatch { record, sum, loc } => {
+                eprintln!("A record and a sum are never the same type");
+                eprintln!("    `{record:?}` is a record -- built with `.{{ .. }}`");
+                eprintln!("    `{sum:?}` is a sum -- built with `.Case`");
+                print_src(src, &[loc]);
+            }
+            PayloadMismatch {
+                case,
+                expected,
+                loc,
+            } => {
+                if expected {
+                    eprintln!("The case `{case}` carries a payload, which this literal does not give");
+                } else {
+                    eprintln!("The case `{case}` carries nothing, so it takes no payload");
+                }
                 print_src(src, &[loc]);
             }
             UnknownField { ty, field, loc } => {
@@ -395,8 +529,8 @@ impl FloErr {
                 print_src(src, &[loc]);
             }
             FieldAccessOnSumType { ty, field, loc } => {
-                eprintln!("Cannot read `{field}` of `{ty:?}`, which has more than one case");
-                eprintln!("    which case it holds has to be established with `is` first");
+                eprintln!("Cannot read `{field}` of `{ty:?}`, which is a sum");
+                eprintln!("    which case a sum holds is a runtime question, so its payload is reached with `match`");
                 print_src(src, &[loc]);
             }
             NotAStruct { ty, field, loc } => {
@@ -428,14 +562,10 @@ impl FloErr {
                 eprintln!("`let` may only appear as a statement inside a scope");
                 print_src(src, &[loc]);
             }
-            UseOutsideStatementPosition { loc } => {
-                eprintln!("`use` may only appear at file scope, or as a statement inside a scope");
-                print_src(src, &[loc]);
-            }
             UnknownIdentifier { name, loc } => {
                 eprintln!("Unknown identifier `{name}`");
                 eprintln!(
-                    "    it is not a variable in scope; if it is a case of a type, bring it in with `use Type::{name};` or write it as `Type::{name}`"
+                    "    it is not a variable in scope; a case of a type is written `.{name}`, or `Type.{name}`"
                 );
                 print_src(src, &[loc]);
             }
@@ -638,7 +768,7 @@ impl TokenKind {
             TokenKind::Comma => ",",
             TokenKind::Dot => ".",
             TokenKind::TypeKw => "type",
-            TokenKind::Use => "use",
+            TokenKind::Match => "match",
             TokenKind::Plus => "+",
             TokenKind::Minus => "-",
             TokenKind::Star => "*",

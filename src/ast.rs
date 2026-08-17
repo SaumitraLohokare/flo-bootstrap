@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
     tokenizer::Loc,
-    types::{Type, TypeTable},
+    types::{DeclKind, FieldName, Type, TypeTable},
 };
 
 #[derive(Clone)]
@@ -12,13 +12,6 @@ pub struct Module {
     /// Every `type` declaration in the program, by name. Types live in their own
     /// namespace, so a type and a function may share a name.
     pub types: TypeTable,
-
-    /// Every `use` written in the program, wherever it was written: at file
-    /// scope, or as a statement inside a body. Name resolution already happened
-    /// in the parser, so this flat list exists only to be validated — which has
-    /// to wait until every `type` is in, since a `use` may name one declared
-    /// further down the file.
-    pub uses: Vec<UseDecl>,
 
     /// How many variable ids the parser handed out. A later pass that needs a
     /// temporary of its own mints it from here on, so it cannot collide with a
@@ -48,19 +41,6 @@ pub struct Func {
     pub type_params: Vec<(String, usize)>,
 }
 
-/// A `use Type::Case;`, wherever it was written.
-///
-/// The parser has already done everything this affects — it is what let a bare
-/// `Case` parse as a literal rather than an unknown name — so all that is left
-/// is to check that the type exists and has the case, which cannot happen until
-/// every declaration is in.
-#[derive(Debug, Clone)]
-pub struct UseDecl {
-    pub type_name: String,
-    pub case: String,
-    pub loc: Loc,
-}
-
 /// One step of a scope, before its tail.
 ///
 /// A statement is not an expression: it has no type and yields no value. An
@@ -80,11 +60,6 @@ pub enum StmtKind {
     // that reads it. `init` is absent for `let x;`, whose type is then pinned by
     // whatever assigns to it first.
     Let(usize, Type, Option<Expr>),
-
-    // Use(type_name, case) - brings a case name into scope for the rest of the
-    // enclosing scope, so it can be written bare. Purely a name binding: there
-    // is nothing to evaluate, and nothing for a later pass to lower.
-    Use(String, String),
 
     // An expression evaluated for its effect; its value is discarded.
     Expr(Expr),
@@ -106,12 +81,12 @@ pub enum ExprKind {
     Bool(bool),
     Var(usize),
 
-    // Call(name, type_args, args, resolved_name)
+    // Call(name, args, resolved_name)
     //
-    // `type_args` are the ones written explicitly with a turbofish
-    // (`add::<i32>(a, b)`), and are empty otherwise — an inferred instantiation
-    // leaves no trace here, it is recorded in the resolved name.
-    Call(String, Vec<Type>, Vec<Expr>, Option<String>),
+    // There are no explicit type arguments: nothing inside an expression may
+    // name a type, so a generic's instantiation is always inferred and leaves no
+    // trace here — it is recorded in the resolved name.
+    Call(String, Vec<Expr>, Option<String>),
 
     // Logical(op, lhs, rhs) - `&&` or `||`, and only ever those two. Always bool
     // typed, and both operands are required to be bool.
@@ -146,23 +121,38 @@ pub enum ExprKind {
     // be an l-value (see `Expr::is_lvalue`).
     Assign(Box<Expr>, Box<Expr>),
 
-    // CaseLit(qualifier, case, fields) - a type literal, `Some { val: 0 }`.
+    // RecordLit(qualifier, fields) - a record literal, `.{ x: 0 }`.
     //
-    // A literal names a *case*, never a type: several types may have a case by
-    // that name, so which one this is comes from context (see `Type::SomeType`).
-    // `qualifier` is the `Vec::<i32>::` of `Vec::<i32>::Vec { .. }`, the way to
-    // say it outright; it is `None` for the bare form a `use` allows, and
-    // dropped once the checker has settled the type.
+    // On its own it names no type at all: it says only "something with these
+    // fields", and which record that makes it comes from context (see
+    // `Type::SomeRecord`). `qualifier` is the `Vec2` of `Vec2.{ x: 0 }`, the way
+    // to say it outright; it is dropped once the checker has settled the type.
     //
-    // Its type arguments are empty when no turbofish was written, which is not
-    // the same as "this type has none": `Option::Some { val: 0 }` names the type
-    // and leaves the argument to inference. The checker fills in a fresh
-    // variable per parameter of the declaration.
-    CaseLit(Option<(String, Vec<Type>)>, String, Vec<FieldInit>),
+    // A qualifier names the type and never its arguments — no type may be
+    // written inside an expression — so `Vec.{ .. }` leaves `T` to inference,
+    // and the checker fills in a fresh variable per parameter of the
+    // declaration.
+    //
+    // Fields may be left out; `resolve` fills each missing one in with a
+    // `Zeroed` of its type, once the record this is has been decided.
+    RecordLit(Option<String>, Vec<FieldInit>),
 
-    // Field(receiver, name) - `foo.bar`. Only legal on a type with a single
-    // case; reaching into a sum type needs `is`. An l-value when the receiver is.
-    Field(Box<Expr>, String),
+    // CaseLit(qualifier, case, payload) - a case literal, `.Some .{ 0 }`.
+    //
+    // Names a *case*, never a type: several sums may have a case by that name,
+    // so which one this is comes from context (see `Type::SomeSum`). The payload
+    // is always a `RecordLit`, and is absent for a case that carries nothing.
+    CaseLit(Option<String>, String, Option<Box<Expr>>),
+
+    // Zeroed - the value of a field a record literal left out. Never parsed;
+    // `Expr::resolve` synthesizes one per missing field, typed as that field, so
+    // the back end sees a literal that gives every field exactly once.
+    Zeroed,
+
+    // Field(receiver, name) - `foo.bar`, or `foo._0` for a positional field.
+    // Legal on records only; reaching into a sum needs `match`. An l-value when
+    // the receiver is.
+    Field(Box<Expr>, FieldName),
 
     // Cast(target, value) - `@cast(u8) x`. A bit-cast: it reinterprets the bits
     // it is given rather than converting between representations, so it says
@@ -199,13 +189,14 @@ impl TypeQuery {
     }
 }
 
-/// One `name: value` in a type literal.
+/// One field of a record literal: `name: value`, or just `value` for a
+/// positional one, whose name is the index it was written at.
 #[derive(Debug, Clone)]
 pub struct FieldInit {
-    pub name: String,
+    pub name: FieldName,
     pub value: Expr,
-    /// Of the field's name, so a duplicate or unknown field underlines the name
-    /// rather than the whole literal.
+    /// Of the field's name — or of the value, for a positional field — so a
+    /// duplicate or unknown field underlines it rather than the whole literal.
     pub loc: Loc,
 }
 
@@ -261,33 +252,41 @@ impl Debug for Module {
                 format!("<{list}>")
             };
 
-            let cases = decl
-                .cases
-                .iter()
-                .map(|case| {
-                    if case.fields.is_empty() {
-                        case.name.clone()
-                    } else {
-                        let fields = case
-                            .fields
-                            .iter()
-                            .map(|field| format!("{}: {:?}", field.name, field.ty))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("{} {{ {fields} }}", case.name)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
+            let body = match &decl.kind {
+                DeclKind::Record(record) => {
+                    let fields = record
+                        .fields
+                        .iter()
+                        .map(|field| match &field.name {
+                            FieldName::Pos(_) => format!("{:?}", field.ty),
+                            FieldName::Named(n) => format!("{n}: {:?}", field.ty),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{{ {fields} }}")
+                }
+                DeclKind::Sum(cases) => cases
+                    .iter()
+                    .map(|case| match &case.payload {
+                        None => case.name.clone(),
+                        Some(payload) => {
+                            let fields = payload
+                                .fields
+                                .iter()
+                                .map(|field| match &field.name {
+                                    FieldName::Pos(_) => format!("{:?}", field.ty),
+                                    FieldName::Named(n) => format!("{n}: {:?}", field.ty),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("{} {{ {fields} }}", case.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            };
 
-            writeln!(f, "type {name}{params} = {cases};")?;
-        }
-
-        // Only the file-scope ones would be interesting on their own, but the
-        // list does not say which is which — a scoped `use` also prints inside
-        // the body it belongs to, so it simply shows up twice.
-        for use_decl in &self.uses {
-            writeln!(f, "use {}::{};", use_decl.type_name, use_decl.case)?;
+            writeln!(f, "type {name}{params} = {body};")?;
         }
 
         let mut names = self.funcs.keys().collect::<Vec<_>>();
@@ -350,8 +349,6 @@ impl Statement {
                 var_ty.substitute(subst),
                 init.as_ref().map(|e| e.substitute(subst)),
             ),
-            // Nothing but names, and a name is not a type.
-            StmtKind::Use(ty, case) => StmtKind::Use(ty.clone(), case.clone()),
             StmtKind::Expr(e) => StmtKind::Expr(e.substitute(subst)),
         };
 
@@ -371,7 +368,6 @@ impl Statement {
                 };
                 format!("{indent}let var_{id}:{var_ty:?}{init}")
             }
-            StmtKind::Use(ty, case) => format!("{indent}use {ty}::{case}"),
             StmtKind::Expr(e) => e.pretty_print(indent_amt),
         }
     }
@@ -387,9 +383,8 @@ impl Expr {
         let sub_box = |e: &Expr| Box::new(e.substitute(subst));
 
         let kind = match &self.kind {
-            Call(name, type_args, args, resolved) => Call(
+            Call(name, args, resolved) => Call(
                 name.clone(),
-                type_args.iter().map(|t| t.substitute(subst)).collect(),
                 args.iter().map(|a| a.substitute(subst)).collect(),
                 resolved.clone(),
             ),
@@ -406,16 +401,11 @@ impl Expr {
             While(cond, body) => While(sub_box(cond), sub_box(body)),
             Return(value) => Return(value.as_deref().map(sub_box)),
             Assign(target, value) => Assign(sub_box(target), sub_box(value)),
-            // A qualifier's type arguments can mention a type parameter too:
-            // `Vec::<T>::Vec { .. }` inside a generic function.
-            CaseLit(qualifier, case, fields) => CaseLit(
-                qualifier.as_ref().map(|(name, args)| {
-                    (
-                        name.clone(),
-                        args.iter().map(|a| a.substitute(subst)).collect(),
-                    )
-                }),
-                case.clone(),
+            // A qualifier is a bare type name — it cannot mention a type
+            // parameter, since it cannot carry type arguments at all — so only
+            // the field values need substituting.
+            RecordLit(qualifier, fields) => RecordLit(
+                qualifier.clone(),
                 fields
                     .iter()
                     .map(|f| FieldInit {
@@ -424,6 +414,11 @@ impl Expr {
                         loc: f.loc,
                     })
                     .collect(),
+            ),
+            CaseLit(qualifier, case, payload) => CaseLit(
+                qualifier.clone(),
+                case.clone(),
+                payload.as_deref().map(sub_box),
             ),
             Field(recv, name) => Field(sub_box(recv), name.clone()),
             // The target is substituted alongside `ty`, which mirrors it: a
@@ -438,6 +433,7 @@ impl Expr {
             Flt(n) => Flt(*n),
             Bool(b) => Bool(*b),
             Var(id) => Var(*id),
+            Zeroed => Zeroed,
             Break => Break,
             Continue => Continue,
         };
@@ -456,7 +452,8 @@ impl Expr {
             ExprKind::Flt(num) => format!("{indent}{num}:{:?}", self.ty),
             ExprKind::Bool(b) => format!("{indent}{b}:{:?}", self.ty),
             ExprKind::Var(id) => format!("{indent}var_{id}:{:?}", self.ty),
-            ExprKind::Call(name, type_args, exprs, resolved) => {
+            ExprKind::Zeroed => format!("{indent}@zeroed:{:?}", self.ty),
+            ExprKind::Call(name, exprs, resolved) => {
                 let arg_list = exprs
                     .iter()
                     .map(|arg| arg.pretty_print(0))
@@ -467,17 +464,7 @@ impl Expr {
                 } else {
                     format!("[unresolved]{name}")
                 };
-                let turbofish = if type_args.is_empty() {
-                    String::new()
-                } else {
-                    let list = type_args
-                        .iter()
-                        .map(|t| format!("{t:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("::<{list}>")
-                };
-                format!("{indent}{name}{turbofish}({arg_list}):{:?}", self.ty)
+                format!("{indent}{name}({arg_list}):{:?}", self.ty)
             }
             ExprKind::BuiltinOp(op) => format!("{indent}@builtin({op:?})"),
             ExprKind::Scope(stmts, tail) => {
@@ -539,34 +526,28 @@ impl Expr {
                 value.pretty_print(0),
                 self.ty
             ),
-            ExprKind::CaseLit(qualifier, case, fields) => {
-                let qualifier = match qualifier {
-                    Some((name, args)) if args.is_empty() => format!("{name}::"),
-                    Some((name, args)) => {
-                        let list = args
-                            .iter()
-                            .map(|a| format!("{a:?}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("{name}::<{list}>::")
-                    }
+            ExprKind::RecordLit(qualifier, fields) => {
+                let qualifier = qualifier.clone().unwrap_or_default();
+                let list = fields
+                    .iter()
+                    .map(|f| match &f.name {
+                        FieldName::Pos(_) => f.value.pretty_print(0),
+                        FieldName::Named(n) => format!("{n}: {}", f.value.pretty_print(0)),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{indent}{qualifier}.{{ {list} }}:{:?}", self.ty)
+            }
+            ExprKind::CaseLit(qualifier, case, payload) => {
+                let qualifier = qualifier.clone().unwrap_or_default();
+                let payload = match payload {
+                    Some(payload) => format!(" {}", payload.pretty_print(0)),
                     None => String::new(),
                 };
-                // A case with no fields is written bare, so it prints that way.
-                let field_list = if fields.is_empty() {
-                    String::new()
-                } else {
-                    let list = fields
-                        .iter()
-                        .map(|f| format!("{}: {}", f.name, f.value.pretty_print(0)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(" {{ {list} }}")
-                };
-                format!("{indent}{qualifier}{case}{field_list}:{:?}", self.ty)
+                format!("{indent}{qualifier}.{case}{payload}:{:?}", self.ty)
             }
             ExprKind::Field(recv, name) => {
-                format!("{indent}{}.{name}:{:?}", recv.pretty_print(0), self.ty)
+                format!("{indent}{}.{name:?}:{:?}", recv.pretty_print(0), self.ty)
             }
             // The target is printed as the cast, not as a trailing `:ty`, since
             // for a cast the two are the same thing.

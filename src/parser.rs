@@ -1,33 +1,32 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind, TypeQuery, UseDecl},
+    ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKind, TypeQuery},
     errors::{FloErr, FloResult},
     tokenizer::{Loc, Token, TokenKind, TokenValue},
-    types::{CaseDecl, FieldDecl, Type, TypeDecl, TypeTable},
+    types::{
+        CaseDecl, DeclKind, FieldDecl, FieldName, RecordDecl, SumCase, Type, TypeDecl, TypeTable,
+        sorted_cases,
+    },
     util::Iota,
 };
 
 /// The names visible at a point in the source, mapping each to its variable id.
 /// Only the mapping is scoped — a variable's type lives in [`Parser::var_types`],
 /// keyed by the id, because ids are unique for the whole parse.
+///
+/// Variables are the only thing a scope holds. A case name is only ever written
+/// after a `.`, where nothing else it could be, so there is nothing to bring
+/// into scope to make one writable.
 #[derive(Debug, Clone)]
 struct Scope {
     vars: HashMap<String, usize>,
-
-    /// The case names a `use` has brought in, and the type each was used from.
-    /// A name in here may be written bare; one that is not is an unknown
-    /// identifier. The type name is kept only so the `use` can be checked once
-    /// every declaration is in — it does *not* pin the literal to that type,
-    /// which is still inferred like any other.
-    cases: HashMap<String, String>,
 }
 
 impl Scope {
     fn duplicate(&self) -> Self {
         Self {
             vars: self.vars.clone(),
-            cases: self.cases.clone(),
         }
     }
 
@@ -38,14 +37,19 @@ impl Scope {
     fn get_var(&self, name: &String) -> Option<usize> {
         self.vars.get(name).copied()
     }
+}
 
-    fn add_case(&mut self, case: String, type_name: String) {
-        self.cases.insert(case, type_name);
-    }
-
-    fn knows_case(&self, name: &String) -> bool {
-        self.cases.contains_key(name)
-    }
+/// What one alternative of a type position turned out to be.
+///
+/// A `{ .. }` is a record and a `Name { .. }` is a sum case, but a bare `Name`
+/// is either a mention of a declared type or a payload-less case of an anonymous
+/// sum — and which it is only becomes clear when the next token either is or is
+/// not a `|`. So the decision is deferred to [`Parser::parse_type`] rather than
+/// guessed at here.
+enum TypeAtom {
+    Ty(Type),
+    Case(SumCase),
+    Name(String),
 }
 
 pub struct Parser {
@@ -66,13 +70,8 @@ pub struct Parser {
     /// signature has nothing to do with a `T` in the next.
     type_params: HashMap<String, usize>,
 
-    /// The case names a file-scope `use` brought in, and the type each was used
-    /// from. Every function body starts from a copy of this.
-    file_cases: HashMap<String, String>,
-
     funcs: HashMap<String, Vec<Func>>,
     types: TypeTable,
-    uses: Vec<UseDecl>,
 }
 
 impl Parser {
@@ -84,33 +83,18 @@ impl Parser {
             type_iota: Iota::new(),
             loop_depth: 0,
             type_params: HashMap::new(),
-            file_cases: HashMap::new(),
             funcs: HashMap::new(),
             types: TypeTable::new(),
-            uses: Vec::new(),
         }
     }
 
     pub fn parse(mut self) -> FloResult<Module> {
         use TokenKind::*;
 
-        // A file-scope `use` applies to the whole file, not just to what comes
-        // after it — the same as a `fn` or a `type`. Since resolving a name
-        // happens while parsing, the set has to be known before the first body
-        // is read, which is what this pre-pass is for.
-        self.prescan_file_uses();
-
         while let Ok(token) = self.peek() {
             match token.kind {
                 Fn | Op => self.parse_func()?,
                 TypeKw => self.parse_type_decl()?,
-                Use => {
-                    // Already accounted for by the pre-pass; parsed again here
-                    // so that a malformed one is reported, and recorded so it
-                    // can be checked against the declarations.
-                    let use_decl = self.parse_use()?;
-                    self.uses.push(use_decl);
-                }
 
                 _ => {
                     return Err(FloErr::UnexpectedToken {
@@ -126,99 +110,27 @@ impl Parser {
         Ok(Module {
             funcs: self.funcs,
             types: self.types,
-            uses: self.uses,
             var_count: self.var_types.len(),
             type_var_count: self.type_iota.count(),
         })
     }
 
-    /// Find every file-scope `use` up front, so one written at the bottom of the
-    /// file is in scope at the top.
-    ///
-    /// "File scope" is just brace depth zero: a `use` is either a top-level
-    /// declaration or a statement, and a statement is always inside the braces
-    /// of some scope. Nothing is reported here — a malformed `use` is simply not
-    /// recognised, and the real parse reports it a moment later.
-    fn prescan_file_uses(&mut self) {
-        use TokenKind::*;
-
-        let mut found = Vec::new();
-        let mut depth = 0usize;
-
-        for (i, token) in self.tokens.iter().enumerate() {
-            match token.kind {
-                LCurly => depth += 1,
-                RCurly => depth = depth.saturating_sub(1),
-                Use if depth == 0 => {
-                    let kind_at = |n: usize| self.tokens.get(i + n).map(|t| t.kind);
-                    if kind_at(1) != Some(Ident)
-                        || kind_at(2) != Some(ColonColon)
-                        || kind_at(3) != Some(Ident)
-                    {
-                        continue;
-                    }
-
-                    let (TokenValue::String(type_name), TokenValue::String(case)) =
-                        (&self.tokens[i + 1].value, &self.tokens[i + 3].value)
-                    else {
-                        unreachable!()
-                    };
-                    found.push((case.clone(), type_name.clone()));
-                }
-                _ => {}
-            }
-        }
-
-        self.file_cases.extend(found);
-    }
-
-    /// Parses `use Type::Case;`. The same form at file scope and as a statement.
-    ///
-    /// Whether the type exists and has the case cannot be answered yet — it may
-    /// be declared further down the file — so that waits for
-    /// [`crate::type_checker::check_type_decls`].
-    fn parse_use(&mut self) -> FloResult<UseDecl> {
-        use TokenKind::*;
-
-        let use_tok = self.expect_get(Use)?;
-
-        let type_token = self.expect_get(Ident)?;
-        let TokenValue::String(type_name) = type_token.value else {
-            unreachable!()
-        };
-
-        self.expect(ColonColon)?;
-
-        let case_token = self.expect_get(Ident)?;
-        let TokenValue::String(case) = case_token.value else {
-            unreachable!()
-        };
-
-        self.expect(Semicolon)?;
-
-        Ok(UseDecl {
-            type_name,
-            case,
-            loc: Loc {
-                start: use_tok.loc.start,
-                end: case_token.loc.end,
-            },
-        })
-    }
-
-    /// A scope's copy of the file-level names. Every function body starts here.
+    /// The scope every function body starts from. Nothing is visible at file
+    /// scope that a body has to be told about: functions and types are looked up
+    /// by name after parsing, and there are no file-level variables yet.
     fn root_scope(&self) -> Scope {
         Scope {
             vars: HashMap::new(),
-            cases: self.file_cases.clone(),
         }
     }
 
-    /// Parses `type Name<T> = Case { field: T } | Other;`
+    /// Parses `type Name<T> = { field: T };` or
+    /// `type Name<T> = Case { T } | Other;`
     ///
-    /// A case may leave out its name, in which case it takes the type's own —
-    /// which is what makes `type Vec<T> = { .. };` the one-case shorthand for
-    /// `type Vec<T> = Vec { .. };`.
+    /// What follows the `=` decides which kind of type this is: a `{` makes it a
+    /// record, a case name makes it a sum. There is no shorthand between the
+    /// two — a one-case sum and a record of that case's fields are different
+    /// types, and only the record supports field access.
     ///
     /// Nothing here checks that the field types name real types, or that the
     /// type is not recursive: a declaration may mention one written further down
@@ -234,30 +146,35 @@ impl Parser {
             unreachable!()
         };
 
-        // As for a function, the parameters are registered before the cases are
+        // As for a function, the parameters are registered before the body is
         // read, so a `T` in a field type resolves to the variable standing for it.
         let type_params = self.parse_type_params()?;
 
         self.expect(Equal)?;
 
-        let mut cases: Vec<CaseDecl> = Vec::new();
-        loop {
-            let case = self.parse_case_decl(&name)?;
+        let kind = if self.peek_kind()? == LCurly {
+            DeclKind::Record(self.parse_record_decl()?)
+        } else {
+            let mut cases: Vec<CaseDecl> = Vec::new();
+            loop {
+                let case = self.parse_case_decl()?;
 
-            if let Some(prev) = cases.iter().find(|c| c.name == case.name) {
-                return Err(FloErr::DuplicateCase {
-                    type_name: name,
-                    case: case.name,
-                    loc: case.loc,
-                    prev_loc: prev.loc,
-                });
-            }
-            cases.push(case);
+                if let Some(prev) = cases.iter().find(|c| c.name == case.name) {
+                    return Err(FloErr::DuplicateCase {
+                        type_name: name,
+                        case: case.name,
+                        loc: case.loc,
+                        prev_loc: prev.loc,
+                    });
+                }
+                cases.push(case);
 
-            if self.expect(Pipe).is_err() {
-                break;
+                if self.expect(Pipe).is_err() {
+                    break;
+                }
             }
-        }
+            DeclKind::Sum(cases)
+        };
 
         let semicolon = self.expect_get(Semicolon)?;
         let loc = Loc {
@@ -278,7 +195,7 @@ impl Parser {
             TypeDecl {
                 name,
                 type_params,
-                cases,
+                kind,
                 loc,
             },
         );
@@ -286,66 +203,116 @@ impl Parser {
         Ok(())
     }
 
-    /// One case of a `type`: `Name { fields }`, a bare `Name`, or `{ fields }`
-    /// with the name left off — which means `type_name`.
-    fn parse_case_decl(&mut self, type_name: &str) -> FloResult<CaseDecl> {
+    /// Parses a record body: `{ x: i32, y: i32 }`, `{ i32, bool }` or `{}`.
+    ///
+    /// A field is named when an identifier is followed by a `:`; anything else is
+    /// a positional field, whose name is the index it was written at. The two
+    /// cannot be mixed — a record is addressed by name or by position, not both —
+    /// which is checked here rather than later, because here is where the spans
+    /// to point at are.
+    fn parse_record_decl(&mut self) -> FloResult<RecordDecl> {
+        use TokenKind::*;
+
+        let l_curly = self.expect_get(LCurly)?;
+
+        let mut fields: Vec<FieldDecl> = Vec::new();
+        let mut positional = 0usize;
+
+        while self.peek_kind()? != RCurly {
+            let field_start = self.peek()?.loc;
+
+            let (name, name_loc) = if self.peek_kind()? == Ident
+                && self.peek_kind_n(1) == Some(Colon)
+            {
+                let tok = self.expect_get(Ident)?;
+                let TokenValue::String(written) = tok.value else {
+                    unreachable!()
+                };
+                self.expect(Colon)?;
+
+                // `_0`, `_1`, ... are the names of positional fields, so they
+                // are not available as written ones.
+                let name = FieldName::parse(&written);
+                if name.is_positional() {
+                    return Err(FloErr::ReservedFieldName {
+                        field: written,
+                        loc: tok.loc,
+                    });
+                }
+                (name, tok.loc)
+            } else {
+                let name = FieldName::Pos(positional);
+                positional += 1;
+                (name, field_start)
+            };
+
+            let (ty, ty_loc) = self.parse_type()?;
+
+            if let Some(prev) = fields.iter().find(|f| f.name == name) {
+                return Err(FloErr::DuplicateField {
+                    field: format!("{name:?}"),
+                    loc: name_loc,
+                    prev_loc: prev.loc,
+                });
+            }
+
+            fields.push(FieldDecl {
+                name,
+                ty,
+                loc: Loc {
+                    start: name_loc.start,
+                    end: ty_loc.end,
+                },
+            });
+
+            if self.expect(Comma).is_err() {
+                break;
+            }
+        }
+
+        let r_curly = self.expect_get(RCurly)?;
+        let loc = Loc {
+            start: l_curly.loc.start,
+            end: r_curly.loc.end,
+        };
+
+        if positional != 0 && positional != fields.len() {
+            return Err(FloErr::MixedFieldKinds { loc });
+        }
+
+        Ok(RecordDecl { fields, loc })
+    }
+
+    /// One case of a sum: `Name { fields }` or a bare `Name`.
+    fn parse_case_decl(&mut self) -> FloResult<CaseDecl> {
         use TokenKind::*;
 
         let start_token = self.peek()?.clone();
-
-        let name = if self.peek_kind()? == Ident {
-            let tok = self.expect_get(Ident)?;
-            let TokenValue::String(name) = tok.value else {
-                unreachable!()
-            };
-            name
-        } else if self.peek_kind()? == LCurly {
-            type_name.to_string()
-        } else {
+        if start_token.kind != Ident {
             return Err(FloErr::ExpectedCase {
                 found: start_token,
             });
+        }
+
+        let tok = self.expect_get(Ident)?;
+        let TokenValue::String(name) = tok.value else {
+            unreachable!()
         };
 
-        let mut fields: Vec<FieldDecl> = Vec::new();
-        let mut end = self.tokens[self.idx - 1].loc.end;
+        let payload = if matches!(self.peek_kind(), Ok(LCurly)) {
+            Some(self.parse_record_decl()?)
+        } else {
+            None
+        };
 
-        if self.expect(LCurly).is_ok() {
-            while self.peek_kind()? == Ident {
-                let field_token = self.expect_get(Ident)?;
-                let TokenValue::String(field_name) = field_token.value else {
-                    unreachable!()
-                };
-
-                self.expect(Colon)?;
-                let (ty, _) = self.parse_type()?;
-
-                if let Some(prev) = fields.iter().find(|f| f.name == field_name) {
-                    return Err(FloErr::DuplicateField {
-                        case: name,
-                        field: field_name,
-                        loc: field_token.loc,
-                        prev_loc: prev.loc,
-                    });
-                }
-
-                fields.push(FieldDecl {
-                    name: field_name,
-                    ty,
-                    loc: field_token.loc,
-                });
-
-                if self.expect(Comma).is_err() {
-                    break;
-                }
-            }
-
-            end = self.expect_get(RCurly)?.loc.end;
-        }
+        let end = match &payload {
+            Some(record) => record.loc.end,
+            None => tok.loc.end,
+        };
 
         Ok(CaseDecl {
             name,
-            fields,
+            payload,
             loc: Loc {
                 start: start_token.loc.start,
                 end,
@@ -489,38 +456,6 @@ impl Parser {
         Ok(ids)
     }
 
-    /// Parses an optional `::<T, U>` turbofish at a call site. Empty when there
-    /// is none, which is the usual case — the instantiation is inferred.
-    ///
-    /// A `::` not followed by `<` is left alone: that is the qualifier of a type
-    /// literal, `Foo::Foo { .. }`.
-    fn parse_turbofish(&mut self) -> FloResult<Vec<Type>> {
-        use TokenKind::*;
-
-        if !matches!(self.peek_kind(), Ok(ColonColon)) || self.peek_kind_n(1) != Some(LessThan) {
-            return Ok(Vec::new());
-        }
-        self.skip();
-
-        self.expect(LessThan)?;
-
-        let mut args = Vec::new();
-        while self.peek_kind()? != GreaterThan {
-            args.push(self.parse_type()?.0);
-            if self.expect(Comma).is_err() {
-                break;
-            }
-        }
-
-        let close = self.expect_get(GreaterThan)?;
-
-        if args.is_empty() {
-            return Err(FloErr::EmptyTypeParamList { loc: close.loc });
-        }
-
-        Ok(args)
-    }
-
     fn parse_operator(&mut self) -> FloResult<(Op, String, Loc)> {
         use TokenKind as TK;
 
@@ -594,7 +529,7 @@ impl Parser {
                 };
 
                 lhs = Expr {
-                    kind: Call(name.to_string(), Vec::new(), vec![lhs, rhs], None),
+                    kind: Call(name.to_string(), vec![lhs, rhs], None),
                     ty: self.fresh_type(),
                     loc,
                 };
@@ -651,12 +586,7 @@ impl Parser {
                     }
                 } else {
                     Expr {
-                        kind: Call(
-                            format!("{}", op.pretty_name()),
-                            Vec::new(),
-                            vec![lhs, rhs],
-                            None,
-                        ),
+                        kind: Call(format!("{}", op.pretty_name()), vec![lhs, rhs], None),
                         ty: self.fresh_type(),
                         loc,
                     }
@@ -671,8 +601,6 @@ impl Parser {
                 let start = lhs.loc.start;
                 let mut end = func.loc.end;
 
-                let type_args = self.parse_turbofish()?;
-
                 let mut args = match self.parse_call_args(scope)? {
                     Some((args, args_end)) => {
                         end = args_end;
@@ -683,7 +611,7 @@ impl Parser {
                 args.insert(0, lhs); // lhs becomes the first arg
 
                 lhs = Expr {
-                    kind: ExprKind::Call(func_name, type_args, args, None),
+                    kind: ExprKind::Call(func_name, args, None),
                     ty: self.fresh_type(),
                     loc: Loc { start, end },
                 };
@@ -709,12 +637,7 @@ impl Parser {
 
             let operand = self.parse_unary(scope)?;
             let end = operand.loc.end;
-            let kind = Call(
-                format!("{}", op.pretty_name()),
-                Vec::new(),
-                vec![operand],
-                None,
-            );
+            let kind = Call(format!("{}", op.pretty_name()), vec![operand], None);
             let loc = Loc { start, end };
             Ok(Expr {
                 kind,
@@ -802,9 +725,24 @@ impl Parser {
     /// tighter than every operator, unary ones included, so `-a.b` is `-(a.b)`
     /// and `&a.b` will be `&(a.b)`.
     fn parse_postfix(&mut self, scope: &mut Scope) -> FloResult<Expr> {
-        use TokenKind::*;
+        let expr = self.parse_atom(scope)?;
 
-        let mut expr = self.parse_atom(scope)?;
+        // A block-shaped expression is not a receiver. An expression may *begin*
+        // with `.` (every literal does), so a `.` after a `}` would otherwise
+        // swallow the statement that follows: `if c { } .Alive` would read as one
+        // field access instead of an `if` and a literal. Stopping here leaves the
+        // `.` for the caller, and the missing `;` gets reported as exactly that.
+        // `({ .. }).x` still works — the parenthesized form does its own chain.
+        if expr.is_block_like() {
+            return Ok(expr);
+        }
+
+        self.parse_field_chain(expr)
+    }
+
+    /// The `.field` chain hanging off an already-parsed receiver.
+    fn parse_field_chain(&mut self, mut expr: Expr) -> FloResult<Expr> {
+        use TokenKind::*;
 
         while matches!(self.peek_kind(), Ok(Dot)) {
             self.skip();
@@ -819,7 +757,7 @@ impl Parser {
                 end: name_token.loc.end,
             };
             expr = Expr {
-                kind: ExprKind::Field(Box::new(expr), field),
+                kind: ExprKind::Field(Box::new(expr), FieldName::parse(&field)),
                 ty: self.fresh_type(),
                 loc,
             };
@@ -883,94 +821,62 @@ impl Parser {
                 let name_loc = token.loc;
                 self.skip();
 
-                let type_args = self.parse_turbofish()?;
+                // A `.` after a name is either field access on a variable of that
+                // name, or the qualifier of a literal — `Vec2.{ .. }`,
+                // `Option.Some`. The variable wins, as it does everywhere: a name
+                // in scope is that variable, whatever else it might also be. That
+                // this is a type name is not checked here at all; it cannot be,
+                // since the declaration may be further down the file.
+                if matches!(self.peek_kind(), Ok(Dot)) && scope.get_var(&name).is_none() {
+                    self.expect(Dot)?;
+                    return self.parse_lit_after_dot(Some(name), name_loc.start, scope);
+                }
 
-                // A second `::` means this name was the *type* of a literal:
-                // `Vec::<i32>::Vec { .. }`. Nothing else can follow a name that
-                // way, so it is decided before the call forms below.
+                // `::` is the module separator and nothing else — a type's case is
+                // reached with `.`. Caught here so that old `Type::Case` and
+                // `f::<T>()` spellings say what is wrong rather than reporting the
+                // name as unknown.
                 if matches!(self.peek_kind(), Ok(ColonColon)) {
-                    self.skip();
-
-                    let case_token = self.expect_get(Ident)?;
-                    let TokenValue::String(case) = case_token.value else {
-                        unreachable!()
-                    };
-
-                    let (fields, fields_end) = self.parse_field_inits(scope)?;
-
-                    return Ok(Expr {
-                        kind: ExprKind::CaseLit(Some((name, type_args)), case, fields),
-                        ty: self.fresh_type(),
-                        loc: Loc {
-                            start: name_loc.start,
-                            end: fields_end.unwrap_or(case_token.loc.end),
-                        },
+                    return Err(FloErr::NotImplemented {
+                        what: "module paths (`::`)",
+                        loc: self.peek()?.loc,
                     });
                 }
 
-                let args = self.parse_call_args(scope)?;
-
-                // Parentheses make it a call, and so does a turbofish on its
-                // own, since no variable can carry type arguments.
-                match (args, type_args.is_empty()) {
-                    (Some((args, end)), _) => {
-                        let kind = ExprKind::Call(name, type_args, args, None); // unresolved
-                        Ok(Expr {
-                            kind,
-                            ty: self.fresh_type(),
-                            loc: Loc {
-                                start: name_loc.start,
-                                end,
-                            },
-                        })
-                    }
-                    (None, false) => {
-                        let kind = ExprKind::Call(name, type_args, Vec::new(), None);
-                        Ok(Expr {
-                            kind,
-                            ty: self.fresh_type(),
-                            loc: Loc {
-                                start: name_loc.start,
-                                end: self.tokens[self.idx - 1].loc.end,
-                            },
-                        })
-                    }
-                    // A name in scope is that variable. The variable always
-                    // wins: `if foo { .. }` reads `foo` as the condition, not as
-                    // the start of a literal of a case that happens to be
-                    // called `foo`.
-                    (None, true) if scope.get_var(&name).is_some() => {
-                        let var_id = scope.get_var(&name).unwrap();
-                        Ok(Expr {
+                // Parentheses make it a call. Without them there are no type
+                // arguments to give it away, so a bare name is a variable or
+                // nothing at all.
+                match self.parse_call_args(scope)? {
+                    Some((args, end)) => Ok(Expr {
+                        kind: ExprKind::Call(name, args, None), // unresolved
+                        ty: self.fresh_type(),
+                        loc: Loc {
+                            start: name_loc.start,
+                            end,
+                        },
+                    }),
+                    None => match scope.get_var(&name) {
+                        Some(var_id) => Ok(Expr {
                             kind: ExprKind::Var(var_id),
                             ty: self.var_types[var_id].clone(),
                             loc: name_loc,
-                        })
-                    }
-                    // Failing that, a case a `use` brought in: `Foo { bar: 0 }`,
-                    // or written bare when the case carries no fields. The `use`
-                    // only makes the name legal — which type this is remains
-                    // inferred, exactly as for the qualified form.
-                    (None, true) if scope.knows_case(&name) => {
-                        let (fields, fields_end) = self.parse_field_inits(scope)?;
-                        Ok(Expr {
-                            kind: ExprKind::CaseLit(None, name, fields),
-                            ty: self.fresh_type(),
-                            loc: Loc {
-                                start: name_loc.start,
-                                end: fields_end.unwrap_or(name_loc.end),
-                            },
-                        })
-                    }
-                    // Neither, so there is nothing the name could denote. A case
-                    // name on its own says nothing about which type it belongs
-                    // to, so it has to have been introduced by a `use` or be
-                    // written out as `Type::Case`.
-                    (None, true) => Err(FloErr::UnknownIdentifier {
-                        name,
-                        loc: name_loc,
-                    }),
+                        }),
+                        // There is nothing else a bare name could denote: a case
+                        // is only ever written after a `.`, and a type name only
+                        // as a qualifier, which the `.` above would have caught.
+                        None => Err(FloErr::UnknownIdentifier {
+                            name,
+                            loc: name_loc,
+                        }),
+                    },
                 }
+            }
+
+            // A leading `.` starts a literal, and only ever a literal — that is
+            // what makes one unmistakable wherever it is written.
+            Dot => {
+                let dot = self.expect_get(Dot)?;
+                self.parse_lit_after_dot(None, dot.loc.start, scope)
             }
 
             LParen => {
@@ -985,7 +891,12 @@ impl Parser {
                     start: l_paren.loc.start,
                     end: r_paren.loc.end,
                 };
-                Ok(expr)
+
+                // Parenthesizing is how a block-shaped expression becomes a
+                // receiver: `({ .. }).x`. `parse_postfix` will not chain onto one
+                // (see there), so the chain is taken here, where the parentheses
+                // have already made the receiver unambiguous.
+                self.parse_field_chain(expr)
             }
 
             LCurly => self.parse_scope(scope),
@@ -998,15 +909,85 @@ impl Parser {
 
             Return => self.parse_return(scope),
 
-            // Neither is an expression, and both are only legal as a statement
-            // directly inside a scope, where `parse_scope` handles them.
-            // Reaching one here means it was written as an operand —
-            // `1 + (let a = 2)` and the like.
+            // Reserved, so that a program using it as a name breaks now rather
+            // than when the expression lands.
+            Match => Err(FloErr::NotImplemented {
+                what: "match",
+                loc: token.loc,
+            }),
+
+            // Not an expression, and only legal as a statement directly inside a
+            // scope, where `parse_scope` handles it. Reaching one here means it
+            // was written as an operand — `1 + (let a = 2)` and the like.
             Let => Err(FloErr::LetOutsideStatementPosition { loc: token.loc }),
-            Use => Err(FloErr::UseOutsideStatementPosition { loc: token.loc }),
 
             _ => Err(FloErr::UnexpectedToken {
                 found: token.clone(),
+            }),
+        }
+    }
+
+    /// Parses a literal, with the cursor just past the `.` that starts it:
+    /// `.{ .. }`, `.Case`, or `.Case .{ .. }`. `qualifier` is the type name
+    /// written before the dot, if there was one, and `start` is where the whole
+    /// literal begins.
+    fn parse_lit_after_dot(
+        &mut self,
+        qualifier: Option<String>,
+        start: usize,
+        scope: &mut Scope,
+    ) -> FloResult<Expr> {
+        use TokenKind::*;
+
+        match self.peek_kind()? {
+            LCurly => {
+                let (fields, end) = self.parse_record_lit(scope)?;
+                Ok(Expr {
+                    kind: ExprKind::RecordLit(qualifier, fields),
+                    ty: self.fresh_type(),
+                    loc: Loc { start, end },
+                })
+            }
+
+            Ident => {
+                let case_token = self.expect_get(Ident)?;
+                let TokenValue::String(case) = case_token.value else {
+                    unreachable!()
+                };
+                let mut end = case_token.loc.end;
+
+                // Only a `{` after the next `.` makes it a payload. A name there
+                // is field access on this literal instead, which the caller's
+                // field chain picks up — and which the checker then rejects,
+                // because a sum has no fields to reach.
+                let payload = if matches!(self.peek_kind(), Ok(Dot))
+                    && self.peek_kind_n(1) == Some(LCurly)
+                {
+                    self.skip();
+                    let payload_start = self.peek()?.loc.start;
+                    let (fields, payload_end) = self.parse_record_lit(scope)?;
+                    end = payload_end;
+                    Some(Box::new(Expr {
+                        kind: ExprKind::RecordLit(None, fields),
+                        ty: self.fresh_type(),
+                        loc: Loc {
+                            start: payload_start,
+                            end: payload_end,
+                        },
+                    }))
+                } else {
+                    None
+                };
+
+                Ok(Expr {
+                    kind: ExprKind::CaseLit(qualifier, case, payload),
+                    ty: self.fresh_type(),
+                    loc: Loc { start, end },
+                })
+            }
+
+            _ => Err(FloErr::ExpectedLiteral {
+                found: self.peek()?.clone(),
             }),
         }
     }
@@ -1021,57 +1002,42 @@ impl Parser {
         let mut stmts: Vec<Statement> = Vec::new();
         let mut tail = None;
         while self.peek_kind()? != RCurly {
-            // A scope is the only place `let` and `use` may appear, and neither
-            // is an expression, so both are parsed here rather than in
-            // `parse_atom`. Both always end in a `;`: a statement has no value,
-            // so neither can be the scope's tail.
-            match self.peek_kind()? {
-                Let => {
-                    stmts.push(self.parse_let(&mut scope)?);
-                    continue;
-                }
-                Use => {
-                    let use_decl = self.parse_use()?;
-                    scope.add_case(use_decl.case.clone(), use_decl.type_name.clone());
-                    stmts.push(Statement {
-                        kind: StmtKind::Use(
-                            use_decl.type_name.clone(),
-                            use_decl.case.clone(),
-                        ),
-                        loc: use_decl.loc,
-                    });
-                    self.uses.push(use_decl);
-                    continue;
-                }
-                _ => {}
+            // A scope is the only place a `let` may appear, and it is not an
+            // expression, so it is parsed here rather than in `parse_atom`.
+            if self.peek_kind()? == Let {
+                stmts.push(self.parse_let(&mut scope)?);
+                continue;
             }
 
-            let starts_block = matches!(self.peek_kind()?, LCurly | If | While);
             let expr = self.parse_expr(-1, &mut scope)?;
 
-            // A block-shaped expression carries an implicit `;` when something
-            // follows it, so `if c { } print();` needs no separator. Written
-            // last it is still the scope's tail, which is what makes
-            // `{ if c { 0 } else { 1 } }` yield a value.
-            //
-            // Both halves of the test matter. The statement has to have *begun*
-            // with a block, so `({ 0 }) - 1` stays one subtraction; and it has
-            // to have *stayed* one, so `if c { 0 } else { 1 } - 1` does too —
-            // there the trailing operator was folded in and the result is a
-            // call, not an `if`.
-            let implicit_semi =
-                starts_block && expr.is_block_like() && !matches!(self.peek_kind(), Ok(RCurly));
-
-            if self.expect(Semicolon).is_ok() || implicit_semi {
+            // Every statement ends in a `;`, block-shaped ones included: there is
+            // no implicit separator. An expression may *begin* with `.`, so
+            // without the `;` a `.` after a `}` would be read as field access on
+            // the block rather than as the start of what follows. The tail is the
+            // one expression that goes without, and that is how the two are told
+            // apart.
+            if self.expect(Semicolon).is_ok() {
                 let loc = expr.loc;
                 stmts.push(Statement {
                     kind: StmtKind::Expr(expr),
                     loc,
                 });
-            } else {
-                tail = Some(expr);
-                break;
+                continue;
             }
+
+            // No `;`, so this was the tail — and nothing may follow the tail. If
+            // something does, the `;` is what is missing, which says far more
+            // than "expected `}`" would.
+            if !matches!(self.peek_kind(), Ok(RCurly)) {
+                return Err(FloErr::ExpectedTokenNotFound {
+                    expected: Semicolon,
+                    found: self.peek()?.clone(),
+                });
+            }
+
+            tail = Some(expr);
+            break;
         }
 
         let r_curly = self.expect_get(RCurly)?;
@@ -1287,33 +1253,55 @@ impl Parser {
         Ok(Some((args, r_paren.loc.end)))
     }
 
-    /// Parses the optional `{ name: value, .. }` of a type literal. The end
-    /// offset is `None` when there was no brace list at all — a case with no
-    /// fields is written bare.
+    /// Parses the `{ .. }` of a record literal, and where it ends.
     ///
-    /// Every field must be named and they may come in any order, since which
-    /// case this is has not even been decided yet.
-    fn parse_field_inits(&mut self, scope: &mut Scope) -> FloResult<(Vec<FieldInit>, Option<usize>)> {
+    /// As in a declaration, a field is named when an identifier is followed by a
+    /// `:`, and positional otherwise — its name being the index it was written
+    /// at. Named fields may come in any order, since which record this is has not
+    /// even been decided yet; positional ones are in the only order they have.
+    ///
+    /// Fields may be left out. What that means is not this pass's business: the
+    /// missing ones are filled in with zeroes once the checker has settled which
+    /// record this is.
+    fn parse_record_lit(&mut self, scope: &mut Scope) -> FloResult<(Vec<FieldInit>, usize)> {
         use TokenKind::*;
 
-        if self.expect(LCurly).is_err() {
-            return Ok((Vec::new(), None));
-        }
+        let l_curly = self.expect_get(LCurly)?;
 
         let mut fields: Vec<FieldInit> = Vec::new();
-        while self.peek_kind()? == Ident {
-            let name_token = self.expect_get(Ident)?;
-            let TokenValue::String(name) = name_token.value else {
-                unreachable!()
-            };
+        let mut positional = 0usize;
 
-            self.expect(Colon)?;
+        while self.peek_kind()? != RCurly {
+            let value_start = self.peek()?.loc;
+
+            let (name, name_loc) =
+                if self.peek_kind()? == Ident && self.peek_kind_n(1) == Some(Colon) {
+                    let tok = self.expect_get(Ident)?;
+                    let TokenValue::String(written) = tok.value else {
+                        unreachable!()
+                    };
+                    self.expect(Colon)?;
+
+                    let name = FieldName::parse(&written);
+                    if name.is_positional() {
+                        return Err(FloErr::ReservedFieldName {
+                            field: written,
+                            loc: tok.loc,
+                        });
+                    }
+                    (name, tok.loc)
+                } else {
+                    let name = FieldName::Pos(positional);
+                    positional += 1;
+                    (name, value_start)
+                };
+
             let value = self.parse_expr(-1, scope)?;
 
             if let Some(prev) = fields.iter().find(|f| f.name == name) {
                 return Err(FloErr::DuplicateFieldInit {
-                    field: name,
-                    loc: name_token.loc,
+                    field: format!("{name:?}"),
+                    loc: name_loc,
                     prev_loc: prev.loc,
                 });
             }
@@ -1321,7 +1309,7 @@ impl Parser {
             fields.push(FieldInit {
                 name,
                 value,
-                loc: name_token.loc,
+                loc: name_loc,
             });
 
             if self.expect(Comma).is_err() {
@@ -1330,15 +1318,95 @@ impl Parser {
         }
 
         let r_curly = self.expect_get(RCurly)?;
-        Ok((fields, Some(r_curly.loc.end)))
+
+        if positional != 0 && positional != fields.len() {
+            return Err(FloErr::MixedFieldKinds {
+                loc: Loc {
+                    start: l_curly.loc.start,
+                    end: r_curly.loc.end,
+                },
+            });
+        }
+
+        Ok((fields, r_curly.loc.end))
     }
 
+    /// Parses a type: a primitive, a type parameter, a declared type, an
+    /// anonymous record, or an anonymous sum.
+    ///
+    /// The one thing that needs deciding is a bare name, which is a declared type
+    /// everywhere except as an alternative of an anonymous sum, where it is a
+    /// payload-less case. What follows it is what says which: a `|` makes the
+    /// whole thing a sum, and nothing else can. Which also means an anonymous sum
+    /// always has at least two cases — with one there would be no `|`, and no way
+    /// to tell it from a mention of a type by that name.
     fn parse_type(&mut self) -> FloResult<(Type, Loc)> {
         use TokenKind::*;
-        let token = self.peek()?;
+
+        let (first, first_loc) = self.parse_type_atom()?;
+
+        if !matches!(self.peek_kind(), Ok(Pipe)) {
+            return match first {
+                TypeAtom::Ty(ty) => Ok((ty, first_loc)),
+                TypeAtom::Name(name) => {
+                    // Taken on trust: the declaration may be further down the
+                    // file, so whether the name exists and takes this many
+                    // arguments is checked once the whole program is parsed.
+                    Ok((Type::User(name, Vec::new()), first_loc))
+                }
+                // It had a payload, so it can only have been meant as a case —
+                // but there is no `|`, so there is no sum for it to be a case of.
+                TypeAtom::Case(case) => Err(FloErr::SingleCaseAnonSum {
+                    case: case.name,
+                    loc: first_loc,
+                }),
+            };
+        }
+
+        let mut cases = vec![atom_as_case(first, first_loc)?];
+        let mut end = first_loc.end;
+
+        while self.expect(Pipe).is_ok() {
+            let (atom, atom_loc) = self.parse_type_atom()?;
+            let case = atom_as_case(atom, atom_loc)?;
+
+            if let Some(prev) = cases.iter().find(|c| c.name == case.name) {
+                return Err(FloErr::DuplicateCaseInAnonSum {
+                    case: prev.name.clone(),
+                    loc: atom_loc,
+                });
+            }
+
+            cases.push(case);
+            end = atom_loc.end;
+        }
+
+        Ok((
+            Type::AnonSum(sorted_cases(cases)),
+            Loc {
+                start: first_loc.start,
+                end,
+            },
+        ))
+    }
+
+    /// One alternative of a type position. See [`TypeAtom`] for why a bare name
+    /// cannot be resolved here.
+    fn parse_type_atom(&mut self) -> FloResult<(TypeAtom, Loc)> {
+        use TokenKind::*;
+
+        let token = self.peek()?.clone();
         let loc = token.loc;
 
         match token.kind {
+            // An anonymous record. Written down means concrete, so this is an
+            // `AnonRecord` and not something still being inferred.
+            LCurly => {
+                let record = self.parse_record_decl()?;
+                let ty = Type::AnonRecord(record.at(&HashMap::new()));
+                Ok((TypeAtom::Ty(ty), record.loc))
+            }
+
             Ident => {
                 let token = self.expect_get(Ident)?;
                 let TokenValue::String(value) = &token.value else {
@@ -1350,7 +1418,7 @@ impl Parser {
                 // but it is checked first all the same, so a `T` resolves to the
                 // variable standing for it.
                 if let Some(&id) = self.type_params.get(value) {
-                    return Ok((Type::T(id), loc));
+                    return Ok((TypeAtom::Ty(Type::T(id)), loc));
                 }
 
                 let primitive = match value.as_str() {
@@ -1369,23 +1437,39 @@ impl Parser {
                     _ => None,
                 };
                 if let Some(ty) = primitive {
-                    return Ok((ty, loc));
+                    return Ok((TypeAtom::Ty(ty), loc));
                 }
 
-                // Anything else names a declared type. It is taken on trust: the
-                // declaration may be further down the file, so whether the name
-                // exists and takes this many arguments is checked once the whole
-                // program is parsed.
                 let name = value.clone();
-                let (args, end) = self.parse_type_args()?;
 
-                Ok((
-                    Type::User(name, args),
-                    Loc {
-                        start: loc.start,
-                        end: end.unwrap_or(loc.end),
-                    },
-                ))
+                // A `{` makes it a case with a payload, which no type mention can
+                // be. A `<` makes it a generic type, which no case can be.
+                if matches!(self.peek_kind(), Ok(LCurly)) {
+                    let payload = self.parse_record_decl()?;
+                    let case = SumCase::new(
+                        name,
+                        Some(Type::AnonRecord(payload.at(&HashMap::new()))),
+                    );
+                    return Ok((
+                        TypeAtom::Case(case),
+                        Loc {
+                            start: loc.start,
+                            end: payload.loc.end,
+                        },
+                    ));
+                }
+
+                let (args, args_end) = self.parse_type_args()?;
+                match args_end {
+                    Some(end) => Ok((
+                        TypeAtom::Ty(Type::User(name, args)),
+                        Loc {
+                            start: loc.start,
+                            end,
+                        },
+                    )),
+                    None => Ok((TypeAtom::Name(name), loc)),
+                }
             }
 
             _ => Err(FloErr::NotAType {
@@ -1802,6 +1886,20 @@ pub fn check_entry_point(module: &Module) -> FloResult<()> {
             ty: main.ty.clone(),
             loc: main.loc,
         })
+    }
+}
+
+/// The atom read as one case of an anonymous sum.
+///
+/// A bare name becomes a payload-less case, which is the whole reason the
+/// decision waits for the `|`. Anything that is definitely a type — a primitive,
+/// a type parameter, a generic mention, a record — is not something a case could
+/// be, and says the `|` was a mistake.
+fn atom_as_case(atom: TypeAtom, loc: Loc) -> FloResult<SumCase> {
+    match atom {
+        TypeAtom::Case(case) => Ok(case),
+        TypeAtom::Name(name) => Ok(SumCase::new(name, None)),
+        TypeAtom::Ty(ty) => Err(FloErr::NotACase { ty, loc }),
     }
 }
 

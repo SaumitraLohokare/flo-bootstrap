@@ -5,12 +5,12 @@ pub enum TokenKind {
 
     TypeKw,
 
-    Use,
-
     Let,
 
     If,
     Else,
+
+    Match,
 
     While,
     Break,
@@ -212,10 +212,12 @@ impl Tokenizer {
             "fn" => TokenKind::Fn,
             "op" => TokenKind::Op,
             "type" => TokenKind::TypeKw,
-            "use" => TokenKind::Use,
             "let" => TokenKind::Let,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            // Reserved ahead of the expression itself, so that a program using
+            // `match` as a name breaks now rather than when it lands.
+            "match" => TokenKind::Match,
             "while" => TokenKind::While,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,

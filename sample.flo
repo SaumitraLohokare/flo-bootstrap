@@ -155,9 +155,9 @@ type Enum
 
 type TaggedEnum
     = A { a: i32 }
-    | B(bool);
+    | B ( bool );
 
-type Tuple = (i32, bool);
+type Tuple = ( i32, bool );
 
 ---
 
@@ -331,7 +331,7 @@ type Foo = { a: i32, b: i32 };
 -- is the same as
 type Foo = Foo { a: i32, b: i32 };
 
-fn Foo(a: i32 = 0, b: i32 = 0) -> Foo = Foo { a, b };
+fn Foo(a: i32 = 0, b: i32 = 0) -> Foo = ::Foo { a, b };
 --                                      ^ is `Foo { a: i32, b: i32 } | ..`
 --                                ^ this binds it to type `Foo`
 
@@ -343,9 +343,12 @@ fn Foo(a: i32 = 0, b: i32 = 0) -> Foo = Foo { a, b };
 
 -- No fields sum type:
 type Color = Red | Green | Blue;
-fn Red() -> Color = Red;
-fn Green() -> Color = Green;
-fn Blue() -> Color = Blue;
+fn Red() -> Color = ::Red; -- Anonymous case Red => gets unified with Color
+fn Green() -> Color = Color::Green;
+fn Blue() -> Color = {
+    use Color::*;
+    Blue
+};
 
 -- This is ok syntax. We just check if there exists a variable with
 -- the same name first. If not then check for constructors namespace.
@@ -355,7 +358,7 @@ fn Blue() -> Color = Blue;
 
 type Vec<T> = Vec { data: *mut T, len: u64, cap: u64 };
 
-fn Vec<T>() -> Vec<T> = Vec<T>::Vec { data: nil, len: 0, cap: 0 };
+fn Vec<T>() -> Vec<T> = Vec::<T>::Vec { data: nil, len: 0, cap: 0 };
 --                      ^ this is the full way to make a type
 
 -- It is also ok, because we first check for module, then for a type

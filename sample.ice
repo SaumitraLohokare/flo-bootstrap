@@ -29,6 +29,8 @@ def parse(file: File) -> Vec<Token> errors[ParseErr] {
     // ...
 }
 
-def compile(path: string) -> Vec<Token> {
-    
+def compile(path: string) -> Vec<Token> errors[ParseErr] {
+    var file = open(path) or |e| log_abort(e);
+    var tokens = parse(file)?;
+    return tokens;
 }

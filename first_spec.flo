@@ -23,6 +23,9 @@
 
 -- A comment runs from `--` to the end of the line.
 
+-- Which means the space in `a - -b` is load bearing: `a --b` is `a` followed by
+-- a comment.
+
 --- 1.2 Literals
 
 fn int_lit() -> i32 = 0; -- it can coerce to any integral type
@@ -41,6 +44,9 @@ int main() {
 ";
 
 -- String and char literals allow the same escape sequences as C
+
+-- A number literal always begins with a digit: `.5` is not one. A leading `.`
+-- always starts a type literal (2.7).
 
 --- 1.3 Trailing commas
 
@@ -137,16 +143,31 @@ fn copied_strings() = {
 -- There should be a future optimization to put strings in .rodata
 -- if they're not modified & remove the copy
 
---- 2.6 User defined types
+--- 2.6 Records & sums
 
-type Foo = Foo { bar: i32, baz: bool };
+-- There are two kinds of user defined type, and they are not interchangeable.
 
-type Option<T> = Some { val: T } | None;
+-- A RECORD is a set of fields, all of them present at once.
+type Vec2 = { x: i32, y: i32 };
 
--- An easier way to define a type with only one case is:
-type Vec<T> = { data: *T, len: u64, cap: u64 };
--- This is the same as:
-type Vec<T> = Vec { data: *T, len: u64, cap: u64 };
+-- A SUM is a choice between named cases, exactly one of which is present. A
+-- case may carry a payload, and a payload is always a record.
+type Option<T> = Some { T } | None;
+
+-- Which kind a declaration is, is decided by what follows the `=`: a `{` makes
+-- it a record, a case name makes it a sum. So a one case sum is a thing you can
+-- write, and it is NOT the same type as the record of that case's fields --
+-- it is still a choice, of one, and `.` does not reach into it (2.8).
+type Wrapper = W { v: i32 };        -- a sum with one case
+type Holder  = { v: i32 };          -- a record
+
+-- A record's fields are either all named or all positional. Mixing the two in
+-- one record is an error.
+type Named = { x: i32, y: i32 };    -- named:      order is not part of the type
+type Pos   = { i32, bool };         -- positional: order IS the type
+
+-- A positional field's name is its index, written `_0`, `_1`, ... So `_` followed
+-- by digits is not available as a field name in a named record.
 
 -- Types and functions have separate namespaces
 -- Globals also have a separate namespace
@@ -154,42 +175,107 @@ type Vec<T> = Vec { data: *T, len: u64, cap: u64 };
 -- Recursive types whose size cannot be calculated aren't allowed, all types must have a fixed size at
 -- compile time
 
---- 2.7 Type literals
+--- 2.7 Anonymous types & composition
 
-use Foo::Foo;
-fn type_literals() -> Foo = Foo { bar: 0, baz: true };
--- fields must be named, order independent
--- Names are always the tag
+-- Anywhere a type may be written, ANY type may be written. A record body and a
+-- sum body are types in their own right, so they nest freely:
 
--- A literal names a *case*, never a type, so a bare case name has to have been
--- brought into scope by a `use` (see 3.7). Written out it needs no `use`:
-fn qualified() -> Foo = Foo::Foo { bar: 0, baz: true };
---                     ^--- the type
---                          ^--- the case
-
-fn Vec<T>() -> Vec<T> = Vec::<T>::Vec { data: nil, len: 0, cap: 0 };
--- The turbofish is only needed to say what the type arguments are. Left off,
--- they are inferred like anything else:
-fn some(v: i32) -> Option<i32> = Option::Some { val: v };
-
---- 2.8 Field access
-
-fn field_access() = {
-    let foo = Foo { bar: 0, baz: false };
-
-    -- Fields can be accessed of a type with only one
-    -- case without needing is expr
-    if foo.baz {
-        foo.bar = 100;
-    }
+type Player = {
+    pos: { x: i32, y: i32 },        -- an anonymous record
+    dim: { w: i32, h: i32 },
+    status: Alive | Dead,           -- an anonymous sum
 };
 
---- 2.9 Layout
+-- The same holds for an argument, a return type and a `let` annotation:
+fn anon_record(pos: { x: i32, y: i32 }) -> i32 = pos.x + pos.y;
+fn anon_sum(status: Alive | Dead) -> Alive | Dead = status;
 
--- The tag takes the smallest size uint possible
--- It is represented in C as a struct with a tag and a union.
--- If there is only one case, there is no tag, and is represented as
--- a struct in C.
+-- An anonymous type written down is CONCRETE -- it is not something still being
+-- inferred. Two of them are the same type when they have the same shape:
+-- fields by name (order does not matter) or by position (order does), and cases
+-- by name. Both `pos` and the argument of `anon_record` above have one type.
+
+-- An anonymous type is NEVER equal to a declared type of the same shape. A
+-- `Player` is not a `{ pos: .., dim: .., status: .. }`, and cannot be passed
+-- where one is expected. Declared types are nominal; that is the whole point of
+-- declaring one.
+
+-- An anonymous sum needs at least two cases: with one, `|` is missing and there
+-- is nothing to tell a case name from an ordinary type name. So `Alive` on its
+-- own is a mention of a type called `Alive`, and `Alive | Dead` is an anonymous
+-- sum of two cases.
+
+--- 2.8 Type literals
+
+-- A literal begins with `.` and never names a type. A record literal names no
+-- name at all; a case literal names only the CASE, and several types may have a
+-- case by that name. So which type a literal is comes from its context -- the
+-- annotation, argument type or return type it flows into.
+
+fn record_lit() -> Vec2 = .{ x: 0, y: 0 };  -- named fields, in any order
+fn positional() -> Pos  = .{ 0, true };     -- positional fields, in order
+fn case_lit() -> Option<i32> = .Some .{ 0 };
+fn no_payload() -> Option<i32> = .None;     -- a case with no payload
+
+fn nested() -> Player = .{
+    pos: .{ x: 0, y: 0 },
+    dim: .{ w: 0, h: 0 },
+    status: .Alive,
+};
+
+-- A literal may be qualified with a type name, for readability or to pin down a
+-- type nothing else would:
+fn qualified() -> Vec2 = Vec2.{ x: 0, y: 0 };
+fn qualified_case() -> Option<i32> = Option.Some.{ 0 };
+--                                   ^--- the type
+--                                         ^--- the case
+
+-- A qualifier names the type and nothing else: its type ARGUMENTS cannot be
+-- written, because no type may be written inside an expression at all (2.9). So
+-- `Vec.{ .. }` says which declaration this is and leaves `T` to inference. To
+-- force a type argument, annotate what the value flows into (5.3).
+
+-- A record literal may leave fields out. What is left out is zero initialized.
+-- A field that is not a field of the record, or one given twice, is an error.
+fn partial() -> Player = .{ pos: .{ x: 1, y: 2 } };   -- dim and status zeroed
+
+-- Zero initializing a sum yields its FIRST case, with a zeroed payload -- the
+-- tag is zero like everything else.
+
+--- 2.9 No types inside expressions
+
+-- Nothing in an expression may name a type. There is no turbofish, no `Type` as
+-- an operand, and no way to spell a type argument at a call site. The three
+-- builtins are the exceptions, and each takes a type where a call would take a
+-- value, which is what makes them not calls: `@cast(T) x` (4.9), `@sizeof(T)`
+-- and `@alignof(T)` (4.10).
+
+-- This is what buys the `.` on every literal: since an identifier can never be
+-- followed by a literal `{`, a `{` after a condition is always a scope, and a
+-- bare name is always a variable or a call. Nothing has to be resolved to know
+-- what was written.
+
+--- 2.10 Field access
+
+fn field_access(p: Player) = {
+    let x = p.pos.x;
+    p.pos.x = 100;
+
+    let pair: Pos = .{ 0, true };
+    let first = pair._0;        -- positional fields are `_0`, `_1`, ...
+};
+
+-- `.` reaches into a RECORD only -- declared, anonymous, or still being
+-- inferred. Every sum is rejected, one case sums included: which case is
+-- present is a runtime question, and `match` (4.8) is the only thing that
+-- answers it.
+
+--- 2.11 Layout
+
+-- A record is a C struct: fields in declaration order.
+-- A sum is a C struct of a tag and a union of the case payloads. The tag takes
+-- the smallest uint that fits the case count, and cases are tagged in
+-- declaration order.
 
 
 -- =============================================================================
@@ -264,28 +350,9 @@ let global_counter: i32 = 0; -- Global vars must always be given a type
 -- and doesn't call any external functions, and doesn't call any
 -- other impure function
 
---- 3.7 Use declarations
-
-use Option::Some;
-use Option::None;
-
--- A `use` brings a case name into scope so that it may be written bare, the
--- way `Some { val: 0 }` is. Without one there is nothing a bare name could
--- mean: a case name says nothing about which type it belongs to, and several
--- types may declare a case by the same name.
-
--- A `use` does NOT decide which type a literal is. It only makes the name
--- writable; which type it becomes is inferred exactly as it is for the
--- `Type::Case` form. So this is legal, and yields a `Result`:
-type Result<T> = Some { val: T } | Err;
-fn takes_result() -> Result<i32> = Some { val: 0 };
-
--- Nothing about a generic type's arguments is named here, so one `use` covers
--- every specialization of it.
-
--- A `use` may appear at file scope, where it covers the whole file regardless
--- of where it is written, or as a statement inside a scope (see 4.1), where it
--- covers the rest of that scope only.
+-- There is no `use` declaration. There is nothing for one to do: a case name is
+-- only ever written after a `.`, where it cannot be mistaken for anything else,
+-- so no name needs bringing into scope to make it writable.
 
 
 -- =============================================================================
@@ -295,25 +362,32 @@ fn takes_result() -> Result<i32> = Some { val: 0 };
 --- 4.1 Scope expr
 
 -- A scope is a list of statements followed by an optional tail expression.
--- A statement is a `let` (4.2), a `use` (3.7), or an expression written for its
--- effect. Only the tail has a value, and it is the scope's.
+-- A statement is a `let` (4.2) or an expression written for its effect. Only the
+-- tail has a value, and it is the scope's.
 
-fn scope_ex() = {}; -- Empty scope evaluated to void
+-- EVERY statement ends in a `;`. There is no implicit one: a scope, an `if` or a
+-- `while` written in statement position needs its `;` like anything else, and
+-- the tail is the one expression that goes without. That is how the two are told
+-- apart.
+
+fn scope_ex() = {}; -- Empty scope evaluates to void
 fn scope_ex() = {
-    print("Hi");  -- Multiple expressions can be chained with `;`
+    print("Hi");
     print("Hi");
     {                   -- Scopes can also be inserted in
         print("Hi");
-    }                   -- They don't need to end in a `;` (implicit)
+    };                  -- and are statements like any other
     if foo() {
-        -- If also has the implicit `;`
-    }
+    };
     while foo() {
-        -- While also has implicit `;`
-    }
-    print("Hi");
+    };
+    print("Hi")         -- the tail: no `;`
 };
-fn scope_ex() -> i32 = { 0 }; -- Scoped have implicit return
+fn scope_ex() -> i32 = { 0 }; -- Scopes have implicit return
+
+-- The `;` is not a formality. An expression may begin with `.` (2.8), and `.`
+-- also means field access, so `if c { } .Alive` could be read either way. The
+-- separator is what makes the answer never depend on how it was spaced.
 
 --- 4.2 Variables
 
@@ -325,7 +399,7 @@ fn var() -> u8 = {
     {
         let x = 32; -- shadowing is allowed
         y = x;
-    }
+    };
 
     x + y
 };
@@ -352,6 +426,9 @@ fn dangling_if(a: bool) -> void = if a {
 -- The if body must be a scope
 -- The else body can be a scope or another if (allows `else if`)
 
+-- A body that is not a scope is not allowed. It could not be: a body may begin
+-- with `.`, and the condition would take that as a field access on itself.
+
 --- 4.4 While
 
 fn while_ex() = while false {
@@ -364,9 +441,9 @@ fn while_ex() = while false {
 
 fn break_continue() = {
     while foo() {
-        if bar() { break }
-        if baz() { continue }
-    }
+        if bar() { break };
+        if baz() { continue };
+    };
 };
 -- break and continue must be inside a loop
 -- They also evaluate to noreturn type
@@ -395,23 +472,40 @@ fn baz(a: i32, b: i32) -> i32 = -- ...
 
 fn main() = 0 |> foo() |> bar() |> baz(1);
 
---- 4.8 is expression
+--- 4.8 Match expr
 
--- <expr> is <destructure> -> bool
--- Allows defining new variables
+-- `match` is the only way to read a sum: which case is present is a runtime
+-- question, so it is answered by branching on it.
 
-if option is Some { val } {
-    -- val is usable here
-} else {
-    -- val isn't usable here
-}
+type Shape = Circle { r: i32 } | Rect { w: i32, h: i32 };
 
--- The bool of an is expr must be used or it's a warning
--- eg:
-option is Some { val }; -- Will give a warning (unused result of is expr)
--- Warnings should be given in cases where the is might return false, but the destructured
--- variables are used.
--- For example `opt is Some { val } || val == 0`
+fn area(s: Shape) -> i32 = match s {
+    .Circle .{ r }   -> r * r * 3,
+    .Rect .{ w, h }  -> w * h,
+};
+
+fn describe(n: i32) -> i32 = match n {
+    0            -> 10,
+    1            -> 20,
+    x if x < 0   -> 30,
+    _            -> 40,
+};
+
+-- Arms are comma separated, a trailing comma is allowed, and each arm's body is
+-- one expression. The commas are required: an arm body may end where the next
+-- pattern begins with `.`, and without a separator the two would run together.
+
+-- A pattern is a literal, `_`, a case (`.Case`, with or without a payload
+-- pattern), a record pattern, or a binding. A bare identifier is always a
+-- BINDING, never a comparison against a variable of that name -- use a guard for
+-- that. In a record pattern a bare identifier binds the field it stands for:
+-- by name for a named record (`.{ r }` binds `r`), by position for a positional
+-- one (`.{ a, b }` binds the first and second).
+
+-- An arm may carry a guard, `if <expr>`, which is checked after the pattern
+-- matches. A guarded arm never counts towards exhaustiveness.
+
+-- Every match must be exhaustive. Ranges are not patterns (no `v @ 1..10`).
 
 --- 4.9 Casting
 
@@ -451,24 +545,30 @@ type View<T> = { data: *T, len: u64 };
 
 -- Similarly every use of this type can be specialized
 
---- 5.3 Specialization & the turbofish
+--- 5.3 Specialization
+
+fn Vec<T>() -> Vec<T> = .{ data: nil, len: 0 };
 
 fn uses() = {
     let a = 10;
     let b = 20;
 
-    let view_a = View { data: &a, len: 1 };
-    let view_b = View::<i32>::View { data: &b, len: 1 };
-    --           ^---------- This is the type
-    --                        ^--- This is the case
+    let view_a = View.{ data: &a, len: 1 };
 
     let new_view = view_a |> add(view_b); -- ERROR, the error will be printed in `add`
                                           -- Error because it tried to monomorphize and failed
-    let new_num = a |> add::<i32>(b); -- We use turbofish operator to tell the generic type
+
+    -- A type argument is never written at a call site (2.9), so the way to say
+    -- what one is, is to annotate what the call flows into:
+    let v: Vec<u8> = Vec();
+
+    -- With nothing to infer from, it is an error -- there is no `T` to pick.
+    let unknown = Vec();                  -- ERROR: cannot infer T
 };
 
--- This shows us a funny mechanic of the language. All user type literals just give the case name.
--- The return types or argument types is what allows us to infer their type.
+-- All this follows from literals naming a case and never a type: the return
+-- type or argument type is what tells us which type a literal is, and the same
+-- machinery is what settles a generic's arguments.
 
 
 -- =============================================================================
@@ -502,6 +602,9 @@ import foo "./foo.flo"
 -- imports from foo will be visible inside `foo::`
 let imported: i32 = foo::a;
 
+-- `::` is the module separator and nothing else. A type's cases are reached
+-- with `.` (2.8), so `foo::Option.Some.{ 0 }` is a case of a type in a module.
+
 -- If the path isn't relative, it checks the folder the compiler is present in
 -- And the folder the compiler was run from
 import "std/vec.flo";
@@ -530,20 +633,22 @@ pub let a: i32 = 100;
 -- 1.2  Integer, float and bool literals, and their coercion
 -- 1.3  Trailing commas, in the comma separated lists that exist so far
 -- 2.1  Primitive types -- except `noreturn` as something you can write down
--- 2.6  User defined types: declaration, sum cases, the one-case shorthand,
---      and the rejection of a type that has no size (2.9's lowering is not
---      done, so a one-case type is not yet *treated* as a struct anywhere)
--- 2.7  Type literals, including the `Vec::<i32>::Vec { .. }` form and the
---      `Option::Some { .. }` one, whose type arguments are inferred
--- 2.8  Field access, and assignment through it
+-- 2.6  Records & sums: both kinds of declaration, named and positional fields,
+--      case payloads, and the rejection of a type that has no size
+-- 2.7  Anonymous records and sums, everywhere a type may be written, nested
+--      freely -- structural, concrete, and never equal to a declared type
+-- 2.8  Type literals: `.{ .. }`, `.Case`, `.Case .{ .. }`, and the qualified
+--      `Vec2.{ .. }` / `Option.Some.{ .. }` forms whose type arguments are
+--      inferred. Fields left out of a record literal are zero initialized
+-- 2.9  No types inside expressions, `@cast`/`@sizeof`/`@alignof` excepted
+-- 2.10 Field access, and assignment through it -- on records only
 -- 3.1  Functions
 -- 3.2  Arguments & return
 -- 3.3  Overloading, on argument types AND on return type
 -- 3.4  `op` overloads, and the built-in operators on primitives -- the whole
 --      set, `!`, `~`, `<<` and `>>` included -- with `&&` and `||` rejected as
 --      overloads because they short-circuit
--- 3.7  `use`, at file scope and as a statement
--- 4.1  Scope expr, including the implicit `;` and the implicit tail value
+-- 4.1  Scope expr, with the mandatory `;` and the implicit tail value
 -- 4.2  Variables: `let` with/without a type, with/without an initializer,
 --      shadowing, and assignment
 -- 4.3  If expr, including `else if`
@@ -553,12 +658,12 @@ pub let a: i32 = 100;
 -- 4.7  Piping
 -- 5.1  Generic functions
 -- 5.2  Generic types
+-- 5.3  Specialization, of functions and of types
 -- 4.9  @cast, as the bit-cast between any two types that have bits. Its type
 --      is the one written into it, and it says nothing about its operand's; the
 --      size-mismatch case is a warning, so it waits on a diagnostic sink
 -- 4.10 @sizeof / @alignof -- checked, and u64. The number each yields is a
 --      property of the target, so it is codegen that will work it out
--- 5.3  The turbofish, and specialization -- for functions and for types
 -- 6.1  The main function -- except the `[]string` argument form
 
 -- Also, not visible in the spec but done: whole-function type inference, with
@@ -566,43 +671,45 @@ pub let a: i32 = 100;
 -- resolution iterated to a fixpoint. Overload resolution sees generic and
 -- ordinary functions as one set, so the two can overload each other.
 
--- And, on 2.6/2.7: a literal names a *case*, and several types may have a case
--- by that name, so a literal does not pick a type when it is written. It gets
--- an open type of the cases it is known to have, which narrows as it meets
--- other types -- merging with another open one, or becoming a declared type
--- when it reaches an annotation or a function boundary. A literal that never
--- meets a declared type closes into an anonymous type of exactly the cases it
--- had. Anonymous types are structural (two with the same cases are one type)
--- and are never equal to a declared type of the same shape.
+-- And, on 2.6/2.8: a literal does not pick a type when it is written -- a
+-- record literal names nothing, and a case literal names only a case, which
+-- several types may have. So it gets an OPEN type of what it is known to have,
+-- which narrows as it meets other types: merging with another open one, or
+-- becoming a declared type when it reaches an annotation or a function
+-- boundary. One that never meets a declared type CLOSES into the anonymous type
+-- of exactly what it had. Written out:
 --
--- A bare name that is not followed by `(` is read as a variable if one is in
--- scope, then as a case a `use` brought in, and is an unknown identifier
--- otherwise. Which means an anonymous type can no longer be written down
--- directly: every bare case name comes from a `use`, and a `use` names a
--- declared type. One still arises whenever a literal never meets the
--- declaration it was used from -- `let a = Some { val: 1 };` with nothing
--- pinning it closes into `{Some { val: i32 }}`, not into `Option<i32>`.
+--      SomeRecord --> AnonRecord    (nothing pinned it)
+--                 \-> declared record type
+--      SomeSum    --> AnonSum
+--                 \-> declared sum type
+--
+-- An open record is the one type that can still GROW: unifying two of them
+-- takes the union of their fields, which is what makes a field left out of one
+-- literal and given in another end up in both (zero initialized in the first).
+-- An open type is never `is_known`; closing it is what makes it concrete.
 
 --- 7.2 Not implemented
 
 -- Types & data
 -- 2.2  Pointers: `*T`, `&x`, `*p`, `nil`, pointer arithmetic
 -- 2.3  Arrays: `[N]T`, array literals, indexing, `&arr`
--- 2.4  Slices: `[]T`, implicit array -> slice
+-- 2.4  Slices: `[]T`, implicit array -> slice, `slice.count`
 -- 2.5  Strings: the `string` type, string and char literals, escape
 --      sequences, multi-line literals, and the copy-on-use rule
--- 2.9  Layout (tag + union lowering). Nothing lowers yet, so a one-case type
---      is checked as a one-case type rather than as a struct.
--- 4.8  is expression & destructuring. Until it lands, a sum type can be
---      declared and built, but its fields cannot be read: field access is
---      rejected on anything with more than one case.
---      Recursive types through a pointer. Every field holds its type by
---      value today, so the size check rejects any cycle at all; a `*T` field
---      will break the cycle once 2.2 exists.
+-- 2.11 Layout (record lowering, tag + union lowering). Nothing lowers yet.
+--      Recursive types through a pointer: every field holds its type by value
+--      today, so the size check rejects any cycle at all; a `*T` field will
+--      break the cycle once 2.2 exists.
 
 -- Declarations
 -- 3.5  External functions
 -- 3.6  Global variables & their constexpr initializers
+
+-- Expressions
+-- 4.8  match, its patterns, and exhaustiveness checking. Until it lands a sum
+--      can be declared and built but not read: `.` is rejected on every sum,
+--      and there is nothing else that looks inside one.
 
 -- Operators & builtins
 -- 3.4  The short circuit in `&&` and `||` itself. The front end models them
@@ -615,9 +722,8 @@ pub let a: i32 = 100;
 -- 6.2  Multi file: `import`, namespaced import, `pub`
 
 -- Compiler infrastructure -- not language features, but needed
--- - Warnings of any kind. Both the unused-`is`-result warning (4.8) and the
---   @cast size-mismatch warning (4.9) need a diagnostic sink that is not
---   error-only.
+-- - Warnings of any kind. The @cast size-mismatch warning (4.9) needs a
+--   diagnostic sink that is not error-only.
 -- - Tokenizer error reporting. It panics on an unknown character or a
 --   malformed number instead of reporting one.
 -- - Deterministic error ordering. Functions are checked by iterating a
@@ -626,7 +732,7 @@ pub let a: i32 = 100;
 
 --- 7.3 Suggested order
 
--- TODO: Add is expr
+-- TODO: Add match & patterns & exhaustiveness
 -- TODO: Add pointers & pointer operators
 -- TODO: Add arrays
 -- TODO: Add slices & strings & char

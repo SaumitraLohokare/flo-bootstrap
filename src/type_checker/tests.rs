@@ -15,7 +15,7 @@ use crate::ast::{Expr, ExprKind, FieldInit, Func, Module, Op, Statement, StmtKin
 use crate::errors::FloErr;
 use crate::parser::{Parser, check_entry_point};
 use crate::tokenizer::{TokenKind, Tokenizer};
-use crate::types::{Type, TypeCase};
+use crate::types::{DeclKind, FieldName, Record, RecordDecl, SumCase, Type};
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -95,8 +95,8 @@ fn func<'a>(module: &'a Module, mangled: &str) -> &'a Func {
 /// The resolved (mangled) callee name of a call expression.
 fn resolved_call_name(expr: &Expr) -> &str {
     match &expr.kind {
-        ExprKind::Call(_, _, _, Some(name)) => name.as_str(),
-        ExprKind::Call(orig, _, _, None) => panic!("call `{orig}` was left unresolved"),
+        ExprKind::Call(_, _, Some(name)) => name.as_str(),
+        ExprKind::Call(orig, _, None) => panic!("call `{orig}` was left unresolved"),
         other => panic!("expected a call expression, got {other:?}"),
     }
 }
@@ -104,7 +104,7 @@ fn resolved_call_name(expr: &Expr) -> &str {
 /// The argument expressions of a call.
 fn call_args(expr: &Expr) -> &[Expr] {
     match &expr.kind {
-        ExprKind::Call(_, _, args, _) => args,
+        ExprKind::Call(_, args, _) => args,
         other => panic!("expected a call expression, got {other:?}"),
     }
 }
@@ -938,8 +938,8 @@ fn logical_operator_on_integers_is_an_error() {
     assert_err!(
         errs,
         FloErr::TypeMismatch {
-            expected: Type::Integer,
-            got: Type::Bool,
+            expected: Type::Bool,
+            got: Type::Integer,
             ..
         }
     );
@@ -1610,15 +1610,15 @@ fn scope_with_trailing_semicolon_is_void() {
 }
 
 #[test]
-fn block_statements_need_no_separating_semicolon() {
-    // A scope, an `if` and a `while` each carry an implicit `;` when something
-    // follows them, so three blocks in a row parse as three statements.
+fn block_statements_need_their_semicolon_too() {
+    // There is no implicit `;`: a scope, an `if` and a `while` in statement
+    // position each end in one, like everything else.
     let module = check_ok(
         "
         fn main() = {
-            { nop() }
-            if true { nop() }
-            while false { nop() }
+            { nop() };
+            if true { nop() };
+            while false { nop() };
             nop()
         };
         fn nop() = {};
@@ -1637,27 +1637,33 @@ fn block_statements_need_no_separating_semicolon() {
 }
 
 #[test]
-fn an_explicit_semicolon_after_a_block_is_still_allowed() {
-    let module = check_ok(
+fn a_block_without_its_semicolon_is_an_error() {
+    // The separator is what keeps `}` followed by `.` from reading as field
+    // access on the block, so it is not optional even where it looks redundant.
+    let err = parse_err(
         "
         fn main() = {
-            if true { nop() };
+            if true { nop() }
             nop()
         };
         fn nop() = {};
         ",
     );
-    let main = func_sig(&module, "main", vec![], Type::Void);
-    let (stmts, tail) = scope_parts(&main.body);
-    assert_eq!(stmts.len(), 1);
-    assert!(matches!(stmt_expr(&stmts[0]).kind, ExprKind::If(..)));
-    assert!(tail.is_some());
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::Semicolon,
+                ..
+            }
+        ),
+        "expected a missing-`;` error, got: {err:?}"
+    );
 }
 
 #[test]
-fn a_trailing_block_is_still_the_scope_tail() {
-    // The implicit `;` only applies when something follows: written last, an
-    // `if` is the tail and the scope takes its value.
+fn a_trailing_block_is_the_scope_tail() {
+    // Written last it has no `;`, and that is exactly what makes it the tail.
     let module = check_ok("fn main() -> i32 = { if true { 1 } else { 2 } };");
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, tail) = scope_parts(&main.body);
@@ -1666,18 +1672,50 @@ fn a_trailing_block_is_still_the_scope_tail() {
 }
 
 #[test]
-fn a_non_block_statement_still_needs_its_semicolon() {
+fn a_statement_without_its_semicolon_is_an_error() {
     let err = parse_err("fn main() = { nop() nop() };");
     assert!(
         matches!(
             err,
             FloErr::ExpectedTokenNotFound {
-                expected: TokenKind::RCurly,
+                expected: TokenKind::Semicolon,
                 ..
             }
         ),
-        "expected a missing-`}}` error, got: {err:?}"
+        "expected a missing-`;` error, got: {err:?}"
     );
+}
+
+#[test]
+fn a_block_is_not_the_receiver_of_a_field_access() {
+    // An expression may begin with `.`, so a block never takes one: the `.` here
+    // starts the next statement, and the missing `;` is what gets reported.
+    let err = parse_err(
+        "
+        fn main() = {
+            if true { }
+            .{ x: 1 };
+        };
+        ",
+    );
+    assert!(
+        matches!(
+            err,
+            FloErr::ExpectedTokenNotFound {
+                expected: TokenKind::Semicolon,
+                ..
+            }
+        ),
+        "expected a missing-`;` error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_parenthesized_block_is_a_receiver() {
+    // Parenthesizing is how a block becomes one.
+    let module = check_ok("fn main() -> i32 = ({ .{ x: 1 } }).x;");
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    assert_eq!(field_parts(&main.body).1, "x");
 }
 
 #[test]
@@ -3363,36 +3401,31 @@ fn an_uninferable_type_param_is_an_error() {
 }
 
 // --------------------------------------------------------------------------
-// Turbofish
+// No types inside expressions
 // --------------------------------------------------------------------------
 
 #[test]
-fn a_turbofish_picks_the_instantiation() {
-    let module = check_ok(
+fn a_turbofish_is_not_syntax() {
+    // Nothing inside an expression may name a type, so there is no way to write an
+    // instantiation: `::<` is simply not a thing the grammar has.
+    let err = parse_err(
         "
         fn main() = { id::<u8>(1); };
         fn id<T>(a: T) -> T = a;
         ",
     );
-    func_sig(&module, "id", vec![Type::U8], Type::U8);
-}
-
-#[test]
-fn a_turbofish_settles_an_otherwise_uninferable_param() {
-    let module = check_ok(
-        "
-        fn main() = ignore::<u8>();
-        fn ignore<T>() = {};
-        ",
+    assert!(
+        matches!(err, FloErr::NotImplemented { .. }),
+        "expected a not-implemented error, got: {err:?}"
     );
-    func_sig(&module, "ignore", vec![], Type::Void);
 }
 
 #[test]
-fn a_turbofish_works_through_a_pipe() {
+fn an_annotation_picks_the_instantiation() {
+    // What the turbofish used to do, done by saying what the value flows into.
     let module = check_ok(
         "
-        fn main() = { 1 |> id::<u8>(); };
+        fn main() = { let a: u8 = id(1); };
         fn id<T>(a: T) -> T = a;
         ",
     );
@@ -3400,51 +3433,42 @@ fn a_turbofish_works_through_a_pipe() {
 }
 
 #[test]
-fn a_turbofish_selects_the_generic_over_a_concrete_overload() {
-    // Without the turbofish an i8 argument fits both overloads and the call is
-    // ambiguous; the turbofish rules the concrete one out.
+fn a_parameter_type_picks_the_instantiation_through_a_pipe() {
     let module = check_ok(
         "
-        fn main() = { id::<i8>(1); };
+        fn main() = { let a: u8 = 1 |> id(); };
+        fn id<T>(a: T) -> T = a;
+        ",
+    );
+    func_sig(&module, "id", vec![Type::U8], Type::U8);
+}
+
+#[test]
+fn a_generic_and_a_concrete_overload_that_both_fit_are_ambiguous() {
+    // There is no longer anything that could rule one of them out at the call
+    // site: an annotation names the type, not which overload provides it.
+    let errs = check_err(
+        "
         fn id(a: i8) -> i8 = a;
         fn id<T>(a: T) -> T = a;
+        fn call(v: i8) -> i8 = id(v);
+        fn main() = {};
         ",
     );
-    let insts = &module.funcs[&m("id", vec![Type::I8], Type::I8)];
-    assert_eq!(insts.len(), 2, "both overloads should have been checked");
+    assert_err!(errs, FloErr::MultiplePossibleOverloads { name, .. } if name == "id");
 }
 
 #[test]
-fn a_turbofish_conflicting_with_the_arguments_is_an_error() {
+fn an_annotation_conflicting_with_the_arguments_is_an_error() {
+    // Only one overload, so it is chosen and then `T` is pinned by the argument —
+    // which leaves the return type to disagree with the annotation.
     let errs = check_err(
         "
-        fn main() = { id::<u8>(true); };
+        fn main() = { let a: u8 = id(true); };
         fn id<T>(a: T) -> T = a;
         ",
     );
-    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
-}
-
-#[test]
-fn a_turbofish_with_the_wrong_number_of_arguments_is_an_error() {
-    let errs = check_err(
-        "
-        fn main() = { id::<u8, bool>(1); };
-        fn id<T>(a: T) -> T = a;
-        ",
-    );
-    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
-}
-
-#[test]
-fn a_turbofish_on_a_non_generic_function_is_an_error() {
-    let errs = check_err(
-        "
-        fn main() = { id::<i32>(1); };
-        fn id(a: i32) -> i32 = a;
-        ",
-    );
-    assert_err!(errs, FloErr::NoPossibleOverloads { .. });
+    assert_err!(errs, FloErr::TypeMismatch { .. });
 }
 
 #[test]
@@ -3482,39 +3506,79 @@ fn type_params_do_not_leak_between_functions() {
 // User defined types
 // --------------------------------------------------------------------------
 
-/// The case name and field initialisers of a type literal.
-fn case_lit(expr: &Expr) -> (&str, &[FieldInit]) {
+/// The case name and payload of a case literal.
+fn case_lit(expr: &Expr) -> (&str, Option<&Expr>) {
     match &expr.kind {
-        ExprKind::CaseLit(None, case, fields) => (case.as_str(), fields),
+        ExprKind::CaseLit(None, case, payload) => (case.as_str(), payload.as_deref()),
         ExprKind::CaseLit(Some(q), ..) => panic!("literal kept its qualifier {q:?}"),
-        other => panic!("expected a type literal, got {other:?}"),
+        other => panic!("expected a case literal, got {other:?}"),
     }
 }
 
-/// The receiver and name of a field access.
-fn field_parts(expr: &Expr) -> (&Expr, &str) {
+/// The field initialisers of a record literal, after `resolve` has filled in the
+/// ones the source left out.
+fn record_lit(expr: &Expr) -> &[FieldInit] {
     match &expr.kind {
-        ExprKind::Field(recv, name) => (recv, name.as_str()),
+        ExprKind::RecordLit(None, fields) => fields,
+        ExprKind::RecordLit(Some(q), ..) => panic!("literal kept its qualifier {q:?}"),
+        other => panic!("expected a record literal, got {other:?}"),
+    }
+}
+
+/// The value a record literal gives a named field, or `None` if it has no such
+/// field at all.
+fn field_init<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
+    record_lit(expr)
+        .iter()
+        .find(|f| f.name == named_field(name))
+        .map(|f| &f.value)
+}
+
+/// The receiver and name of a field access.
+fn field_parts(expr: &Expr) -> (&Expr, String) {
+    match &expr.kind {
+        ExprKind::Field(recv, name) => (recv, format!("{name:?}")),
         other => panic!("expected a field access, got {other:?}"),
     }
+}
+
+fn named_field(name: &str) -> FieldName {
+    FieldName::Named(name.to_string())
 }
 
 fn user(name: &str, args: Vec<Type>) -> Type {
     Type::User(name.to_string(), args)
 }
 
-/// An anonymous type of one case, for comparing against an inferred one.
-fn anon(case: &str, fields: Vec<(&str, Type)>) -> Type {
-    Type::Anon(vec![TypeCase::new(
-        case.to_string(),
+/// An anonymous record, for comparing against an inferred one.
+fn anon_record(fields: Vec<(&str, Type)>) -> Type {
+    Type::AnonRecord(Record::named(
         fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
-    )])
+    ))
+}
+
+/// An anonymous record of positional fields.
+fn anon_pos(fields: Vec<Type>) -> Type {
+    Type::AnonRecord(Record::Pos(fields))
+}
+
+/// An anonymous sum of one case, for comparing against an inferred one.
+fn anon_sum(case: &str, payload: Option<Type>) -> Type {
+    Type::AnonSum(vec![SumCase::new(case.to_string(), payload)])
 }
 
 // --- Declarations ---------------------------------------------------------
 
+/// The record a declaration is, or a panic if it is a sum.
+fn record_decl<'a>(module: &'a Module, name: &str) -> &'a RecordDecl {
+    match &module.types[name].kind {
+        DeclKind::Record(record) => record,
+        DeclKind::Sum(_) => panic!("`{name}` is a sum, not a record"),
+    }
+}
+
 #[test]
-fn a_type_is_declared_with_its_cases_in_order() {
+fn a_sum_is_declared_with_its_cases_in_order() {
     let module = check_ok(
         "
         type Option = Some { val: i32 } | None;
@@ -3525,48 +3589,107 @@ fn a_type_is_declared_with_its_cases_in_order() {
     let decl = &module.types["Option"];
     assert!(decl.type_params.is_empty());
     assert_eq!(
-        decl.cases.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        decl.cases().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
         vec!["Some", "None"]
     );
-    assert_eq!(decl.cases[0].fields[0].name, "val");
-    assert_eq!(decl.cases[0].fields[0].ty, Type::I32);
-    assert!(decl.cases[1].fields.is_empty());
+
+    // A payload is a record, and a case that carries nothing has none at all —
+    // which is not the same as carrying an empty one.
+    let payload = decl.cases()[0].payload.as_ref().expect("Some has a payload");
+    assert_eq!(payload.fields[0].name, named_field("val"));
+    assert_eq!(payload.fields[0].ty, Type::I32);
+    assert!(decl.cases()[1].payload.is_none());
 }
 
 #[test]
-fn a_case_with_no_name_takes_the_types_name() {
+fn a_record_is_declared_with_its_fields_in_order() {
     let module = check_ok(
         "
-        type Vec = { len: u64 };
+        type Vec = { len: u64, cap: u64 };
         fn main() = {};
         ",
     );
-    assert_eq!(module.types["Vec"].cases[0].name, "Vec");
+
+    let record = record_decl(&module, "Vec");
+    assert_eq!(
+        record
+            .fields
+            .iter()
+            .map(|f| format!("{:?}", f.name))
+            .collect::<Vec<_>>(),
+        vec!["len", "cap"]
+    );
+    // A record has no cases: `{ .. }` after the `=` is not a case whose name was
+    // left off, it is the type itself.
+    assert!(module.types["Vec"].cases().is_empty());
 }
 
 #[test]
-fn the_one_case_shorthand_is_the_named_form() {
-    let shorthand = check_ok("type Foo = { bar: i32 };\nfn main() = {};");
-    let named = check_ok("type Foo = Foo { bar: i32 };\nfn main() = {};");
+fn a_record_and_a_one_case_sum_are_different_types() {
+    // What follows the `=` is what decides which kind this is, and there is no
+    // shorthand between them: only the record supports field access.
+    let module = check_ok(
+        "
+        type Rec = { v: i32 };
+        type Sum = Sum { v: i32 };
+        fn main() -> i32 = { let r: Rec = .{ v: 1 }; r.v };
+        ",
+    );
+    assert!(module.types["Rec"].is_record());
+    assert!(!module.types["Sum"].is_record());
 
-    let a = &shorthand.types["Foo"].cases;
-    let b = &named.types["Foo"].cases;
-    assert_eq!(a.len(), b.len());
-    assert_eq!(a[0].name, b[0].name);
-    assert_eq!(a[0].fields[0].name, b[0].fields[0].name);
-    assert_eq!(a[0].fields[0].ty, b[0].fields[0].ty);
+    let errs = check_err(
+        "
+        type Sum = Sum { v: i32 };
+        fn main() -> i32 = { let s: Sum = .Sum .{ v: 1 }; s.v };
+        ",
+    );
+    assert_err!(errs, FloErr::FieldAccessOnSumType { .. });
+}
+
+#[test]
+fn a_positional_record_names_its_fields_by_index() {
+    let module = check_ok(
+        "
+        type Pair = { i32, bool };
+        fn main() -> i32 = { let p: Pair = .{ 1, true }; p._0 };
+        ",
+    );
+
+    let record = record_decl(&module, "Pair");
+    assert_eq!(record.fields[0].name, FieldName::Pos(0));
+    assert_eq!(record.fields[1].name, FieldName::Pos(1));
+    assert_eq!(record.fields[1].ty, Type::Bool);
+}
+
+#[test]
+fn a_record_may_not_mix_named_and_positional_fields() {
+    let err = parse_err("type Bad = { x: i32, bool };\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::MixedFieldKinds { .. }),
+        "expected a mixed-field-kinds error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_positional_field_name_may_not_be_written() {
+    let err = parse_err("type Bad = { _0: i32 };\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::ReservedFieldName { ref field, .. } if field == "_0"),
+        "expected a reserved-field-name error, got: {err:?}"
+    );
 }
 
 #[test]
 fn type_and_field_lists_allow_trailing_commas() {
     let module = check_ok(
         "
-        type Foo<T,> = Foo { a: T, b: bool, };
+        type Foo<T,> = { a: T, b: bool, };
         fn main() = {};
         ",
     );
     assert_eq!(module.types["Foo"].type_params.len(), 1);
-    assert_eq!(module.types["Foo"].cases[0].fields.len(), 2);
+    assert_eq!(record_decl(&module, "Foo").fields.len(), 2);
 }
 
 #[test]
@@ -3574,9 +3697,8 @@ fn a_type_and_a_function_may_share_a_name() {
     // Types, functions and variables are three separate namespaces.
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn Foo() -> Foo = Foo { bar: 0 };
+        type Foo = { bar: i32 };
+        fn Foo() -> Foo = Foo.{ bar: 0 };
         fn main() = { Foo(); };
         ",
     );
@@ -3587,8 +3709,8 @@ fn a_type_and_a_function_may_share_a_name() {
 fn a_type_declared_twice_is_an_error() {
     let err = parse_err(
         "
-        type Foo = Foo { a: i32 };
-        type Foo = Foo { b: i32 };
+        type Foo = { a: i32 };
+        type Foo = { b: i32 };
         fn main() = {};
         ",
     );
@@ -3609,7 +3731,7 @@ fn a_case_declared_twice_is_an_error() {
 
 #[test]
 fn a_field_declared_twice_is_an_error() {
-    let err = parse_err("type Foo = Foo { x: i32, x: bool };\nfn main() = {};");
+    let err = parse_err("type Foo = { x: i32, x: bool };\nfn main() = {};");
     assert!(
         matches!(err, FloErr::DuplicateField { ref field, .. } if field == "x"),
         "expected a duplicate field error, got: {err:?}"
@@ -3632,9 +3754,8 @@ fn an_unknown_type_in_a_let_annotation_is_an_error() {
 fn a_type_may_be_used_before_it_is_declared() {
     let module = check_ok(
         "
-        fn main() -> Foo = Foo { bar: 0 };
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
+        fn main() -> Foo = Foo.{ bar: 0 };
+        type Foo = { bar: i32 };
         ",
     );
     func_sig(&module, "main", vec![], user("Foo", vec![]));
@@ -3644,7 +3765,7 @@ fn a_type_may_be_used_before_it_is_declared() {
 fn the_wrong_number_of_type_arguments_is_an_error() {
     let errs = check_err(
         "
-        type Pair<T> = Pair { a: T, b: T };
+        type Pair<T> = { a: T, b: T };
         fn main() -> Pair = 0;
         ",
     );
@@ -3671,8 +3792,8 @@ fn a_directly_recursive_type_is_an_error() {
 fn a_mutually_recursive_type_is_an_error() {
     let errs = check_err(
         "
-        type A = A { b: B };
-        type B = B { a: A };
+        type A = { b: B };
+        type B = { a: A };
         fn main() = {};
         ",
     );
@@ -3692,8 +3813,8 @@ fn recursion_through_a_generic_type_argument_is_an_error() {
     // which is not visible until `A` is substituted in for it.
     let errs = check_err(
         "
-        type Holder<T> = Holder { it: T };
-        type A = A { held: Holder<A> };
+        type Holder<T> = { it: T };
+        type A = { held: Holder<A> };
         fn main() = {};
         ",
     );
@@ -3704,7 +3825,7 @@ fn recursion_through_a_generic_type_argument_is_an_error() {
 fn a_generic_that_nests_itself_is_an_error() {
     let errs = check_err(
         "
-        type Deep<T> = Deep { next: Deep<Deep<T>> };
+        type Deep<T> = { next: Deep<Deep<T>> };
         fn main() = {};
         ",
     );
@@ -3715,8 +3836,8 @@ fn a_generic_that_nests_itself_is_an_error() {
 fn two_fields_of_the_same_type_are_not_recursion() {
     check_ok(
         "
-        type Pair<T> = Pair { a: T, b: T };
-        type Both = Both { ints: Pair<i32>, bools: Pair<bool> };
+        type Pair<T> = { a: T, b: T };
+        type Both = { ints: Pair<i32>, bools: Pair<bool> };
         fn main() = {};
         ",
     );
@@ -3726,45 +3847,76 @@ fn two_fields_of_the_same_type_are_not_recursion() {
 
 #[test]
 fn a_literal_takes_the_type_the_context_wants() {
+    // A record literal names no type at all, so the return type is the only thing
+    // that says which record this is.
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32, baz: bool };
-        use Foo::Foo;
-        fn main() -> Foo = Foo { bar: 0, baz: true };
+        type Foo = { bar: i32, baz: bool };
+        fn main() -> Foo = .{ bar: 0, baz: true };
         ",
     );
     let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
     assert_eq!(main.body.ty, user("Foo", vec![]));
 
-    let (case, fields) = case_lit(&main.body);
-    assert_eq!(case, "Foo");
     // The declared field type is what the literal's `0` became.
-    assert_eq!(fields[0].value.ty, Type::I32);
+    assert_eq!(field_init(&main.body, "bar").unwrap().ty, Type::I32);
 }
 
 #[test]
 fn literal_fields_may_come_in_any_order() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32, baz: bool };
-        use Foo::Foo;
-        fn main() -> Foo = Foo { baz: true, bar: 0 };
+        type Foo = { bar: i32, baz: bool };
+        fn main() -> Foo = .{ baz: true, bar: 0 };
         ",
     );
     let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
-    let (_, fields) = case_lit(&main.body);
-    assert_eq!(fields[0].name, "baz");
-    assert_eq!(fields[1].name, "bar");
+
+    // Order is not part of a named record's type, and `resolve` puts the fields
+    // in the record's canonical order rather than the written one.
+    let names = record_lit(&main.body)
+        .iter()
+        .map(|f| format!("{:?}", f.name))
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["bar", "baz"]);
+}
+
+#[test]
+fn a_positional_literal_matches_its_fields_by_index() {
+    let module = check_ok(
+        "
+        type Pair = { i32, bool };
+        fn main() -> Pair = .{ 1, true };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Pair", vec![]));
+    let fields = record_lit(&main.body);
+    assert_eq!(fields[0].name, FieldName::Pos(0));
+    assert_eq!(fields[0].value.ty, Type::I32);
+    assert_eq!(fields[1].value.ty, Type::Bool);
+}
+
+#[test]
+fn a_literal_may_not_mix_named_and_positional_fields() {
+    let err = parse_err(
+        "
+        type Pair = { i32, bool };
+        fn main() -> Pair = .{ 1, _1: true };
+        ",
+    );
+    assert!(
+        matches!(err, FloErr::ReservedFieldName { .. } | FloErr::MixedFieldKinds { .. }),
+        "expected a mixed/reserved field error, got: {err:?}"
+    );
 }
 
 #[test]
 fn a_literal_is_pinned_by_a_function_boundary() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
+        type Foo = { bar: i32 };
         fn take(f: Foo) -> i32 = 0;
-        fn main() -> i32 = take(Foo { bar: 1 });
+        fn main() -> i32 = take(Foo.{ bar: 1 });
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::I32);
@@ -3779,27 +3931,26 @@ fn a_literal_is_pinned_by_a_function_boundary() {
 fn a_literal_that_meets_no_declared_type_becomes_anonymous() {
     let module = check_ok(
         "
-        type Nowhere = Nowhere { n: i32 };
-        use Nowhere::Nowhere;
-        fn main() = { let a = Nowhere { n: 1 }; };
+        type Nowhere = { n: i32 };
+        fn main() = { let a = .{ n: 1 }; };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (stmts, _) = scope_parts(&main.body);
     let (_, var_ty, _) = let_parts(&stmts[0]);
-    assert_eq!(*var_ty, anon("Nowhere", vec![("n", Type::I32)]));
+    // `Nowhere` has exactly this shape, and is deliberately not what this is:
+    // nothing pinned the literal to it, so it closed into the anonymous record.
+    assert_eq!(*var_ty, anon_record(vec![("n", Type::I32)]));
 }
 
 #[test]
-fn identical_anonymous_types_are_the_same_type() {
+fn identical_anonymous_records_are_the_same_type() {
     // Structural, so two literals written apart from each other unify.
     let module = check_ok(
         "
-        type Point = Point { x: i32, y: i32 };
-        use Point::Point;
         fn main() = {
-            let a = Point { x: 1, y: 2 };
-            let b = Point { y: 4, x: 3 };
+            let a = .{ x: 1, y: 2 };
+            let b = .{ y: 4, x: 3 };
             a = b;
         };
         ",
@@ -3809,19 +3960,22 @@ fn identical_anonymous_types_are_the_same_type() {
     let (_, a_ty, _) = let_parts(&stmts[0]);
     let (_, b_ty, _) = let_parts(&stmts[1]);
     assert_eq!(a_ty, b_ty);
-    assert_eq!(*a_ty, anon("Point", vec![("x", Type::I32), ("y", Type::I32)]));
+    assert_eq!(
+        *a_ty,
+        anon_record(vec![("x", Type::I32), ("y", Type::I32)])
+    );
 }
 
 #[test]
-fn an_anonymous_type_is_not_a_declared_type_of_the_same_shape() {
+fn an_anonymous_record_is_not_a_declared_record_of_the_same_shape() {
+    // Nominal means nominal: a declared type is only itself, however an
+    // anonymous one is shaped.
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
-        type Other = Nope { bar: i32 };
-        use Other::Nope;
+        type Foo = { bar: i32 };
         fn take(f: Foo) -> i32 = 0;
         fn main() -> i32 = {
-            let a = Nope { bar: 1 };
+            let a: { bar: i32 } = .{ bar: 1 };
             take(a)
         };
         ",
@@ -3830,49 +3984,285 @@ fn an_anonymous_type_is_not_a_declared_type_of_the_same_shape() {
 }
 
 #[test]
+fn an_anonymous_record_written_down_is_concrete() {
+    let module = check_ok(
+        "
+        fn take(p: { x: i32, y: i32 }) -> i32 = p.x + p.y;
+        fn main() -> i32 = take(.{ x: 1, y: 2 });
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let arg = anon_record(vec![("x", Type::I32), ("y", Type::I32)]);
+    assert_eq!(
+        resolved_call_name(&main.body),
+        m("take", vec![arg.clone()], Type::I32)
+    );
+    assert_eq!(call_args(&main.body)[0].ty, arg);
+}
+
+#[test]
 fn a_case_the_type_does_not_have_is_an_error() {
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
-        type Other = Nope { bar: i32 };
-        use Other::Nope;
-        fn main() -> Foo = Nope { bar: 0 };
+        type Foo = A { bar: i32 } | B;
+        fn main() -> Foo = .Nope .{ bar: 0 };
         ",
     );
     assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
 }
 
+// --- Anonymous sums -------------------------------------------------------
+
 #[test]
-fn a_literal_missing_a_field_is_an_error() {
-    let errs = check_err(
+fn an_anonymous_sum_written_down_is_concrete() {
+    let module = check_ok(
         "
-        type Foo = Foo { bar: i32, baz: bool };
-        use Foo::Foo;
-        fn main() -> Foo = Foo { bar: 0 };
+        fn take(s: Alive | Dead) -> Alive | Dead = s;
+        fn main() = { take(.Alive); };
         ",
     );
-    assert_err!(errs, FloErr::WrongFields { case, .. } if case == "Foo");
+    let status = Type::AnonSum(vec![
+        SumCase::new("Alive".to_string(), None),
+        SumCase::new("Dead".to_string(), None),
+    ]);
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    assert_eq!(
+        resolved_call_name(stmt_expr(&scope_parts(&main.body).0[0])),
+        m("take", vec![status.clone()], status)
+    );
+}
+
+#[test]
+fn identical_anonymous_sums_are_the_same_type() {
+    // Structural, and the case order is not part of the type.
+    let module = check_ok(
+        "
+        fn a(s: Alive | Dead) -> i32 = 0;
+        fn b(s: Dead | Alive) -> i32 = 1;
+        fn main() = { a(.Alive); b(.Alive); };
+        ",
+    );
+    let (stmts, _) = scope_parts(&func_sig(&module, "main", vec![], Type::Void).body);
+    let arg_of = |i: usize| call_args(stmt_expr(&stmts[i]))[0].ty.clone();
+    assert_eq!(arg_of(0), arg_of(1));
+}
+
+#[test]
+fn an_anonymous_sum_is_not_a_declared_sum_of_the_same_shape() {
+    let errs = check_err(
+        "
+        type Status = Alive | Dead;
+        fn take(s: Status) -> i32 = 0;
+        fn main() -> i32 = {
+            let s: Alive | Dead = .Alive;
+            take(s)
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::NoPossibleOverloads { name, .. } if name == "take");
+}
+
+#[test]
+fn an_anonymous_sum_needs_at_least_two_cases() {
+    // With one there is no `|`, and nothing to tell a case from a type of that
+    // name — so the one-case form is a record written the long way round.
+    let err = parse_err("fn take(x: Only { n: i32 }) = {};\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::SingleCaseAnonSum { ref case, .. } if case == "Only"),
+        "expected a single-case-anon-sum error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_primitive_cannot_be_a_case_of_a_sum() {
+    let err = parse_err("fn take(x: i32 | Dead) = {};\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::NotACase { .. }),
+        "expected a not-a-case error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_case_named_twice_in_an_anonymous_sum_is_an_error() {
+    let err = parse_err("fn take(x: Dead | Dead) = {};\nfn main() = {};");
+    assert!(
+        matches!(err, FloErr::DuplicateCaseInAnonSum { ref case, .. } if case == "Dead"),
+        "expected a duplicate-case error, got: {err:?}"
+    );
+}
+
+// --- Composition ----------------------------------------------------------
+
+#[test]
+fn a_record_composes_anonymous_records_and_sums() {
+    // Anywhere a type may be written, any type may be written — so a field's type
+    // can be a record or a sum of its own, nested as deep as it likes.
+    let module = check_ok(
+        "
+        type Player = {
+            pos: { x: i32, y: i32 },
+            status: Alive | Dead,
+        };
+        fn main() -> i32 = {
+            let p: Player = .{ pos: .{ x: 1, y: 2 }, status: .Alive };
+            p.pos.x
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::I32);
+    let (_, tail) = scope_parts(&main.body);
+    let (recv, field) = field_parts(tail.unwrap());
+    assert_eq!(field, "x");
+    assert_eq!(
+        recv.ty,
+        anon_record(vec![("x", Type::I32), ("y", Type::I32)])
+    );
+}
+
+#[test]
+fn a_field_left_out_of_a_composed_record_is_zero_initialized() {
+    let module = check_ok(
+        "
+        type Player = {
+            pos: { x: i32, y: i32 },
+            status: Alive | Dead,
+        };
+        fn main() -> Player = .{ status: .Dead };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Player", vec![]));
+    let pos = field_init(&main.body, "pos").unwrap();
+    assert!(matches!(pos.kind, ExprKind::Zeroed));
+    assert_eq!(
+        pos.ty,
+        anon_record(vec![("x", Type::I32), ("y", Type::I32)])
+    );
+}
+
+#[test]
+fn a_type_named_inside_an_anonymous_type_must_exist() {
+    let errs = check_err("fn take(p: { inner: Nope }) = {};\nfn main() = {};");
+    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Nope");
+}
+
+#[test]
+fn recursion_through_an_anonymous_type_is_an_error() {
+    // A cycle is a cycle whether or not it has a name at every step.
+    let errs = check_err(
+        "
+        type A = { b: { c: A } };
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::RecursiveType { name, .. } if name == "A");
+}
+
+#[test]
+fn recursion_through_a_case_payload_is_an_error() {
+    let errs = check_err(
+        "
+        type A = Wrap { A } | Stop;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::RecursiveType { name, .. } if name == "A");
+}
+
+#[test]
+fn a_field_left_out_of_a_literal_is_zero_initialized() {
+    let module = check_ok(
+        "
+        type Foo = { bar: i32, baz: bool };
+        fn main() -> Foo = .{ bar: 0 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
+
+    // The literal reaching the back end gives every field of the record exactly
+    // once, whatever the source wrote.
+    assert_eq!(record_lit(&main.body).len(), 2);
+    let baz = field_init(&main.body, "baz").unwrap();
+    assert!(matches!(baz.kind, ExprKind::Zeroed));
+    assert_eq!(baz.ty, Type::Bool);
+}
+
+#[test]
+fn a_field_left_out_of_a_positional_literal_is_zero_initialized() {
+    let module = check_ok(
+        "
+        type Pair = { i32, bool };
+        fn main() -> Pair = .{ 1 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Pair", vec![]));
+    let fields = record_lit(&main.body);
+    assert_eq!(fields.len(), 2);
+    assert!(matches!(fields[1].value.kind, ExprKind::Zeroed));
+    assert_eq!(fields[1].value.ty, Type::Bool);
+}
+
+#[test]
+fn merging_two_open_records_zero_initializes_both() {
+    // An open record is the one type that grows: the union of the two field sets
+    // is what they both are, so each literal is missing what the other gave.
+    let module = check_ok(
+        "
+        fn main() = {
+            let a = .{ x: 1 };
+            let b = .{ y: 2 };
+            a = b;
+        };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+
+    let (_, a_ty, a_init) = let_parts(&stmts[0]);
+    assert_eq!(
+        *a_ty,
+        anon_record(vec![("x", Type::I32), ("y", Type::I32)])
+    );
+    let a_init = a_init.unwrap();
+    assert!(matches!(field_init(a_init, "y").unwrap().kind, ExprKind::Zeroed));
+
+    let (_, _, b_init) = let_parts(&stmts[1]);
+    let b_init = b_init.unwrap();
+    assert!(matches!(field_init(b_init, "x").unwrap().kind, ExprKind::Zeroed));
 }
 
 #[test]
 fn a_literal_with_an_extra_field_is_an_error() {
+    // A field left *out* is zero initialized; one the record does not have has
+    // nowhere to go.
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn main() -> Foo = Foo { bar: 0, nope: 1 };
+        type Foo = { bar: i32 };
+        fn main() -> Foo = .{ bar: 0, nope: 1 };
         ",
     );
-    assert_err!(errs, FloErr::WrongFields { case, .. } if case == "Foo");
+    assert_err!(errs, FloErr::UnexpectedField { field, .. } if field == "nope");
+}
+
+#[test]
+fn two_concrete_records_of_different_shapes_do_not_unify() {
+    let errs = check_err(
+        "
+        fn main() = {
+            let a: { x: i32 } = .{ x: 1 };
+            let b: { y: i32 } = .{ y: 1 };
+            a = b;
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::WrongFields { .. });
 }
 
 #[test]
 fn a_field_given_twice_is_an_error() {
     let err = parse_err(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn main() -> Foo = Foo { bar: 0, bar: 1 };
+        type Foo = { bar: i32 };
+        fn main() -> Foo = .{ bar: 0, bar: 1 };
         ",
     );
     assert!(
@@ -3885,44 +4275,144 @@ fn a_field_given_twice_is_an_error() {
 fn a_field_of_the_wrong_type_is_an_error() {
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn main() -> Foo = Foo { bar: true };
+        type Foo = { bar: i32 };
+        fn main() -> Foo = .{ bar: true };
         ",
     );
     assert_err!(errs, FloErr::TypeMismatch { .. });
 }
 
 #[test]
-fn a_case_with_no_fields_is_written_bare() {
+fn a_case_with_no_payload_is_written_bare() {
     let module = check_ok(
         "
         type Option = Some { val: i32 } | None;
-        use Option::None;
-        fn main() -> Option = None;
+        fn main() -> Option = .None;
         ",
     );
     let main = func_sig(&module, "main", vec![], user("Option", vec![]));
-    let (case, fields) = case_lit(&main.body);
+    let (case, payload) = case_lit(&main.body);
     assert_eq!(case, "None");
-    assert!(fields.is_empty());
+    assert!(payload.is_none());
     assert_eq!(main.body.ty, user("Option", vec![]));
 }
 
 #[test]
-fn a_variable_wins_over_a_case_of_the_same_name() {
+fn a_case_payload_is_a_record_literal() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
+        type Option = Some { val: i32 } | None;
+        fn main() -> Option = .Some .{ val: 1 };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Option", vec![]));
+    let (case, payload) = case_lit(&main.body);
+    assert_eq!(case, "Some");
+
+    let payload = payload.expect("Some carries a payload");
+    assert_eq!(payload.ty, anon_record(vec![("val", Type::I32)]));
+    assert_eq!(field_init(payload, "val").unwrap().ty, Type::I32);
+}
+
+#[test]
+fn a_positional_case_payload_is_matched_by_index() {
+    let module = check_ok(
+        "
+        type Option<T> = Some { T } | None;
+        fn main() -> Option<bool> = .Some .{ true };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], user("Option", vec![Type::Bool]));
+    let (_, payload) = case_lit(&main.body);
+    assert_eq!(payload.unwrap().ty, anon_pos(vec![Type::Bool]));
+}
+
+#[test]
+fn a_case_given_no_payload_when_it_takes_one_is_an_error() {
+    let errs = check_err(
+        "
+        type Option = Some { val: i32 } | None;
+        fn main() -> Option = .Some;
+        ",
+    );
+    assert_err!(errs, FloErr::PayloadMismatch { case, expected: true, .. } if case == "Some");
+}
+
+#[test]
+fn a_case_given_a_payload_it_does_not_take_is_an_error() {
+    let errs = check_err(
+        "
+        type Option = Some { val: i32 } | None;
+        fn main() -> Option = .None .{ val: 1 };
+        ",
+    );
+    assert_err!(errs, FloErr::PayloadMismatch { case, expected: false, .. } if case == "None");
+}
+
+#[test]
+fn a_record_literal_is_not_a_sum() {
+    let errs = check_err(
+        "
+        type Option = Some { val: i32 } | None;
+        fn main() -> Option = .{ val: 1 };
+        ",
+    );
+    assert_err!(errs, FloErr::RecordSumMismatch { .. });
+}
+
+#[test]
+fn a_case_literal_is_not_a_record() {
+    let errs = check_err(
+        "
+        type Foo = { bar: i32 };
+        fn main() -> Foo = .Foo .{ bar: 1 };
+        ",
+    );
+    assert_err!(errs, FloErr::RecordSumMismatch { .. });
+}
+
+#[test]
+fn an_anonymous_record_and_an_anonymous_sum_do_not_unify() {
+    let errs = check_err(
+        "
+        fn main() = {
+            let a = .{ x: 1 };
+            a = .Alive;
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::RecordSumMismatch { .. });
+}
+
+#[test]
+fn a_variable_wins_over_a_type_of_the_same_name() {
+    // `Foo.` is field access when a variable `Foo` is in scope, and a literal's
+    // qualifier only when one is not.
+    let module = check_ok(
+        "
+        type Foo = { bar: i32 };
         fn main() -> i32 = {
-            let Foo = 7;
-            Foo
+            let Foo = .{ bar: 7 };
+            Foo.bar
         };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (_, tail) = scope_parts(&main.body);
-    assert!(matches!(tail.unwrap().kind, ExprKind::Var(_)));
+    let (recv, field) = field_parts(tail.unwrap());
+    assert!(matches!(recv.kind, ExprKind::Var(_)));
+    assert_eq!(field, "bar");
+}
+
+#[test]
+fn a_dot_must_be_followed_by_a_field_name_or_a_brace() {
+    // A leading `.` starts a literal and only a literal, so there is nothing else
+    // `.5` could be trying to be.
+    let err = parse_err("fn main() -> i32 = .5;");
+    assert!(
+        matches!(err, FloErr::ExpectedLiteral { .. }),
+        "expected an expected-literal error, got: {err:?}"
+    );
 }
 
 #[test]
@@ -3941,11 +4431,11 @@ fn a_variable_in_a_condition_is_not_read_as_a_literal() {
 // --- Qualified literals ---------------------------------------------------
 
 #[test]
-fn a_qualifier_pins_a_literal_outright() {
+fn a_qualifier_pins_a_record_literal_outright() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
-        fn main() = { let a = Foo::Foo { bar: 0 }; };
+        type Foo = { bar: i32 };
+        fn main() = { let a = Foo.{ bar: 0 }; };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
@@ -3954,45 +4444,54 @@ fn a_qualifier_pins_a_literal_outright() {
     assert_eq!(*var_ty, user("Foo", vec![]));
     // The qualifier is dropped once it has done its job: `ty` says which type
     // this is, exactly as it does for a bare literal.
-    let (case, _) = case_lit(init.unwrap());
-    assert_eq!(case, "Foo");
+    assert_eq!(record_lit(init.unwrap()).len(), 1);
 }
 
 #[test]
-fn a_turbofish_qualifier_pins_a_generic_type() {
+fn a_qualifier_pins_a_case_literal_outright() {
     let module = check_ok(
         "
-        type Vec<T> = Vec { len: u64, cap: T };
-        fn main() = { let v = Vec::<u8>::Vec { len: 0, cap: 1 }; };
+        type Option = Some { val: i32 } | None;
+        fn main() = { let a = Option.None; };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (stmts, _) = scope_parts(&main.body);
-    let (_, var_ty, _) = let_parts(&stmts[0]);
-    assert_eq!(*var_ty, user("Vec", vec![Type::U8]));
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, user("Option", vec![]));
+    let (case, _) = case_lit(init.unwrap());
+    assert_eq!(case, "None");
 }
 
 #[test]
 fn a_qualifier_naming_a_case_the_type_lacks_is_an_error() {
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
-        type Baz = Baz { bar: i32 };
-        fn main() = { let a = Foo::Baz { bar: 0 }; };
+        type Foo = A { bar: i32 } | B;
+        fn main() = { let a = Foo.Nope.{ bar: 0 }; };
         ",
     );
-    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Baz");
+    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
 }
 
 #[test]
-fn a_qualifier_without_a_turbofish_infers_the_type_arguments() {
-    // Naming the type is not the same as giving its arguments: `Option::Some`
+fn a_qualifier_that_names_no_type_is_an_error() {
+    // Whether a name is a type cannot be known while parsing — the declaration may
+    // be further down the file — so this is reported with the declarations.
+    let errs = check_err("fn main() = { let a = Ghost.{ n: 0 }; };");
+    assert_err!(errs, FloErr::NotATypeOrVariable { name, .. } if name == "Ghost");
+}
+
+#[test]
+fn a_qualifier_infers_the_type_arguments() {
+    // Naming the type is not the same as giving its arguments — which cannot be
+    // written at all, since no type may appear inside an expression. `Option.Some`
     // says which declaration this is and leaves `T` to inference, which takes it
     // from the annotation.
     let module = check_ok(
         "
         type Option<T> = Some { val: T } | None;
-        fn main() = { let a: Option<u8> = Option::Some { val: 1 }; };
+        fn main() = { let a: Option<u8> = Option.Some.{ val: 1 }; };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
@@ -4004,42 +4503,44 @@ fn a_qualifier_without_a_turbofish_infers_the_type_arguments() {
 
 #[test]
 fn a_qualifier_whose_arguments_cannot_be_inferred_is_an_error() {
-    // Nothing here says what `T` is, so the literal's type never becomes known.
+    // Nothing here says what `T` is, and there is no way to write it down, so the
+    // literal's type never becomes known.
     let errs = check_err(
         "
         type Option<T> = Some { val: T } | None;
-        fn main() = { let a = Option::None; };
+        fn main() = { let a = Option.None; };
         ",
     );
     assert_err!(errs, FloErr::UnresolvedType { .. });
 }
 
-#[test]
-fn a_qualifier_with_the_wrong_number_of_turbofish_arguments_is_an_error() {
-    // Written out, they still have to be right — it is only leaving them off
-    // entirely that defers to inference.
-    let errs = check_err(
-        "
-        type Option<T> = Some { val: T } | None;
-        fn main() = { let a = Option::<u8, u8>::None; };
-        ",
-    );
-    assert_err!(errs, FloErr::TypeArityMismatch { name, .. } if name == "Option");
-}
-
-// --- use ------------------------------------------------------------------
+// --- Bare names -----------------------------------------------------------
 //
-// A bare name is a variable if one is in scope, then a case a `use` brought in,
-// and otherwise nothing at all. A `use` only makes the name legal: which type
-// the literal belongs to is inferred exactly as it is for the qualified form.
+// A bare name is a variable, or a call when parentheses follow, and nothing else.
+// A case is only ever written after a `.`, and a type name only as a qualifier —
+// which is a `.` too — so nothing has to be resolved to know what was written.
 // --------------------------------------------------------------------------
 
 #[test]
-fn a_bare_case_name_needs_a_use() {
+fn a_bare_case_name_is_an_unknown_identifier() {
     let err = parse_err(
         "
-        type Foo = Foo { bar: i32 };
-        fn main() -> Foo = Foo { bar: 0 };
+        type Option = Some { val: i32 } | None;
+        fn main() -> Option = None;
+        ",
+    );
+    assert!(
+        matches!(err, FloErr::UnknownIdentifier { ref name, .. } if name == "None"),
+        "expected an unknown-identifier error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_bare_type_name_is_an_unknown_identifier() {
+    let err = parse_err(
+        "
+        type Foo = { bar: i32 };
+        fn main() -> i32 = { let a = Foo; 0 };
         ",
     );
     assert!(
@@ -4058,160 +4559,29 @@ fn a_misspelt_variable_is_an_unknown_identifier() {
 }
 
 #[test]
-fn a_file_scope_use_applies_before_it_is_written() {
-    // Like `fn` and `type`, a file-scope `use` is not order dependent.
+fn a_type_may_be_qualified_before_it_is_declared() {
     let module = check_ok(
         "
-        fn main() -> Foo = Foo { bar: 0 };
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
+        fn main() -> Foo = Foo.{ bar: 0 };
+        type Foo = { bar: i32 };
         ",
     );
     func_sig(&module, "main", vec![], user("Foo", vec![]));
 }
 
 #[test]
-fn a_use_may_be_a_statement_inside_a_scope() {
-    let module = check_ok(
-        "
-        type Foo = Foo { bar: i32 };
-        fn main() -> Foo = {
-            use Foo::Foo;
-            Foo { bar: 0 }
-        };
-        ",
-    );
-    let main = func_sig(&module, "main", vec![], user("Foo", vec![]));
-    let (stmts, tail) = scope_parts(&main.body);
-    assert!(matches!(&stmts[0].kind, StmtKind::Use(t, c) if t == "Foo" && c == "Foo"));
-    assert_eq!(tail.unwrap().ty, user("Foo", vec![]));
-}
-
-#[test]
-fn a_scoped_use_does_not_escape_its_scope() {
-    let err = parse_err(
-        "
-        type Foo = Foo { bar: i32 };
-        fn main() = {
-            { use Foo::Foo; };
-            Foo { bar: 0 };
-        };
-        ",
-    );
-    assert!(
-        matches!(err, FloErr::UnknownIdentifier { ref name, .. } if name == "Foo"),
-        "expected an unknown-identifier error, got: {err:?}"
-    );
-}
-
-#[test]
-fn a_use_does_not_pin_the_literal_to_the_type_it_named() {
-    // It only makes the name writable. `B` is what the context wants, so `B` is
-    // what the literal becomes, even though the `use` named `A`.
+fn a_case_literal_needs_no_declaration_in_scope() {
+    // There is nothing to bring into scope: the `.` is what makes the name a case,
+    // and which type it belongs to is inferred.
     let module = check_ok(
         "
         type A = Same { n: i32 };
         type B = Same { n: i32 };
-        use A::Same;
-        fn main() -> B = Same { n: 0 };
+        fn main() -> B = .Same .{ n: 0 };
         ",
     );
     let main = func_sig(&module, "main", vec![], user("B", vec![]));
     assert_eq!(main.body.ty, user("B", vec![]));
-}
-
-#[test]
-fn a_variable_still_wins_over_a_used_case_of_the_same_name() {
-    let module = check_ok(
-        "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn main() -> i32 = {
-            let Foo = 7;
-            Foo
-        };
-        ",
-    );
-    let main = func_sig(&module, "main", vec![], Type::I32);
-    let (_, tail) = scope_parts(&main.body);
-    assert!(matches!(tail.unwrap().kind, ExprKind::Var(_)));
-}
-
-#[test]
-fn a_use_of_an_undeclared_type_is_an_error() {
-    let errs = check_err(
-        "
-        use Ghost::Ghost;
-        fn main() = {};
-        ",
-    );
-    assert_err!(errs, FloErr::UnknownType { name, .. } if name == "Ghost");
-}
-
-#[test]
-fn a_use_of_a_case_the_type_lacks_is_an_error() {
-    let errs = check_err(
-        "
-        type Foo = Foo { bar: i32 };
-        use Foo::Nope;
-        fn main() = {};
-        ",
-    );
-    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
-}
-
-#[test]
-fn a_scoped_use_is_checked_too() {
-    let errs = check_err(
-        "
-        type Foo = Foo { bar: i32 };
-        fn main() = { use Foo::Nope; };
-        ",
-    );
-    assert_err!(errs, FloErr::NoSuchCase { case, .. } if case == "Nope");
-}
-
-#[test]
-fn a_use_of_a_generic_types_case_needs_no_type_arguments() {
-    let module = check_ok(
-        "
-        type Option<T> = Some { val: T } | None;
-        use Option::Some;
-        fn main() -> Option<u8> = Some { val: 1 };
-        ",
-    );
-    let main = func_sig(&module, "main", vec![], user("Option", vec![Type::U8]));
-    let (_, fields) = case_lit(&main.body);
-    assert_eq!(fields[0].value.ty, Type::U8);
-}
-
-#[test]
-fn a_use_is_not_an_expression() {
-    let err = parse_err("fn main() -> i32 = 1 + use Foo::Foo;");
-    assert!(
-        matches!(err, FloErr::UseOutsideStatementPosition { .. }),
-        "expected a misplaced-`use` error, got: {err:?}"
-    );
-}
-
-#[test]
-fn a_use_cannot_be_a_scope_tail() {
-    let err = parse_err(
-        "
-        type Foo = Foo { bar: i32 };
-        fn main() = { use Foo::Foo };
-        ",
-    );
-    assert!(
-        matches!(
-            err,
-            FloErr::ExpectedTokenNotFound {
-                expected: TokenKind::Semicolon,
-                ..
-            }
-        ),
-        "expected a missing-`;` error, got: {err:?}"
-    );
 }
 
 // --- Shared case names ----------------------------------------------------
@@ -4222,8 +4592,7 @@ fn a_shared_case_name_is_resolved_by_the_expected_type() {
         "
         type A = Same { n: i32 };
         type B = Same { n: i32 };
-        use A::Same;
-        fn main() -> B = Same { n: 0 };
+        fn main() -> B = .Same .{ n: 0 };
         ",
     );
     let main = func_sig(&module, "main", vec![], user("B", vec![]));
@@ -4238,10 +4607,9 @@ fn a_shared_case_name_prunes_overloads_by_its_fields() {
         "
         type A = Same { n: i32 };
         type B = Same { flag: bool };
-        use A::Same;
         fn take(a: A) -> i32 = 1;
         fn take(b: B) -> i32 = 2;
-        fn main() -> i32 = take(Same { flag: true });
+        fn main() -> i32 = take(.Same .{ flag: true });
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::I32);
@@ -4257,9 +4625,8 @@ fn a_case_name_no_overload_can_take_is_an_error() {
         "
         type A = OnlyA { n: i32 };
         type B = Other { n: i32 };
-        use B::Other;
         fn take(a: A) -> i32 = 1;
-        fn main() -> i32 = take(Other { n: 0 });
+        fn main() -> i32 = take(.Other .{ n: 0 });
         ",
     );
     assert_err!(errs, FloErr::NoPossibleOverloads { name, .. } if name == "take");
@@ -4271,7 +4638,7 @@ fn a_case_name_no_overload_can_take_is_an_error() {
 fn a_field_can_be_read() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32, baz: bool };
+        type Foo = { bar: i32, baz: bool };
         fn get(f: Foo) -> i32 = f.bar;
         fn main() = {};
         ",
@@ -4287,7 +4654,7 @@ fn a_field_can_be_read() {
 fn a_field_can_be_assigned() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
+        type Foo = { bar: i32 };
         fn set(f: Foo) = { f.bar = 100; };
         fn main() = {};
         ",
@@ -4303,9 +4670,8 @@ fn a_field_can_be_assigned() {
 fn a_field_of_a_temporary_cannot_be_assigned() {
     let err = parse_err(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn make() -> Foo = Foo { bar: 0 };
+        type Foo = { bar: i32 };
+        fn make() -> Foo = Foo.{ bar: 0 };
         fn main() = make().bar = 1;
         ",
     );
@@ -4319,10 +4685,9 @@ fn a_field_of_a_temporary_cannot_be_assigned() {
 fn a_field_of_a_literal_type_needs_no_annotation() {
     let module = check_ok(
         "
-        type Holder = Holder { n: i32 };
-        use Holder::Holder;
+        type Holder = { n: i32 };
         fn main() -> i32 = {
-            let v = Holder { n: 1 };
+            let v = .{ n: 1 };
             v.n + 1
         };
         ",
@@ -4330,15 +4695,17 @@ fn a_field_of_a_literal_type_needs_no_annotation() {
     let main = func_sig(&module, "main", vec![], Type::I32);
     let (stmts, _) = scope_parts(&main.body);
     let (_, var_ty, _) = let_parts(&stmts[0]);
-    assert_eq!(*var_ty, anon("Holder", vec![("n", Type::I32)]));
+    // Nothing pinned it to `Holder`, so it is the anonymous record of the same
+    // shape — which is still something `.n` can be read of.
+    assert_eq!(*var_ty, anon_record(vec![("n", Type::I32)]));
 }
 
 #[test]
 fn field_access_chains() {
     let module = check_ok(
         "
-        type Inner = Inner { n: i32 };
-        type Outer = Outer { inner: Inner };
+        type Inner = { n: i32 };
+        type Outer = { inner: Inner };
         fn get(o: Outer) -> i32 = o.inner.n;
         fn main() = {};
         ",
@@ -4353,7 +4720,7 @@ fn field_access_chains() {
 fn field_access_binds_tighter_than_an_operator() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
+        type Foo = { bar: i32 };
         fn neg(f: Foo) -> i32 = -f.bar;
         fn main() = {};
         ",
@@ -4368,7 +4735,7 @@ fn field_access_binds_tighter_than_an_operator() {
 fn a_field_in_a_condition_reads_as_a_condition() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32, baz: bool };
+        type Foo = { bar: i32, baz: bool };
         fn pick(f: Foo) -> i32 = if f.baz { 1 } else { 2 };
         fn main() = {};
         ",
@@ -4392,7 +4759,7 @@ fn a_field_of_a_sum_type_is_an_error() {
 fn a_field_the_type_does_not_have_is_an_error() {
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
+        type Foo = { bar: i32 };
         fn get(f: Foo) -> i32 = f.nope;
         fn main() = {};
         ",
@@ -4407,23 +4774,59 @@ fn a_field_of_a_primitive_is_an_error() {
 }
 
 #[test]
-fn an_access_is_rechecked_after_its_receiver_gains_a_case() {
-    // `v.n` resolves while `v` still looks like a one-case type; the assignment
-    // below widens it, and the final check is what catches that.
+fn a_positional_field_of_a_named_record_is_an_error() {
+    // A record is addressed by name or by position, and which one is part of its
+    // type.
+    let errs = check_err(
+        "
+        type Foo = { bar: i32 };
+        fn get(f: Foo) -> i32 = f._0;
+        fn main() = {};
+        ",
+    );
+    assert_err!(errs, FloErr::UnknownField { field, .. } if field == "_0");
+}
+
+#[test]
+fn match_is_reserved_but_not_implemented() {
+    let err = parse_err("fn main() -> i32 = match 1 { 0 -> 1, _ -> 2 };");
+    assert!(
+        matches!(err, FloErr::NotImplemented { what: "match", .. }),
+        "expected a not-implemented error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_field_of_an_open_sum_is_an_error() {
+    // The receiver is a sum from the moment the literal named a case, so there is
+    // nothing to wait for: `.` never reaches into one.
     let errs = check_err(
         "
         type Option = Some { n: i32 } | None;
-        use Option::Some;
-        use Option::None;
         fn main() -> i32 = {
-            let v = Some { n: 1 };
-            let n = v.n;
-            v = None;
-            n
+            let v = .Some .{ n: 1 };
+            v.n
         };
         ",
     );
     assert_err!(errs, FloErr::FieldAccessOnSumType { field, .. } if field == "n");
+}
+
+#[test]
+fn an_access_is_rechecked_after_its_receiver_grows() {
+    // `v.n` resolves while `v` is still an open record; the assignment below adds a
+    // field, and it is the final check that sees the receiver as it ended up.
+    let errs = check_err(
+        "
+        fn main() -> i32 = {
+            let v = .{ n: 1 };
+            let n = v.nope;
+            v = .{ n: 2, other: 3 };
+            n
+        };
+        ",
+    );
+    assert_err!(errs, FloErr::UnknownField { field, .. } if field == "nope");
 }
 
 // --- Generic types --------------------------------------------------------
@@ -4432,26 +4835,23 @@ fn an_access_is_rechecked_after_its_receiver_gains_a_case() {
 fn a_generic_type_is_specialized_by_its_use() {
     let module = check_ok(
         "
-        type Holder<T> = Holder { it: T };
-        use Holder::Holder;
-        fn main() -> Holder<u8> = Holder { it: 1 };
+        type Holder<T> = { it: T };
+        fn main() -> Holder<u8> = Holder.{ it: 1 };
         ",
     );
     let main = func_sig(&module, "main", vec![], user("Holder", vec![Type::U8]));
     // The field type came from the declaration with `T` substituted away.
-    let (_, fields) = case_lit(&main.body);
-    assert_eq!(fields[0].value.ty, Type::U8);
+    assert_eq!(field_init(&main.body, "it").unwrap().ty, Type::U8);
 }
 
 #[test]
 fn one_generic_type_at_two_specializations() {
     let module = check_ok(
         "
-        type Holder<T> = Holder { it: T };
-        use Holder::Holder;
+        type Holder<T> = { it: T };
         fn take(h: Holder<i32>) -> i32 = 1;
         fn take(h: Holder<bool>) -> i32 = 2;
-        fn main() -> i32 = take(Holder { it: true });
+        fn main() -> i32 = take(Holder.{ it: true });
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::I32);
@@ -4465,10 +4865,9 @@ fn one_generic_type_at_two_specializations() {
 fn a_generic_function_over_a_generic_type() {
     let module = check_ok(
         "
-        type Holder<T> = Holder { it: T };
-        use Holder::Holder;
+        type Holder<T> = { it: T };
         fn get<T>(h: Holder<T>) -> T = h.it;
-        fn main() -> u8 = get(Holder { it: 1 });
+        fn main() -> u8 = get(Holder.{ it: 1 });
         ",
     );
     func_sig(
@@ -4480,29 +4879,46 @@ fn a_generic_function_over_a_generic_type() {
 }
 
 #[test]
-fn a_turbofish_qualifier_fixes_the_field_type() {
+fn a_qualifier_does_not_fix_the_type_arguments() {
+    // The qualifier says which declaration this is and nothing more, so `T` is
+    // settled the way any other unknown is — here by the literal defaulting.
     let module = check_ok(
         "
-        type Holder<T> = Holder { it: T };
-        fn main() = { let h = Holder::<u8>::Holder { it: 1 }; };
+        type Holder<T> = { it: T };
+        fn main() = { let h = Holder.{ it: 1 }; };
+        ",
+    );
+    let main = func_sig(&module, "main", vec![], Type::Void);
+    let (stmts, _) = scope_parts(&main.body);
+    let (_, var_ty, init) = let_parts(&stmts[0]);
+    assert_eq!(*var_ty, user("Holder", vec![Type::I32]));
+    assert_eq!(field_init(init.unwrap(), "it").unwrap().ty, Type::I32);
+}
+
+#[test]
+fn an_annotation_is_how_a_type_argument_is_forced() {
+    // With no turbofish, annotating what the value flows into is the way to say
+    // what a type argument is.
+    let module = check_ok(
+        "
+        type Holder<T> = { it: T };
+        fn main() = { let h: Holder<u8> = .{ it: 1 }; };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::Void);
     let (stmts, _) = scope_parts(&main.body);
     let (_, var_ty, init) = let_parts(&stmts[0]);
     assert_eq!(*var_ty, user("Holder", vec![Type::U8]));
-    let (_, fields) = case_lit(init.unwrap());
-    assert_eq!(fields[0].value.ty, Type::U8);
+    assert_eq!(field_init(init.unwrap(), "it").unwrap().ty, Type::U8);
 }
 
 #[test]
 fn a_user_type_appears_in_the_mangled_name() {
     let module = check_ok(
         "
-        type Holder<T> = Holder { it: T };
-        use Holder::Holder;
+        type Holder<T> = { it: T };
         fn take(h: Holder<i32>) -> i32 = 0;
-        fn main() -> i32 = take(Holder { it: 1 });
+        fn main() -> i32 = take(Holder.{ it: 1 });
         ",
     );
     assert!(
@@ -4521,9 +4937,8 @@ fn a_user_type_appears_in_the_mangled_name() {
 fn a_diverging_field_value_makes_the_literal_diverge() {
     let module = check_ok(
         "
-        type Foo = Foo { bar: i32 };
-        use Foo::Foo;
-        fn main() -> i32 = { let f = Foo { bar: return 1 }; 0 };
+        type Foo = { bar: i32 };
+        fn main() -> i32 = { let f = Foo.{ bar: return 1 }; 0 };
         ",
     );
     let main = func_sig(&module, "main", vec![], Type::I32);
@@ -4538,9 +4953,7 @@ fn a_literal_in_both_branches_of_an_if_is_one_type() {
     let module = check_ok(
         "
         type Option = Some { val: i32 } | None;
-        use Option::Some;
-        use Option::None;
-        fn pick(c: bool) -> Option = if c { Some { val: 1 } } else { None };
+        fn pick(c: bool) -> Option = if c { .Some .{ val: 1 } } else { .None };
         fn main() = {};
         ",
     );
@@ -4553,11 +4966,9 @@ fn two_literals_that_join_become_one_anonymous_sum() {
     let module = check_ok(
         "
         type Option = Some { val: i32 } | None;
-        use Option::Some;
-        use Option::None;
         fn main() = {
-            let v = Some { val: 1 };
-            v = None;
+            let v = .Some .{ val: 1 };
+            v = .None;
         };
         ",
     );
@@ -4566,49 +4977,55 @@ fn two_literals_that_join_become_one_anonymous_sum() {
     let (_, var_ty, _) = let_parts(&stmts[0]);
     assert_eq!(
         *var_ty,
-        Type::Anon(vec![
-            TypeCase::new("None".to_string(), vec![]),
-            TypeCase::new("Some".to_string(), vec![("val".to_string(), Type::I32)]),
+        Type::AnonSum(vec![
+            SumCase::new("None".to_string(), None),
+            SumCase::new(
+                "Some".to_string(),
+                Some(anon_record(vec![("val", Type::I32)]))
+            ),
         ])
     );
 }
 
 #[test]
 fn a_case_that_disagrees_with_itself_is_an_error() {
+    // Both payloads are open records, so they merge into `{ a, b }` — and then
+    // there is no declared `Same` that has both.
     let errs = check_err(
         "
         type S = Same { a: i32 };
-        use S::Same;
+        fn take(s: S) = {};
         fn main() = {
-            let v = Same { a: 1 };
-            v = Same { b: 2 };
+            let v = .Same .{ a: 1 };
+            v = .Same .{ b: 2 };
+            take(v);
         };
         ",
     );
-    assert_err!(errs, FloErr::WrongFields { case, .. } if case == "Same");
+    assert_err!(errs, FloErr::NoPossibleOverloads { name, .. } if name == "take");
 }
 
 #[test]
 fn a_field_holds_a_literal_of_another_type() {
     let module = check_ok(
         "
-        type Inner = Inner { n: i32 };
-        type Outer = Outer { inner: Inner };
-        use Inner::Inner;
-        use Outer::Outer;
-        fn main() -> Outer = Outer { inner: Inner { n: 1 } };
+        type Inner = { n: i32 };
+        type Outer = { inner: Inner };
+        fn main() -> Outer = Outer.{ inner: Inner.{ n: 1 } };
         ",
     );
     let main = func_sig(&module, "main", vec![], user("Outer", vec![]));
-    let (_, fields) = case_lit(&main.body);
-    assert_eq!(fields[0].value.ty, user("Inner", vec![]));
+    assert_eq!(
+        field_init(&main.body, "inner").unwrap().ty,
+        user("Inner", vec![])
+    );
 }
 
 #[test]
 fn a_user_type_has_no_builtin_operators() {
     let errs = check_err(
         "
-        type Foo = Foo { bar: i32 };
+        type Foo = { bar: i32 };
         fn add(a: Foo, b: Foo) -> Foo = a + b;
         fn main() = {};
         ",
@@ -4620,9 +5037,8 @@ fn a_user_type_has_no_builtin_operators() {
 fn an_operator_can_be_overloaded_on_a_user_type() {
     let module = check_ok(
         "
-        type Vec2 = Vec2 { x: i32, y: i32 };
-        use Vec2::Vec2;
-        op +(a: Vec2, b: Vec2) -> Vec2 = Vec2 { x: a.x + b.x, y: a.y + b.y };
+        type Vec2 = { x: i32, y: i32 };
+        op +(a: Vec2, b: Vec2) -> Vec2 = Vec2.{ x: a.x + b.x, y: a.y + b.y };
         fn plus(a: Vec2, b: Vec2) -> Vec2 = a + b;
         fn main() = {};
         ",
@@ -4650,12 +5066,11 @@ fn the_new_operators_can_be_overloaded_too() {
     // the tokenizer never produces as a single token.
     let module = check_ok(
         "
-        type Bits = Bits { n: i32 };
-        use Bits::Bits;
+        type Bits = { n: i32 };
         op !(a: Bits) -> bool = a.n == 0;
-        op ~(a: Bits) -> Bits = Bits { n: ~a.n };
-        op <<(a: Bits, by: i32) -> Bits = Bits { n: a.n << by };
-        op >>(a: Bits, by: i32) -> Bits = Bits { n: a.n >> by };
+        op ~(a: Bits) -> Bits = Bits.{ n: ~a.n };
+        op <<(a: Bits, by: i32) -> Bits = Bits.{ n: a.n << by };
+        op >>(a: Bits, by: i32) -> Bits = Bits.{ n: a.n >> by };
         fn shifted(a: Bits) -> Bits = a << 1;
         fn main() = {};
         ",
@@ -4740,8 +5155,8 @@ fn a_cast_can_reinterpret_one_user_type_as_another() {
     // warning, and there is no warning sink yet.
     let module = check_ok(
         "
-        type Pair = Pair { a: i32, b: i32 };
-        type Wide = Wide { n: i64 };
+        type Pair = { a: i32, b: i32 };
+        type Wide = { n: i64 };
         fn widen(p: Pair) -> Wide = @cast(Wide) p;
         fn main() = {};
         ",
@@ -4758,7 +5173,7 @@ fn a_cast_inside_a_generic_casts_to_the_instantiated_type() {
     let module = check_ok(
         "
         fn bits<T>(a: i32) -> T = @cast(T) a;
-        fn main() -> u8 = bits::<u8>(1);
+        fn main() -> u8 = bits(1);
         ",
     );
     let bits = func_sig(&module, "bits", vec![Type::I32], Type::U8);
@@ -4875,13 +5290,16 @@ fn sizeof_is_an_operand_like_any_other() {
 
 #[test]
 fn sizeof_inside_a_generic_asks_about_the_instantiated_type() {
+    // `T` is taken from the argument: with no turbofish, that is the only place a
+    // type argument can come from.
     let module = check_ok(
         "
-        fn size<T>() -> u64 = @sizeof(T);
-        fn main() -> u64 = size::<u8>();
+        fn size<T>(v: T) -> u64 = @sizeof(T);
+        fn call(v: u8) -> u64 = size(v);
+        fn main() = {};
         ",
     );
-    let size = func_sig(&module, "size", vec![], Type::U64);
+    let size = func_sig(&module, "size", vec![Type::U8], Type::U64);
     let (_, ty) = type_info_parts(&size.body);
     assert_eq!(*ty, Type::U8);
 }

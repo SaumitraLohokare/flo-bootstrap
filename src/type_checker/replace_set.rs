@@ -3,16 +3,17 @@ use std::{collections::HashMap, rc::Rc};
 use crate::{
     errors::{FloErr, FloResult},
     tokenizer::Loc,
-    types::{Type, TypeCase, TypeTable, sorted_cases},
+    types::{FieldName, Record, SumCase, Type, TypeTable, sorted_cases},
 };
 
 #[derive(Debug)]
 pub(super) struct ReplaceSet {
     parents: HashMap<usize, usize>,
     bindings: HashMap<usize, Type>,
-    /// Needed to unify an open [`Type::SomeType`] with a declared type: the
-    /// `Type` only carries the declaration's name, and its cases have to be
-    /// looked up to be checked against.
+    /// Needed to unify an open record or sum with a declared type: the `Type`
+    /// only carries the declaration's name, and its fields or cases have to be
+    /// looked up to be checked against. It is also what says whether a declared
+    /// name is a record or a sum, which nothing else can answer.
     types: Rc<TypeTable>,
 }
 
@@ -75,6 +76,13 @@ impl ReplaceSet {
         Ok(())
     }
 
+    /// Unify two types that are not (or not only) variables, for callers outside
+    /// the union-find itself. The merged type is returned, and any bindings the
+    /// merge implied are recorded.
+    pub(super) fn merge(&mut self, t1: Type, t2: Type, loc: Loc) -> FloResult<Type> {
+        self.unify_types(t1, t2, loc)
+    }
+
     fn unify_types(&mut self, t1: Type, t2: Type, loc: Loc) -> FloResult<Type> {
         use Type::*;
         let result = match (t1, t2) {
@@ -87,12 +95,14 @@ impl ReplaceSet {
                 self.unify(a, b, loc)?;
                 self.resolve(&T(a))
             }
+            // Which side the variable is on is what says whether the incoming type
+            // is the expected one — see `bind_as`.
             (T(a), t2) => {
-                self.bind(a, t2, loc)?;
+                self.bind_as(a, t2, false, loc)?;
                 self.resolve(&T(a))
             }
             (t1, T(b)) => {
-                self.bind(b, t1, loc)?;
+                self.bind_as(b, t1, true, loc)?;
                 self.resolve(&T(b))
             }
 
@@ -134,50 +144,99 @@ impl ReplaceSet {
                 User(n1, args)
             }
 
-            // An open type meeting the type it belongs to. This is where a
-            // literal is finally pinned down: every case it was known to have
-            // must be a case of the declaration, with exactly those fields.
-            (SomeType(cases), User(name, args)) | (User(name, args), SomeType(cases)) => {
-                self.check_against_decl(&cases, &name, &args, loc)?;
-                User(name, args)
-            }
+            // ------------------------------------------------------------------
+            // Records
+            // ------------------------------------------------------------------
 
-            // Two open types: neither knows the whole set, so take the union.
-            (SomeType(c1), SomeType(c2)) => SomeType(self.merge_cases(c1, c2, loc)?),
-
-            // An open type meeting a closed one. The closed side is the whole
-            // set, so the open side may only have cases it already has.
-            (SomeType(open), Anon(closed)) | (Anon(closed), SomeType(open)) => {
-                for case in &open {
-                    match closed.iter().find(|c| c.name == case.name) {
+            // An open record meeting the declared record it belongs to. This is
+            // where a literal is finally pinned down. The declaration's own type
+            // is the result — it is nominal, so the merged fields are thrown
+            // away; what they were for is the *bindings* unifying them made.
+            (SomeRecord(open), User(name, args)) | (User(name, args), SomeRecord(open)) => {
+                let whole = User(name.clone(), args.clone());
+                let types = Rc::clone(&self.types);
+                match types.get(&name) {
+                    // Reported by the declaration check; nothing useful to add.
+                    None => {}
+                    Some(decl) => match decl.record_at(&args) {
+                        // A sum is not a record, however its fields look.
                         None => {
-                            return Err(FloErr::NoSuchCase {
-                                ty: Anon(closed.clone()),
-                                case: case.name.clone(),
+                            return Err(FloErr::RecordSumMismatch {
+                                record: SomeRecord(open),
+                                sum: whole,
                                 loc,
                             });
                         }
-                        Some(other) => {
-                            self.unify_cases(case.clone(), other.clone(), loc)?;
+                        Some(declared) => {
+                            self.fit_record(open, declared, &whole, loc)?;
+                        }
+                    },
+                }
+                whole
+            }
+
+            // An open record meeting a concrete anonymous one.
+            (SomeRecord(open), AnonRecord(closed)) | (AnonRecord(closed), SomeRecord(open)) => {
+                let whole = AnonRecord(closed.clone());
+                AnonRecord(self.fit_record(open, closed, &whole, loc)?)
+            }
+
+            // Two open records: neither knows the whole set, so take the union.
+            // This is the one place a record type *grows* — and why a field given
+            // in one literal and left out of another ends up in both.
+            (SomeRecord(a), SomeRecord(b)) => SomeRecord(self.merge_records(a, b, loc)?),
+
+            // Structural, and closed on both sides, so the field sets have to
+            // line up exactly.
+            (AnonRecord(a), AnonRecord(b)) => AnonRecord(self.unify_same_record(a, b, loc)?),
+
+            // ------------------------------------------------------------------
+            // Sums
+            // ------------------------------------------------------------------
+
+            (SomeSum(open), User(name, args)) | (User(name, args), SomeSum(open)) => {
+                let whole = User(name.clone(), args.clone());
+                let types = Rc::clone(&self.types);
+                match types.get(&name) {
+                    None => {}
+                    Some(decl) if decl.is_record() => {
+                        return Err(FloErr::RecordSumMismatch {
+                            record: whole,
+                            sum: SomeSum(open),
+                            loc,
+                        });
+                    }
+                    Some(decl) => {
+                        for case in open {
+                            let Some(declared) = decl.case_at(&case.name, &args) else {
+                                return Err(FloErr::NoSuchCase {
+                                    ty: whole,
+                                    case: case.name,
+                                    loc,
+                                });
+                            };
+                            self.unify_case(case, declared, loc)?;
                         }
                     }
                 }
-                Anon(closed)
+                whole
             }
 
-            // Structural, so two of them are the same type exactly when they
-            // have the same cases. Both sides are canonically ordered.
-            (Anon(c1), Anon(c2))
-                if c1.len() == c2.len()
-                    && c1.iter().zip(&c2).all(|(a, b)| {
-                        a.name == b.name && a.field_names() == b.field_names()
-                    }) =>
-            {
-                let mut cases = Vec::with_capacity(c1.len());
-                for (a, b) in c1.into_iter().zip(c2) {
-                    cases.push(self.unify_cases(a, b, loc)?);
-                }
-                Anon(cases)
+            (SomeSum(open), AnonSum(closed)) | (AnonSum(closed), SomeSum(open)) => {
+                AnonSum(self.fit_cases(open, closed, loc)?)
+            }
+
+            (SomeSum(c1), SomeSum(c2)) => SomeSum(self.merge_cases(c1, c2, loc)?),
+
+            (AnonSum(c1), AnonSum(c2)) => AnonSum(self.unify_same_cases(c1, c2, loc)?),
+
+            // A record meeting a sum, in whichever forms the two are in. Worth its
+            // own error because it is the easiest mistake to make: `.{ .. }` builds
+            // a record and `.Case` builds a sum, and only the type says which one
+            // belongs here.
+            (record @ (SomeRecord(_) | AnonRecord(_)), sum @ (SomeSum(_) | AnonSum(_)))
+            | (sum @ (SomeSum(_) | AnonSum(_)), record @ (SomeRecord(_) | AnonRecord(_))) => {
+                return Err(FloErr::RecordSumMismatch { record, sum, loc });
             }
 
             (a, b) if a == b => a,
@@ -196,49 +255,131 @@ impl ReplaceSet {
         Ok(result)
     }
 
-    /// Check every case an open type is known to have against the declaration it
-    /// turned out to belong to, unifying the field types as it goes.
-    fn check_against_decl(
+    /// An open record meeting a concrete one.
+    ///
+    /// The concrete side is the whole set, so the open side may only have fields
+    /// it has. Fields the open side is *missing* are not an error: a record
+    /// literal may leave a field out, and it gets zero initialized. Nothing about
+    /// that is recorded here — which fields a literal left out is a property of
+    /// that literal, not of the type several of them may share, so it is worked
+    /// out per literal in [`crate::ast::Expr::resolve`].
+    fn fit_record(
         &mut self,
-        cases: &[TypeCase],
-        name: &str,
-        args: &[Type],
+        open: Record,
+        closed: Record,
+        whole: &Type,
         loc: Loc,
-    ) -> FloResult<()> {
-        let types = Rc::clone(&self.types);
-        let Some(decl) = types.get(name) else {
-            // Reported by the declaration check; nothing useful to say here.
-            return Ok(());
-        };
+    ) -> FloResult<Record> {
+        if !open.same_kind(&closed) {
+            return Err(wrong_fields(&closed, &open, loc));
+        }
 
-        for case in cases {
-            let Some(declared) = decl.case_at(&case.name, args) else {
+        let given = owned_fields(&open);
+
+        for (name, _) in &given {
+            if closed.get(name).is_none() {
+                return Err(FloErr::UnexpectedField {
+                    ty: whole.clone(),
+                    field: format!("{name:?}"),
+                    loc,
+                });
+            }
+        }
+
+        let mut fields = Vec::with_capacity(closed.len());
+        for (name, declared) in owned_fields(&closed) {
+            let ty = match given.iter().find(|(n, _)| *n == name) {
+                // The declared type first: it is the one that was *expected*, and
+                // a mismatch is reported in that order.
+                Some((_, provided)) => self.unify_types(declared, provided.clone(), loc)?,
+                None => declared,
+            };
+            fields.push((name, ty));
+        }
+
+        Ok(Record::build(fields).expect("a shape taken from a record"))
+    }
+
+    /// The union of two open records. A field both sides know about has to be the
+    /// same field on both; one only one side knows about joins the set.
+    fn merge_records(&mut self, a: Record, b: Record, loc: Loc) -> FloResult<Record> {
+        if !a.same_kind(&b) {
+            return Err(wrong_fields(&a, &b, loc));
+        }
+
+        let a_fields = owned_fields(&a);
+        let b_fields = owned_fields(&b);
+
+        let mut merged: Vec<(FieldName, Type)> = Vec::with_capacity(a_fields.len() + b_fields.len());
+        for (name, ty) in a_fields {
+            let ty = match b_fields.iter().find(|(n, _)| *n == name) {
+                Some((_, other)) => self.unify_types(ty, other.clone(), loc)?,
+                None => ty,
+            };
+            merged.push((name, ty));
+        }
+        for (name, ty) in b_fields {
+            if !merged.iter().any(|(n, _)| *n == name) {
+                merged.push((name, ty));
+            }
+        }
+
+        Ok(Record::build(merged).expect("a union of two records"))
+    }
+
+    /// Two concrete records. Both are closed over exactly their fields, so
+    /// neither can give way and the sets have to be identical.
+    fn unify_same_record(&mut self, a: Record, b: Record, loc: Loc) -> FloResult<Record> {
+        if a.names() != b.names() {
+            return Err(wrong_fields(&a, &b, loc));
+        }
+
+        let mut fields = Vec::with_capacity(a.len());
+        for ((name, x), (_, y)) in owned_fields(&a).into_iter().zip(owned_fields(&b)) {
+            fields.push((name, self.unify_types(x, y, loc)?));
+        }
+
+        Ok(Record::build(fields).expect("a shape taken from a record"))
+    }
+
+    /// An open sum meeting a concrete one: every case it is known to have has to
+    /// be one of the concrete set's. Cases it does *not* have say nothing — a sum
+    /// value is one case, and the open side simply has not seen the others.
+    fn fit_cases(
+        &mut self,
+        open: Vec<SumCase>,
+        closed: Vec<SumCase>,
+        loc: Loc,
+    ) -> FloResult<Vec<SumCase>> {
+        let mut out = closed.clone();
+
+        for case in open {
+            let Some(at) = closed.iter().position(|c| c.name == case.name) else {
                 return Err(FloErr::NoSuchCase {
-                    ty: Type::User(name.to_string(), args.to_vec()),
-                    case: case.name.clone(),
+                    ty: Type::AnonSum(closed.clone()),
+                    case: case.name,
                     loc,
                 });
             };
-
-            self.unify_cases(case.clone(), declared, loc)?;
+            out[at] = self.unify_case(case, closed[at].clone(), loc)?;
         }
 
-        Ok(())
+        Ok(out)
     }
 
     /// The union of two sets of cases. A case both sides know about has to be
     /// the same case on both.
     fn merge_cases(
         &mut self,
-        c1: Vec<TypeCase>,
-        c2: Vec<TypeCase>,
+        c1: Vec<SumCase>,
+        c2: Vec<SumCase>,
         loc: Loc,
-    ) -> FloResult<Vec<TypeCase>> {
-        let mut merged: Vec<TypeCase> = Vec::with_capacity(c1.len() + c2.len());
+    ) -> FloResult<Vec<SumCase>> {
+        let mut merged: Vec<SumCase> = Vec::with_capacity(c1.len() + c2.len());
 
         for case in c1 {
             match c2.iter().find(|c| c.name == case.name) {
-                Some(other) => merged.push(self.unify_cases(case, other.clone(), loc)?),
+                Some(other) => merged.push(self.unify_case(case, other.clone(), loc)?),
                 None => merged.push(case),
             }
         }
@@ -251,28 +392,78 @@ impl ReplaceSet {
         Ok(sorted_cases(merged))
     }
 
-    /// Unify two cases of the same name. A literal has to give a case's fields
-    /// exactly, so anything but the same field names is an error — which is what
-    /// reports a missing or misspelt field.
-    fn unify_cases(&mut self, a: TypeCase, b: TypeCase, loc: Loc) -> FloResult<TypeCase> {
-        if a.field_names() != b.field_names() {
-            return Err(FloErr::WrongFields {
-                expected: b.field_names().iter().map(|s| s.to_string()).collect(),
-                got: a.field_names().iter().map(|s| s.to_string()).collect(),
-                case: a.name,
+    /// Two concrete sums, which are the same type exactly when they have the same
+    /// cases. Both sides are canonically ordered.
+    fn unify_same_cases(
+        &mut self,
+        c1: Vec<SumCase>,
+        c2: Vec<SumCase>,
+        loc: Loc,
+    ) -> FloResult<Vec<SumCase>> {
+        let same_shape = c1.len() == c2.len() && c1.iter().zip(&c2).all(|(a, b)| a.name == b.name);
+        if !same_shape {
+            return Err(FloErr::TypeMismatch {
+                expected: Type::AnonSum(c1),
+                got: Type::AnonSum(c2),
                 loc,
             });
         }
 
-        let mut fields = Vec::with_capacity(a.fields.len());
-        for ((name, x), (_, y)) in a.fields.into_iter().zip(b.fields) {
-            fields.push((name, self.unify_types(x, y, loc)?));
+        let mut cases = Vec::with_capacity(c1.len());
+        for (a, b) in c1.into_iter().zip(c2) {
+            cases.push(self.unify_case(a, b, loc)?);
         }
+        Ok(cases)
+    }
 
-        Ok(TypeCase { name: a.name, fields })
+    /// Unify two cases of the same name. A case either carries a payload or does
+    /// not, and a literal has to say which — giving one to a case that carries
+    /// nothing is as wrong as leaving one off a case that does.
+    fn unify_case(&mut self, a: SumCase, b: SumCase, loc: Loc) -> FloResult<SumCase> {
+        let payload = match (a.payload, b.payload) {
+            (None, None) => None,
+            (Some(x), Some(y)) => Some(self.unify_types(x, y, loc)?),
+            (Some(_), None) => {
+                return Err(FloErr::PayloadMismatch {
+                    case: a.name,
+                    expected: false,
+                    loc,
+                });
+            }
+            (None, Some(_)) => {
+                return Err(FloErr::PayloadMismatch {
+                    case: a.name,
+                    expected: true,
+                    loc,
+                });
+            }
+        };
+
+        Ok(SumCase {
+            name: a.name,
+            payload,
+        })
     }
 
     pub(super) fn bind(&mut self, ty_id: usize, ty: Type, loc: Loc) -> FloResult<()> {
+        self.bind_as(ty_id, ty, false, loc)
+    }
+
+    /// Bind a variable to a type.
+    ///
+    /// `incoming_is_expected` says which side of the original constraint `ty` came
+    /// from. Every constraint is collected as (expected, got), and this is the one
+    /// place that order would otherwise be lost: the variable may be on either
+    /// side, so whether the type it already stood for is the expected one or the
+    /// gotten one depends on which. It affects nothing but the wording of a
+    /// mismatch — and getting that backwards is worse than saying nothing.
+    pub(super) fn bind_as(
+        &mut self,
+        ty_id: usize,
+        ty: Type,
+        incoming_is_expected: bool,
+        loc: Loc,
+    ) -> FloResult<()> {
         let root = self.find(ty_id);
 
         if self.occurs(root, &ty) {
@@ -281,6 +472,7 @@ impl ReplaceSet {
 
         let existing = self.bindings.remove(&root);
         let merged = match existing {
+            Some(known) if incoming_is_expected => self.unify_types(ty, known, loc)?,
             Some(known) => self.unify_types(known, ty, loc)?,
             None => ty,
         };
@@ -319,26 +511,29 @@ impl ReplaceSet {
                 User(name.clone(), new_args)
             }
 
-            SomeType(cases) => SomeType(self.resolve_cases(cases)),
-            Anon(cases) => Anon(self.resolve_cases(cases)),
+            SomeRecord(record) => SomeRecord(self.resolve_record(record)),
+            AnonRecord(record) => AnonRecord(self.resolve_record(record)),
+            SomeSum(cases) => SomeSum(self.resolve_cases(cases)),
+            AnonSum(cases) => AnonSum(self.resolve_cases(cases)),
 
             x => x.clone(),
         }
     }
 
-    fn resolve_cases(&mut self, cases: &[TypeCase]) -> Vec<TypeCase> {
+    fn resolve_record(&mut self, record: &Record) -> Record {
+        let fields = owned_fields(record)
+            .into_iter()
+            .map(|(name, ty)| (name, self.resolve(&ty)))
+            .collect();
+        Record::build(fields).expect("a shape taken from a record")
+    }
+
+    fn resolve_cases(&mut self, cases: &[SumCase]) -> Vec<SumCase> {
         cases
             .iter()
-            .map(|case| {
-                let fields = case
-                    .fields
-                    .iter()
-                    .map(|(n, t)| (n.clone(), self.resolve(t)))
-                    .collect();
-                TypeCase {
-                    name: case.name.clone(),
-                    fields,
-                }
+            .map(|case| SumCase {
+                name: case.name.clone(),
+                payload: case.payload.as_ref().map(|ty| self.resolve(ty)),
             })
             .collect()
     }
@@ -368,11 +563,15 @@ impl ReplaceSet {
             User(_, args) => args.iter().any(|a| self.occurs(var_root, a)),
 
             // A field holds its type by value, so a variable reaching one of
-            // these is embedded in it just as directly as in a `Fn` argument.
-            SomeType(cases) | Anon(cases) => cases.iter().any(|case| {
-                case.fields
-                    .iter()
-                    .any(|(_, t)| self.occurs(var_root, t))
+            // these is embedded in it just as directly as in a `Fn` argument. A
+            // case's payload is a record, and reached the same way.
+            SomeRecord(record) | AnonRecord(record) => {
+                record.types().any(|t| self.occurs(var_root, t))
+            }
+            SomeSum(cases) | AnonSum(cases) => cases.iter().any(|case| {
+                case.payload
+                    .as_ref()
+                    .is_some_and(|t| self.occurs(var_root, t))
             }),
 
             _ => false,
@@ -383,9 +582,9 @@ impl ReplaceSet {
         self.map_bindings(&default_ty);
     }
 
-    /// Close every type an inference left open. A [`Type::SomeType`] that never
-    /// met a declared type becomes the anonymous type of exactly the cases it
-    /// was known to have.
+    /// Close every type an inference left open. A record or sum that never met a
+    /// concrete type becomes the anonymous type of exactly what it was known to
+    /// have.
     pub(super) fn close_some_types(&mut self) {
         self.map_bindings(&close_ty);
     }
@@ -399,8 +598,22 @@ impl ReplaceSet {
     }
 }
 
+/// A record's fields, owned, in canonical order. Needed wherever the fields are
+/// walked while the solver is also being mutated.
+fn owned_fields(record: &Record) -> Vec<(FieldName, Type)> {
+    record.iter().map(|(name, ty)| (name, ty.clone())).collect()
+}
+
+fn wrong_fields(expected: &Record, got: &Record, loc: Loc) -> FloErr {
+    FloErr::WrongFields {
+        expected: expected.names().iter().map(|n| format!("{n:?}")).collect(),
+        got: got.names().iter().map(|n| format!("{n:?}")).collect(),
+        loc,
+    }
+}
+
 /// A literal's default type, applied everywhere inside `ty` — including field
-/// types, where a merge may have left an `{integer}` sitting inside a case.
+/// types, where a merge may have left an `{integer}` sitting inside a record.
 fn default_ty(ty: Type) -> Type {
     use Type::*;
     match ty {
@@ -413,7 +626,8 @@ fn default_ty(ty: Type) -> Type {
 fn close_ty(ty: Type) -> Type {
     use Type::*;
     match ty {
-        SomeType(cases) => Anon(sorted_cases(
+        SomeRecord(record) => AnonRecord(record.map_types(&mut |t| close_ty(t.clone()))),
+        SomeSum(cases) => AnonSum(sorted_cases(
             cases
                 .into_iter()
                 .map(|c| c.map_types(&mut |t| close_ty(t.clone())))
@@ -428,18 +642,17 @@ fn close_ty(ty: Type) -> Type {
 fn map_children(ty: Type, f: &dyn Fn(Type) -> Type) -> Type {
     use Type::*;
     match ty {
-        Fn(args, ret) => Fn(
-            args.into_iter().map(|a| f(a)).collect(),
-            Box::new(f(*ret)),
-        ),
+        Fn(args, ret) => Fn(args.into_iter().map(|a| f(a)).collect(), Box::new(f(*ret))),
         User(name, args) => User(name, args.into_iter().map(|a| f(a)).collect()),
-        SomeType(cases) => SomeType(
+        SomeRecord(record) => SomeRecord(record.map_types(&mut |t| f(t.clone()))),
+        AnonRecord(record) => AnonRecord(record.map_types(&mut |t| f(t.clone()))),
+        SomeSum(cases) => SomeSum(
             cases
                 .into_iter()
                 .map(|c| c.map_types(&mut |t| f(t.clone())))
                 .collect(),
         ),
-        Anon(cases) => Anon(
+        AnonSum(cases) => AnonSum(
             cases
                 .into_iter()
                 .map(|c| c.map_types(&mut |t| f(t.clone())))

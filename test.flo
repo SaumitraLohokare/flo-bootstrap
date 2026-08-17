@@ -1,0 +1,197 @@
+-- Generic type
+type Vec<T> = {
+    data: *T,
+    len: u64,
+};
+
+-- Generic Function
+fn Vec<T>() -> Vec<T> = .{ data: nil, len: 0 };
+
+fn test_1() = {
+    let vec_1            = Vec();
+    let vec_2: Vec<u8>   = .{ data: vec_1.data, len: 0 };
+    let vec_3: Vec<bool> = .{ data: nil, len: 0 };
+    let vec_4            = Vec.{ data: vec_3.data, len: 1 }; -- You can specify type name for readibility & Forcing types
+    --                                                          But no generics can be specified here. You need to bind them to a variable to be able to specify generic types
+
+    let len = vec_1.len; -- Field access only on records
+};
+
+type Option<T>
+    = Some { T }    -- Records can be unnamed
+    | None;
+
+fn test_2() = {
+    let opt_1 = .Some .{ 0 };
+    let opt_2 = .None;
+
+    let opt_3: Option<bool> = .Some .{ false };
+    let opt_4: Option<bool> = .None;
+
+    let opt_5 = Option.Some.{ 0. }; -- Qualified by type name
+};
+
+type Player = {
+    pos: { x: i32, y: i32 },
+    dim: { w: i32, y: i32 },
+
+    status: Alive | Dead,
+};
+
+fn test_3() = {
+    let player = .{
+        pos: .{ x: 0, y: 0 },
+        dim: .{ w: 0, y: 0 },
+
+        status: .Alive,
+    };
+};
+
+-- Anonymous Types
+fn anon_record(pos: { x: i32, y: i32 }) -> i32
+    = pos.x + pos.y;
+
+fn anon_enum(status: Alive | Dead) -> bool
+    = match status {
+        .Alive -> true,
+        .Dead  -> false,
+    };
+
+fn test_4() = {
+    let v_0 = anon_record(.{ x: 1, y: 2 });
+    let v_1 = anon_enum(.Dead); -- How can we know that Dead here is a case name?
+};
+
+-- Expressions Syntax
+fn arithmetic_operators() -> i32 = 1 + 1 * 2 / 3 - -4 % 7;
+fn logical_operators() -> bool = !true && false || true;
+fn comparison_operators() -> bool
+    = 1 == 1 || 1 < 1 || 1 <= 1 || 1 > 1 || 1 >= 1;
+
+fn function_calling()
+    = foo(1) |> bar |> baz(1, 2);
+-- Pipe operator binds tighter than binary operators, but less than unary operators.
+-- Skipping `()` is allowed if no more arguments need to be passed.
+-- The piped argument is the first argument.
+
+fn scope() = {
+    {
+        foo();
+        bar();
+    }
+
+    let v = {
+        baz()
+    };
+};
+-- Scope expr allows chaining expressions.
+-- Return values of all statements are dropped.
+-- Statements are separated with a `;`
+-- Last expr without a `;` is considered as the value of the scope.
+-- If there is no tail expr, then the scope is `void`.
+-- Scope exprs don't need an ending `;` in a statement position. It can be inferred.
+-- But at the tail position, the `;` isn't inferred, it must be present if the value needs to be dropped.
+
+fn if_else() = {
+    if foo() {} 
+    else {}
+
+    if foo() {}
+
+    if foo() bar()
+    else     baz();
+
+    let x = if foo() 1 else 0;
+
+    let y =  if foo() { 1 }
+        else if bar() { 2 }
+        else          { 3 };
+};
+-- If expressions don't need `()` around condition
+-- If and else expect an expr as their body
+-- An if without an else must require it's branch to be `void`
+-- The else branch must have the same type as the if branch.
+-- If else can be chained.
+-- The inferred `;` rule is same as scopes, only if the body of if & else is a scope.
+
+fn match_expr(a: i32) = {
+    match a {
+        0 -> foo()
+        1 -> bar()
+        2 if foo() -> baz()
+        _ -> bleh()
+    }
+
+    let x = match foo() {
+        .Some.{ v } if v == 0 -> 0
+        .Some.{ 1 }           -> 1
+        .Some.{ n }           -> 2
+        .None                 -> 3
+    };
+};
+-- Advanced pattern matching is present in match exprs.
+-- But range checking isn't present (unlike rust `v @ 1..10`)
+-- Same rule of inferred `;` is present in a match.
+-- Each branch expects an expr after `->`.
+-- Compiler does exhaustiveness checking.
+
+fn variables() = {
+    let x = 0;
+    let x: i32 = 1;
+    let x: i32;
+    let x;          -- Type will be inferred (if cannot infer then it's an error)
+};
+-- Variables are declared with let.
+-- They are mutable
+-- Type signature can be inferred.
+-- Assignment can be omitted.
+-- Can only be present in a statement position
+-- `Let` is a statement.
+
+fn loops() = {
+    while foo() bar();
+
+    while foo() {
+        bar();
+    }
+
+    while bar() {
+        foo();
+    };
+};
+-- While loops take an expr for condition
+-- Take an expr for body.
+-- They are always `void`
+-- They expect their body to also be `void`.
+-- Same `;` inferred rule as scope and if.
+
+fn pointers() = {
+    let a = 10;
+
+    let ptr_a = &a;
+
+    let b = *ptr_a;
+
+    let ptr_c: *i32 = nil;
+
+    -- Pointer arithmetic like C.
+};
+-- Pointers are like C
+-- They are mutable
+
+fn arrays() = {
+    let arr_1: [10]i32 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let arr_2 = [0, 1, 2];
+
+    let x = arr_1[2];
+    arr_2[0] = x;
+};
+-- Array literals are inside `[]`
+-- Types and sizes of arrays can be inferred
+-- Array indices can be read and written to
+
+fn slices() = {
+    let slice: []i32 = [1, 2, 3, 4]; -- Slices can be implicitly cast from arrays
+
+    let len = slice.count; -- Slice length (built in)
+};
